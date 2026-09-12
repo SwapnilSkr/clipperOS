@@ -1,0 +1,570 @@
+@import "tailwindcss";
+@import url("https://fonts.googleapis.com/css2?family=Anton&family=Bebas+Neue&family=Montserrat:wght@700;800;900&family=Oswald:wght@700&family=Playfair+Display:wght@700;900&family=Poppins:wght@700;800;900&family=Rubik:wght@700;800;900&family=Space+Grotesk:wght@700&display=swap");
+
+/* ============================================================
+   clipperOS design tokens.
+
+   Dark studio factory floor: Linear-black chrome, acid-lime CTAs, cyan peaks.
+
+   Type: Inter Variable is self-hosted via @fontsource-variable/inter.
+   ============================================================ */
+@theme {
+  /* Linear-black ladder + Riverside acid lime (not Opus purple sludge). */
+  --color-bg: #07080a;
+  --color-panel: #0d0e10;
+  --color-panel-2: #121316;
+
+  /* Dividers stay quiet; interactive controls need stronger edges (WCAG 1.4.11). */
+  --color-border: #23262b;
+  --color-control: #6b7280;
+
+  --color-muted: #71717a;
+  --color-fg: #f4f4f6;
+  --color-accent: #c8f542;
+  /* Dark ink on lime CTAs — never white-on-lime. */
+  --color-accent-fg: #0a0a0a;
+  --color-accent-2: #3ee0fa;
+  --color-good: #34d399;
+  --color-warn: #fbbf24;
+  --color-bad: #f87171;
+
+  --font-sans: "Inter Variable", Inter, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+
+  /* ----------------------------------------------------------
+     MOTION TOKENS — one timing budget and one easing family.
+
+     Durations are not per-component taste. They are roles:
+       tap       100ms  press acknowledgement
+       fast      150ms  hover, focus, small state changes
+       pop       250ms  dialogs and popovers
+       collapse  300ms  accordions and layout reflow
+       rise      260ms  a list arriving once
+     Exits run at roughly 70% of the entrance — the user already
+     understands the object by then.
+
+     Easing decelerates hard. No bounce, no elastic: they read as toys.
+     ---------------------------------------------------------- */
+  --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-swap: cubic-bezier(0.2, 0, 0, 1);
+
+  /* 800ms, not the 1s default: a steady waiting indicator, never panicked.
+     Keyframes belonging to an --animate-* token live inside @theme so
+     Tailwind emits them only when the utility is actually used. */
+  --animate-spin: spin-steady 800ms linear infinite;
+
+  @keyframes spin-steady {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+
+  /* ----------------------------------------------------------
+     TYPE SCALE — nine roles, not nine sizes.
+
+     Two deliberate tiers, because this is a compare surface that is
+     read at a desk for long stretches:
+
+     • DENSE TIER (11–14px) — micro, meta, ui, body. These steps are
+       intentionally compressed. Before, the scale had eight sizes
+       clustered at 9/10/11/12/13px (steps of 1.08–1.11), which is not
+       hierarchy, it is noise. The dense tier is now four sizes, and
+       what separates a label from metadata from body text is WEIGHT
+       and COLOUR, not another 1px. That is the sanctioned trade for
+       product work: compressed steps, hierarchy carried elsewhere.
+
+     • HIERARCHY TIER (17–38px) — lead, title, head, score. These take
+       real jumps (1.29 / 1.27 / 1.36) so the shape of the page reads
+       from across the room.
+
+     Every size in the app comes from this list. No arbitrary px.
+     ---------------------------------------------------------- */
+  --text-micro: 0.6875rem; /* 11px — uppercase eyebrows + badge letters */
+  --text-micro--line-height: 1.2;
+  --text-meta: 0.75rem; /* 12px — timestamps, metadata, secondary */
+  --text-meta--line-height: 1.4;
+  --text-ui: 0.8125rem; /* 13px — buttons, chips, controls */
+  --text-ui--line-height: 1.3;
+  --text-body: 0.875rem; /* 14px — rows, card prose, the hook line */
+  --text-body--line-height: 1.45;
+  --text-lead: 1.0625rem; /* 17px — the peak quote: the one loud line */
+  --text-lead--line-height: 1.35;
+  --text-title: 1.375rem; /* 22px — section headings */
+  --text-title--line-height: 1.25;
+  --text-head: 1.75rem; /* 28px — page + empty-state heading */
+  --text-head--line-height: 1.15;
+  /* Numerals are a role of their own: they need tabular figures and a
+     tighter tracking than prose at the same size. */
+  --text-score-sm: 1.5rem; /* 24px — the score in a scan row */
+  --text-score-sm--line-height: 1;
+  --text-score: 2.375rem; /* 38px — the score on a poster */
+  --text-score--line-height: 1;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+/* ------------------------------------------------------------
+   Element defaults live in @layer base.
+
+   This is load-bearing, not tidiness. An UNLAYERED rule outranks every
+   cascade layer, so a bare `:where(h1) { text-wrap: balance }` beat
+   Tailwind's `.truncate` no matter how low its specificity was — the header
+   title stopped truncating and wrapped to seven lines on a phone. Inside
+   @layer base, utilities win again, which is what utilities are for.
+   ------------------------------------------------------------ */
+@layer base {
+  body {
+    background: var(--color-bg);
+    color: var(--color-fg);
+    font-family: var(--font-sans);
+    color-scheme: dark;
+
+    /* Light-on-dark reads optically thinner and brighter than the same face
+       on light, so it needs smoother rendering and a weight that holds up. */
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    font-optical-sizing: auto;
+
+    /* A long title, URL, or dotted id must never blow out its column. */
+    overflow-wrap: break-word;
+  }
+
+  /* Headings get balanced wraps; prose gets the prettier ragged edge. Neither
+     goes on long-form body copy, where balancing fights the reading rhythm.
+     `text-wrap` also controls wrapping, so anything that must stay on one line
+     (a truncated title) needs a utility to be able to override this. */
+  :where(h1, h2, h3, h4) {
+    text-wrap: balance;
+  }
+  :where(p, figcaption, dd) {
+    text-wrap: pretty;
+  }
+
+  /* Taps must not wait out the browser's double-tap-zoom delay before the
+     control responds. Pinch-zoom and double-tap-zoom on the page itself are
+     unaffected — this only removes the delay on the controls. */
+  :where(a, button, [role="button"], select, input, textarea, summary) {
+    touch-action: manipulation;
+  }
+}
+
+@layer components {
+  /* One uppercase-label role, defined once. It was the same three utilities
+     repeated in fourteen places, which is how a scale drifts. */
+  .eyebrow {
+    font-size: var(--text-micro);
+    line-height: var(--text-micro--line-height);
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  /* Every number the user compares gets tabular figures so columns of digits
+     line up and don't shimmer as values change. */
+  .num {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum";
+  }
+}
+
+/* ============================================================
+   Focus: one authored system instead of relying on the UA ring.
+   2px, offset, and the accent colour clears 3:1 on every surface
+   it can land on.
+
+   Deliberately UNLAYERED, unlike the element defaults above: this is a
+   conformance requirement, not a style default, so no utility class should
+   be able to silently delete it with `outline-none`.
+   ============================================================ */
+:where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+/* Inputs already carry a border that changes colour; the ring still applies
+   so keyboard focus is never ambiguous. */
+:where(input, select, textarea):focus-visible {
+  outline-offset: 1px;
+}
+
+/* ============================================================
+   iOS Safari: a form control under 16px triggers auto-zoom on focus,
+   which breaks the layout mid-task. Never suppress it with
+   maximum-scale — that would kill pinch-zoom for everyone.
+
+   Also UNLAYERED on purpose: a `text-ui` utility on a select would
+   otherwise win here and re-introduce the zoom.
+   ============================================================ */
+@media (max-width: 639px) {
+  input,
+  select,
+  textarea {
+    font-size: 1rem;
+  }
+}
+
+
+@layer components {
+  /* Primary CTA on lime — dark ink for contrast. */
+  .btn-accent {
+    background: var(--color-accent);
+    color: var(--color-accent-fg);
+  }
+  .btn-accent:hover {
+    background: #d4ff6a;
+  }
+
+  /* 9:16 device chrome for clip posters (Opus/Klap pattern, quieter). */
+  .phone-frame {
+    position: relative;
+    aspect-ratio: 9 / 16;
+    border-radius: 1.1rem;
+    border: 1px solid color-mix(in srgb, var(--color-fg) 12%, transparent);
+    background: #000;
+    box-shadow:
+      inset 0 0 0 1px color-mix(in srgb, var(--color-fg) 6%, transparent),
+      0 0 0 1px color-mix(in srgb, var(--color-bg) 80%, transparent);
+    overflow: hidden;
+  }
+
+  .studio-glow {
+    background:
+      radial-gradient(600px 280px at 20% -10%, color-mix(in srgb, var(--color-accent) 12%, transparent), transparent 70%),
+      radial-gradient(500px 240px at 90% 0%, color-mix(in srgb, var(--color-accent-2) 10%, transparent), transparent 65%);
+  }
+}
+
+.studio-scroll::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+.studio-scroll::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 9999px;
+}
+.studio-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* 9:16 preview: largest rectangle that fits the leftover column. Width is
+   min(stage width, stage height × 9/16) so the frame never stretches, and
+   the transport under it never has to scroll to stay on screen. */
+.preview-stage {
+  container-type: size;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.preview-frame {
+  position: relative;
+  aspect-ratio: 9 / 16;
+  width: min(100cqw, calc(100cqh * 9 / 16));
+  height: auto;
+  max-height: 100%;
+}
+
+/* Score bar fill — width set inline from the candidate's total. */
+.score-fill {
+  background: linear-gradient(90deg, var(--color-accent), var(--color-accent-2));
+}
+
+/* ============================================================
+   Motion. Everything here is state, not decoration: the pulse marks
+   live work, the sweep marks measurable progress, the rise is the
+   board arriving once. All of it is disabled under
+   prefers-reduced-motion (see the block at the end of this file).
+   ============================================================ */
+@keyframes pulse-soft {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+@keyframes sweep {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(300%);
+  }
+}
+
+/* The board arriving, once. Transform + opacity only, decelerating. */
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* A dialog, entering from the edge nearest its trigger. */
+@keyframes pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* A bar the user must notice (undo, errors). */
+@keyframes reveal-down {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* ============================================================
+   MOTION ROLES
+
+   These live in @layer components on purpose. Two of them set `display`,
+   and an UNLAYERED rule outranks every cascade layer — so a bare
+   `.motion-collapse { display: grid }` would beat Tailwind's `sm:contents`
+   no matter how low its specificity was. Inside the components layer,
+   utilities still win, which is what makes the responsive override work.
+   ============================================================ */
+@layer components {
+  /* These two were declared OUTSIDE any layer, which made them beat every
+     Tailwind utility — a `motion-reduce:animate-none` placed on either element
+     would have silently done nothing. Inside `components` they sit below
+     utilities, so a utility can still win. */
+  .animate-pulse-soft {
+    animation: pulse-soft 1.6s ease-in-out infinite;
+  }
+  .animate-sweep {
+    animation: sweep 1.4s linear infinite;
+  }
+
+  .animate-rise {
+    animation: rise 260ms var(--ease-out-quart) both;
+  }
+
+  /* Subtitle motion presets mirror the short, restrained ASS animations used
+     by the renderer. They restart when a new caption group mounts. */
+  .caption-pop {
+    animation: caption-pop 140ms var(--ease-out-quart) both;
+  }
+  .caption-fade {
+    animation: fade-in 100ms ease-out both;
+  }
+
+  @keyframes caption-pop {
+    from {
+      opacity: 0.72;
+      scale: 1.12;
+    }
+    to {
+      opacity: 1;
+      scale: 1;
+    }
+  }
+
+  /* Dialog panel + its scrim. data-state drives enter and exit so the exit
+     can run at ~70% of the entrance. */
+  .motion-pop[data-state="open"] {
+    animation: pop-in 250ms var(--ease-out-expo) both;
+  }
+  .motion-pop[data-state="closed"] {
+    animation: pop-in 150ms var(--ease-out-quart) reverse both;
+  }
+  .motion-scrim[data-state="open"] {
+    animation: fade-in 150ms ease-out both;
+  }
+  .motion-scrim[data-state="closed"] {
+    animation: fade-in 120ms ease-in reverse both;
+  }
+
+  .motion-reveal {
+    animation: reveal-down 200ms var(--ease-out-quart) both;
+  }
+
+  /* Press feedback, one definition for every control.
+     It sets a SUPERSET of transition properties rather than replacing
+     whatever colour transition a button already had, so swapping
+     `transition-colors` for `press` never costs the hover animation.
+     The visible element scales 0.98; the hit area does not move. */
+  .press {
+    transition-property: opacity, scale, color, background-color, border-color, box-shadow;
+    transition-duration: 150ms;
+    transition-timing-function: var(--ease-out-quart);
+  }
+  .press:active {
+    scale: 0.98;
+  }
+
+  /* Accordion. Animates grid-template-rows, which the browser can
+     interpolate without measuring a pixel height, and nothing animates a
+     layout property directly. */
+  .motion-collapse {
+    display: grid;
+    grid-template-rows: 0fr;
+    opacity: 0;
+    transition:
+      grid-template-rows 300ms var(--ease-out-quart),
+      opacity 200ms ease-out;
+  }
+  .motion-collapse[data-open="true"] {
+    grid-template-rows: 1fr;
+    opacity: 1;
+  }
+  .motion-collapse > * {
+    overflow: hidden;
+  }
+
+  /* An icon changing meaning. Both glyphs stay in the DOM and cross-fade with
+     opacity + scale + blur, so there is no layout shift and no dependency. */
+  .motion-swap {
+    display: inline-grid;
+    place-items: center;
+    position: relative;
+  }
+  .motion-swap > * {
+    grid-area: 1 / 1;
+    transition:
+      opacity 150ms var(--ease-swap),
+      scale 150ms var(--ease-swap),
+      filter 150ms var(--ease-swap);
+  }
+  .motion-swap > [data-shown="false"] {
+    opacity: 0;
+    scale: 0.25;
+    filter: blur(4px);
+  }
+  .motion-swap > [data-shown="true"] {
+    opacity: 1;
+    scale: 1;
+    filter: blur(0);
+  }
+}
+
+/* ============================================================
+   REDUCED MOTION
+
+   Spatial movement is what causes vestibular upset, so travel and scale
+   become fades. What stays running is everything whose whole purpose is to
+   answer the user: loading and progress indicators, and instant state
+   changes like a hover colour or the focus ring.
+
+   Note what is deliberately ABSENT: a global `animation-duration: 0.01ms`
+   kill switch. That would stop the spinner and remove the only signal that
+   the system is still working — the preference asks for less motion, not
+   for the interface to stop answering.
+   ============================================================ */
+@media (prefers-reduced-motion: reduce) {
+  /* Travel and scale -> plain fade, or nothing. */
+  .animate-rise {
+    animation: none !important;
+    opacity: 1;
+  }
+  .caption-pop,
+  .caption-fade {
+    animation: fade-in 100ms ease-out both !important;
+  }
+  .motion-pop[data-state] {
+    animation: none !important;
+    opacity: 1;
+    transform: none;
+  }
+  .motion-scrim[data-state] {
+    animation: fade-in 120ms ease-out both !important;
+  }
+  .motion-reveal {
+    animation: fade-in 150ms ease-out both !important;
+  }
+
+  /* An accordion that slides is an accordion that can be shown instantly. */
+  .motion-collapse {
+    transition: none !important;
+    opacity: 1;
+    grid-template-rows: 1fr;
+  }
+  .motion-collapse[data-open="false"] {
+    display: none;
+  }
+
+  /* Icon swaps keep the meaning, drop the zoom. */
+  .motion-swap > * {
+    transition: opacity 100ms linear !important;
+    scale: 1 !important;
+    filter: none !important;
+  }
+
+  /* The sweep is literally a bar travelling across the screen. Hold it still
+     but keep it visible, so "rendering" is still legible. */
+  .animate-sweep {
+    animation: none !important;
+    transform: none !important;
+    opacity: 0.55;
+  }
+
+  /* Left running on purpose:
+     .animate-spin  — a spinner is the signal, not the decoration
+     .animate-pulse  — a skeleton is a loading indicator
+     every hover / focus / opacity transition — instant state changes  */
+}
+
+/* ============================================================
+   Safe areas. A sticky action bar sits over the iOS home indicator
+   and Android gesture bar unless it pads itself out of the way.
+   `viewport-fit=cover` is set in index.html, which is what makes
+   these insets non-zero on a notched device.
+   ============================================================ */
+@layer components {
+  /* Layered, not bare: unlayered CSS outranks every Tailwind utility, so a
+     `pb-*` next to `.safe-b` would have lost without a word. */
+  .safe-b {
+    padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
+  }
+  /* Only the inset amount — 0 on a device without a cutout, so this is a no-op
+     on desktop rather than adding padding everywhere. */
+  .safe-x {
+    padding-inline: env(safe-area-inset-left) env(safe-area-inset-right);
+  }
+}
+
+/* ============================================================
+   High contrast. Status colour alone must never be the only carrier
+   of meaning — every badge already pairs its tint with a text label,
+   so here we only need to strengthen the boundaries and lift the
+   state colours off the panel.
+   ============================================================ */
+@media (prefers-contrast: more) {
+  :root {
+    --color-border: oklch(0.46 0.02 265);
+    --color-control: oklch(0.64 0.02 265);
+    --color-muted: oklch(0.79 0.02 265);
+    --color-good: oklch(0.86 0.18 155);
+    --color-warn: oklch(0.89 0.16 85);
+    --color-bad: oklch(0.79 0.2 25);
+  }
+}

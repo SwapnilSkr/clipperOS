@@ -1,0 +1,157 @@
+import { t } from "elysia";
+
+/** Allowed genre ids, mirrored from config/genres.ts for request validation. */
+export const GenreIdLiteral = t.Union([
+  t.Literal("motivation"),
+  t.Literal("comedy_talk"),
+  t.Literal("sports_gaming"),
+  t.Literal("music"),
+]);
+
+/**
+ * Exactly the shape POST /api/uploads mints: `${crypto.randomUUID()}.${ext}`.
+ *
+ * Without this, `uploadId` was any 1-200 character string. It is joined onto the
+ * uploads directory to build a filesystem path, and `join` collapses `..`, so
+ * `"../../../../etc/passwd"` escaped the storage root. The id is also persisted
+ * and later passed to `rm()` on project delete, which made it an arbitrary file
+ * delete. Constraining the shape at the boundary removes the vector entirely.
+ */
+const UPLOAD_ID_PATTERN =
+  "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.[a-z0-9]{1,6}$";
+
+/**
+ * Mongoose ObjectId. Validating it here stops a malformed id from reaching
+ * `findById()`, where it throws a CastError that the error handler reports as a
+ * 500 with the internal driver message attached.
+ */
+const OBJECT_ID_PATTERN = "^[0-9a-f]{24}$";
+
+export const CreateProjectBody = t.Object({
+  /** Full YouTube URL or a bare 11-char video id. */
+  youtubeUrl: t.Optional(t.String({ minLength: 6, maxLength: 500 })),
+  /** Id returned by POST /api/uploads. */
+  uploadId: t.Optional(t.String({ maxLength: 200, pattern: UPLOAD_ID_PATTERN })),
+  title: t.Optional(t.String({ minLength: 1, maxLength: 300 })),
+  /** Omit to let detection pick the genre from the content. */
+  genreId: t.Optional(GenreIdLiteral),
+});
+
+export const ListProjectsQuery = t.Object({
+  limit: t.Optional(t.String()),
+  status: t.Optional(t.String({ maxLength: 40 })),
+});
+
+export const RenderClipsBody = t.Object({
+  clipIds: t.Array(t.String({ pattern: OBJECT_ID_PATTERN }), { minItems: 1, maxItems: 60 }),
+  reframeMode: t.Optional(t.Union([t.Literal("center"), t.Literal("smart")])),
+  /** Override the genre's caption default (e.g. force captions off). */
+  captions: t.Optional(t.Boolean()),
+});
+
+/** Re-mine an already-ingested project, optionally with a different genre. */
+export const RemineBody = t.Object({
+  genreId: t.Optional(GenreIdLiteral),
+});
+
+// ---------------------------------------------------------------------------
+// Clip editing
+//
+// `captionStyleId` is validated as a plain bounded string, NOT a literal union:
+// the style registry is data-driven and meant to grow, so closing it here would
+// make every new preset a request-schema change. `resolveCaptionStyle` falls back
+// to the default for an id it does not know.
+// ---------------------------------------------------------------------------
+
+const CaptionOverridesBody = t.Object({
+  chunkWords: t.Optional(t.Number()),
+  sizeScale: t.Optional(t.Number()),
+  verticalFrac: t.Optional(t.Number()),
+  horizontalFrac: t.Optional(t.Number()),
+  textColor: t.Optional(t.String({ maxLength: 9 })),
+  background: t.Optional(t.Union([t.Literal("none"), t.Literal("box")])),
+  animation: t.Optional(t.Union([t.Literal("none"), t.Literal("pop"), t.Literal("fade")])),
+  peakColor: t.Optional(t.String({ maxLength: 9 })),
+  fontFamily: t.Optional(t.String({ maxLength: 60 })),
+  uppercase: t.Optional(t.Boolean()),
+});
+
+const CaptionTextOverrideBody = t.Object({
+  startSec: t.Number(),
+  id: t.Optional(t.String({ maxLength: 64 })),
+  text: t.Optional(t.String({ maxLength: 160 })),
+  displayStartSec: t.Optional(t.Number()),
+  endSec: t.Optional(t.Number()),
+  hidden: t.Optional(t.Boolean()),
+  custom: t.Optional(t.Boolean()),
+});
+
+const VideoEffectsBody = t.Object({
+  grade: t.Optional(t.Union([
+    t.Literal("natural"), t.Literal("vibrant"), t.Literal("warm"),
+    t.Literal("cool"), t.Literal("cinematic"),
+  ])),
+  motion: t.Optional(t.Union([
+    t.Literal("none"), t.Literal("hook_push"), t.Literal("peak_punch"),
+  ])),
+  zoom: t.Optional(t.Number()),
+  sharpen: t.Optional(t.Number()),
+  vignette: t.Optional(t.Boolean()),
+  audio: t.Optional(t.Union([t.Literal("natural"), t.Literal("voice"), t.Literal("loud")])),
+});
+
+const ClipEditBody = t.Object({
+  trimStartSec: t.Optional(t.Number()),
+  trimEndSec: t.Optional(t.Number()),
+  reframeMode: t.Optional(t.Union([t.Literal("center"), t.Literal("smart")])),
+  captionsOn: t.Optional(t.Boolean()),
+  captionStyleId: t.Optional(t.String({ maxLength: 40 })),
+  captionOverrides: t.Optional(CaptionOverridesBody),
+  captionTextOverrides: t.Optional(t.Array(CaptionTextOverrideBody, { maxItems: 240 })),
+  editTemplateId: t.Optional(t.String({ maxLength: 40 })),
+  videoEffects: t.Optional(VideoEffectsBody),
+});
+
+const ClipSegmentBody = t.Object({
+  startSec: t.Number(),
+  endSec: t.Number(),
+  sourceClipId: t.Optional(t.String({ pattern: OBJECT_ID_PATTERN })),
+  reframeMode: t.Optional(t.Union([t.Literal("center"), t.Literal("smart")])),
+  captionStyleId: t.Optional(t.String({ maxLength: 40 })),
+  captionsOn: t.Optional(t.Boolean()),
+});
+
+/** PATCH /api/clips/:id — persist an edit. Any subset may be sent. */
+export const UpdateClipBody = t.Object({
+  title: t.Optional(t.String({ maxLength: 200 })),
+  edit: t.Optional(ClipEditBody),
+  segments: t.Optional(t.Array(ClipSegmentBody, { maxItems: 20 })),
+});
+
+/** POST /api/clips/merge — order is the play order. */
+export const MergeClipsBody = t.Object({
+  projectId: t.String({ pattern: OBJECT_ID_PATTERN }),
+  clipIds: t.Array(t.String({ pattern: OBJECT_ID_PATTERN }), { minItems: 2, maxItems: 20 }),
+  title: t.Optional(t.String({ maxLength: 200 })),
+});
+
+export const ProjectParams = t.Object({ id: t.String({ pattern: OBJECT_ID_PATTERN }) });
+export const ClipParams = t.Object({ id: t.String({ pattern: OBJECT_ID_PATTERN }) });
+
+/** `?dryRun=0` is the only value that actually deletes; anything else reports. */
+export const ReconcileQuery = t.Object({
+  dryRun: t.Optional(t.String({ maxLength: 4 })),
+});
+
+/** GET /api/clips/:id/words — optional live trim, so extending the out-point fills captions. */
+export const ClipWordsQuery = t.Object({
+  startSec: t.Optional(t.String()),
+  endSec: t.Optional(t.String()),
+});
+
+/** POST /api/clips/:id/reframe/preview — analyse the live trim for editor WYSIWYG. */
+export const PreviewReframeBody = t.Object({
+  startSec: t.Optional(t.Number()),
+  endSec: t.Optional(t.Number()),
+  mode: t.Optional(t.Union([t.Literal("center"), t.Literal("smart")])),
+});

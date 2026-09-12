@@ -1,0 +1,3 @@
+# Loaded automatically by every `bun` invocation in this directory.
+# See src/v8-shim.ts — works around a bson/Bun incompatibility.
+preload = ["./src/v8-shim.ts"]
