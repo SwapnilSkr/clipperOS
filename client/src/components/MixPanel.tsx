@@ -3,7 +3,7 @@ import { Music, Trash2, Upload, Volume2 } from "lucide-react";
 import {
   api,
   builtinAudioUrl,
-  projectAudioUrl,
+  sharedAudioUrl,
   type AudioAsset,
   type Soundtrack,
   type SoundtrackHit,
@@ -30,19 +30,24 @@ export function MixTimeline({
   soundtrack,
   localTime,
   durationSec,
+  outroSec = 0,
   onSeekLocal,
 }: {
   soundtrack: Soundtrack;
   localTime: number;
   durationSec: number;
+  /** Sting length after the clip window. 0 hides that region. */
+  outroSec?: number;
   onSeekLocal: (sec: number) => void;
 }) {
-  const span = Math.max(0.1, durationSec);
+  const clipSpan = Math.max(0.1, durationSec);
+  const span = Math.max(0.1, clipSpan + Math.max(0, outroSec));
   const playhead = Math.min(1, Math.max(0, localTime / span));
+  const clipPct = (clipSpan / span) * 100;
   return (
     <button
       type="button"
-      aria-label="Sound timeline"
+      aria-label={outroSec > 0 ? "Clip and sting timeline" : "Sound timeline"}
       onClick={(event) => {
         const rect = event.currentTarget.getBoundingClientRect();
         const x = (event.clientX - rect.left) / Math.max(1, rect.width);
@@ -51,7 +56,19 @@ export function MixTimeline({
       className="relative mt-1 h-7 w-full overflow-hidden rounded-md border border-border bg-panel-2"
     >
       {soundtrack.music?.assetId ? (
-        <span className="absolute inset-y-1 start-0 end-0 rounded-sm bg-accent/20" />
+        <span
+          className="absolute inset-y-1 start-0 rounded-sm bg-accent/20"
+          style={{
+            width:
+              outroSec > 0 && soundtrack.music.carryIntoOutro !== false ? "100%" : `${clipPct}%`,
+          }}
+        />
+      ) : null}
+      {outroSec > 0 ? (
+        <span
+          className="absolute inset-y-1 rounded-sm bg-fg/10"
+          style={{ left: `${clipPct}%`, right: 0 }}
+        />
       ) : null}
       {(soundtrack.sfx ?? []).map((hit) => (
         <span
@@ -74,6 +91,7 @@ export function MixPanel({
   onChange,
   localTime,
   durationSec,
+  outroSec = 0,
   playing,
   live,
   videoRef,
@@ -82,13 +100,16 @@ export function MixPanel({
   soundtrack: Soundtrack;
   onChange: (next: Soundtrack) => void;
   localTime: number;
+  /** Clip window, or clip + sting when a ready outro is attached. */
   durationSec: number;
+  outroSec?: number;
   playing: boolean;
   live: boolean;
   videoRef: RefObject<HTMLVideoElement | null>;
 }) {
   const [library, setLibrary] = useState<AudioAsset[]>([]);
   const [custom, setCustom] = useState<AudioAsset[]>([]);
+  const [maxCustom, setMaxCustom] = useState(24);
   const [error, setError] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const [uploadKind, setUploadKind] = useState<"music" | "sfx">("sfx");
@@ -101,6 +122,7 @@ export function MixPanel({
       .then((result) => {
         setLibrary(result.builtin);
         setCustom(result.custom);
+        if (result.maxCustom) setMaxCustom(result.maxCustom);
       })
       .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)));
   }
@@ -132,9 +154,11 @@ export function MixPanel({
     };
   }, [live, soundtrack.voiceGain, videoRef]);
 
-  const musicSrc = soundtrack.music?.assetId
-    ? audioSrc(projectId, soundtrack.music.assetId)
-    : undefined;
+  const musicSrc = soundtrack.music?.assetId ? audioSrc(soundtrack.music.assetId) : undefined;
+
+  const clipEnd = Math.max(0.1, durationSec - Math.max(0, outroSec));
+  const musicThroughOutro = outroSec > 0 && soundtrack.music?.carryIntoOutro !== false;
+  const musicPlaying = playing && (localTime <= clipEnd + 0.05 || musicThroughOutro);
 
   useEffect(() => {
     const el = musicEl.current;
@@ -147,9 +171,9 @@ export function MixPanel({
     const bed = Math.max(0.5, el.duration || 16);
     const target = localTime % bed;
     if (Math.abs(el.currentTime - target) > 0.4) el.currentTime = target;
-    if (playing) void el.play().catch(() => undefined);
+    if (musicPlaying) void el.play().catch(() => undefined);
     else el.pause();
-  }, [live, musicSrc, playing, localTime, soundtrack.music?.gain]);
+  }, [live, musicSrc, musicPlaying, localTime, soundtrack.music?.gain]);
 
   useEffect(() => {
     if (!live || !playing) {
@@ -159,7 +183,7 @@ export function MixPanel({
     const prev = lastLocal.current;
     lastLocal.current = localTime;
     for (const hit of soundtrack.sfx ?? []) {
-      if (prev <= hit.atSec && localTime >= hit.atSec) playOneShot(projectId, hit);
+      if (prev <= hit.atSec && localTime >= hit.atSec) playOneShot(hit);
     }
   }, [live, playing, localTime, soundtrack.sfx, projectId]);
 
@@ -176,6 +200,7 @@ export function MixPanel({
         assetId,
         gain: soundtrack.music?.gain ?? 0.22,
         duck: soundtrack.music?.duck ?? true,
+        carryIntoOutro: soundtrack.music?.carryIntoOutro,
       },
     });
   }
@@ -298,6 +323,7 @@ export function MixPanel({
                   music: {
                     assetId: soundtrack.music!.assetId,
                     duck: soundtrack.music?.duck ?? true,
+                    carryIntoOutro: soundtrack.music?.carryIntoOutro,
                     gain: Number(event.target.value),
                   },
                 })
@@ -316,6 +342,7 @@ export function MixPanel({
                     assetId: soundtrack.music!.assetId,
                     gain: musicGain,
                     duck: event.target.checked,
+                    carryIntoOutro: soundtrack.music?.carryIntoOutro,
                   },
                 })
               }
@@ -323,10 +350,33 @@ export function MixPanel({
             />
             <span className="text-ui text-muted">Dip under speech</span>
           </label>
+          {outroSec > 0 ? (
+            <label className="mt-2 flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={soundtrack.music?.carryIntoOutro !== false}
+                onChange={(event) =>
+                  onChange({
+                    ...soundtrack,
+                    music: {
+                      assetId: soundtrack.music!.assetId,
+                      gain: musicGain,
+                      duck: soundtrack.music?.duck ?? true,
+                      carryIntoOutro: event.target.checked,
+                    },
+                  })
+                }
+                className="size-4 accent-accent"
+              />
+              <span className="text-ui text-muted">Carry into sting</span>
+            </label>
+          ) : null}
         </div>
       ) : null}
 
-      <p className="eyebrow mt-4 text-muted">Hits at playhead</p>
+      <p className="eyebrow mt-4 text-muted">
+        {outroSec > 0 ? "Hits at playhead — clip or sting" : "Hits at playhead"}
+      </p>
       <div className="mt-1.5 flex flex-wrap gap-1.5">
         {sfxTracks.map((asset) => (
           <Chip
@@ -347,7 +397,11 @@ export function MixPanel({
               <span className="text-ui min-w-0 flex-1 truncate">
                 {labels.get(hit.assetId) ?? hit.assetId}
               </span>
-              <span className="num text-micro text-muted">{timecode(hit.atSec)}</span>
+              <span className="num text-micro text-muted">
+                {outroSec > 0 && hit.atSec >= clipEnd - 0.02
+                  ? `sting ${timecode(Math.max(0, hit.atSec - clipEnd))}`
+                  : timecode(hit.atSec)}
+              </span>
               <button
                 type="button"
                 onClick={() => removeHit(hit.id)}
@@ -363,10 +417,12 @@ export function MixPanel({
 
       <details className="mt-3 rounded-lg border border-border bg-panel-2/40">
         <summary className="text-ui cursor-pointer px-3 py-2 font-semibold text-muted">
-          Your files
+          Shared library
         </summary>
         <div className="border-t border-border px-3 pb-3">
-          <p className="text-meta mt-2 text-muted">Up to 8 files, 8 MB each. Stored with this project.</p>
+          <p className="text-meta mt-2 text-muted">
+            Up to {maxCustom} files, 8 MB each. Every project can use these.
+          </p>
           <div className="mt-2 flex flex-wrap items-center gap-2">
             <select
               value={uploadKind}
@@ -383,7 +439,7 @@ export function MixPanel({
                 type="file"
                 accept="audio/*,video/mp4"
                 className="sr-only"
-                disabled={uploading}
+                disabled={uploading || custom.length >= maxCustom}
                 onChange={(event) => {
                   const file = event.target.files?.[0];
                   event.target.value = "";
@@ -446,15 +502,15 @@ function Chip({
   );
 }
 
-function audioSrc(projectId: string, assetId: string): string {
+function audioSrc(assetId: string): string {
   if (assetId.startsWith("custom:")) {
-    return projectAudioUrl(projectId, assetId.slice("custom:".length));
+    return sharedAudioUrl(assetId.slice("custom:".length));
   }
   return builtinAudioUrl(assetId);
 }
 
-function playOneShot(projectId: string, hit: SoundtrackHit): void {
-  const src = audioSrc(projectId, hit.assetId);
+function playOneShot(hit: SoundtrackHit): void {
+  const src = audioSrc(hit.assetId);
   const audio = new Audio(src);
   audio.volume = Math.min(1, hit.gain ?? 0.9);
   void audio.play().catch(() => undefined);

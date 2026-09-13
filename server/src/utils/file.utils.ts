@@ -88,6 +88,7 @@ export async function initializeStorage(): Promise<void> {
     ensureDir(config.outputPath),
     ensureDir(config.mediaPath),
     ensureDir(config.audioPath),
+    ensureDir(config.outroPath),
   ]);
 }
 
@@ -101,7 +102,12 @@ export function projectMediaDir(projectId: string): string {
   return join(config.mediaPath, projectId);
 }
 
-/** Directory that holds user-uploaded music and SFX for one project. */
+/** Leftover per-project audio folder. Prefer `storage/audio/shared`. */
 export function projectAudioDir(projectId: string): string {
   return join(config.audioPath, projectId);
+}
+
+/** Directory that holds a project's logo sting and its source mark. */
+export function projectOutroDir(projectId: string): string {
+  return join(config.outroPath, projectId);
 }

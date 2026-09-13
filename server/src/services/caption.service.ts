@@ -1,4 +1,5 @@
 import {
+  ASS_FONT_SIZE_MATCH,
   CAPTION_BASE_FONT,
   CAPTION_VERTICAL_FRAC,
   OUTPUT_HEIGHT,
@@ -6,11 +7,13 @@ import {
   PEAK_BASE_FONT,
   PEAK_COLOR,
   type CaptionTextOverride,
+  type CaptionWordOverride,
   type TimelineCaption,
   type VttWordTiming,
 } from "../types/clip.types";
 import type { CaptionStyle } from "../config/caption-styles";
 import { resolveCaptionFont } from "../config/caption-fonts";
+import { expandWordTimings } from "./transcript.service";
 
 // ============================================
 // CAPTIONS
@@ -25,6 +28,28 @@ import { resolveCaptionFont } from "../config/caption-fonts";
 // ============================================
 
 const DEFAULT_CHUNK_SIZE = 3;
+/** One clean frame after the last spoken word, before a hard outro cut. */
+const AFTER_WORD_PAD_SEC = 0.04;
+const MIN_WORD_HOLD_SEC = 0.36;
+const MAX_WORD_HOLD_SEC = 1.15;
+
+function clipCaptionEnd(start: number, nextT: number | undefined, duration: number): number {
+  const cap = Math.max(start + 0.04, duration - AFTER_WORD_PAD_SEC);
+  const natural = nextT != null ? Math.min(nextT, start + MAX_WORD_HOLD_SEC) : start + MIN_WORD_HOLD_SEC;
+  return Math.min(cap, natural);
+}
+
+function msKey(t: number): number {
+  return Math.round(t * 1000);
+}
+
+function tokenizeCaption(text: string): string[] {
+  return text.trim().split(/\s+/).filter(Boolean);
+}
+
+function alignKey(word: string): string {
+  return normalizeWord(word) || word.toLowerCase();
+}
 
 function normalizeWord(word: string): string {
   return word.toLowerCase().replace(/[^a-z0-9']/g, "");
@@ -36,6 +61,166 @@ function normalizeWords(text: string): string[] {
     .replace(/[^a-z0-9'\s]/g, " ")
     .split(/\s+/)
     .filter(Boolean);
+}
+
+/** Spread edited tokens across the onsets they were typed over. */
+export function assignTokensToWords(
+  targets: VttWordTiming[],
+  tokens: string[]
+): CaptionWordOverride[] {
+  if (targets.length === 0) return [];
+  if (tokens.length === 0) return targets.map((word) => ({ t: word.t, hidden: true }));
+  if (tokens.length <= targets.length) {
+    return targets.map((word, i) =>
+      i < tokens.length ? { t: word.t, word: tokens[i] } : { t: word.t, hidden: true }
+    );
+  }
+  return targets.map((word, i) =>
+    i < targets.length - 1
+      ? { t: word.t, word: tokens[i] }
+      : { t: word.t, word: tokens.slice(i).join(" ") }
+  );
+}
+
+/** Turn older group-level subtitle edits into word patches. */
+export function compileGroupEditsToWords(
+  words: VttWordTiming[],
+  groupEdits: CaptionTextOverride[]
+): CaptionWordOverride[] {
+  const out: CaptionWordOverride[] = [];
+  for (const edit of groupEdits) {
+    if (edit.custom) continue;
+    const start = edit.startSec;
+    const from = words.findIndex((word) => word.t >= start - 0.05);
+    if (from < 0) continue;
+    const spanned =
+      edit.endSec != null && Number.isFinite(edit.endSec)
+        ? words.filter((word) => word.t >= start - 0.02 && word.t < edit.endSec! - 0.001)
+        : [];
+    if (edit.hidden) {
+      const hide = spanned.length > 0 ? spanned : words.slice(from, from + 1);
+      for (const word of hide) out.push({ t: word.t, hidden: true });
+      continue;
+    }
+    const tokens = tokenizeCaption(edit.text ?? "");
+    if (tokens.length === 0) continue;
+    const targets = spanned.length > 0 ? spanned : words.slice(from, from + tokens.length);
+    out.push(...assignTokensToWords(targets, tokens));
+  }
+  return out;
+}
+
+function mergeWordPatches(patches: CaptionWordOverride[]): Map<number, CaptionWordOverride> {
+  const map = new Map<number, CaptionWordOverride>();
+  for (const item of patches) {
+    if (!Number.isFinite(item.t)) continue;
+    const key = msKey(item.t);
+    const prev = map.get(key);
+    map.set(key, prev ? { ...prev, ...item, t: item.t } : item);
+  }
+  return map;
+}
+
+/** Bind stored word/group edits onto the spoken onsets. */
+export function applyCaptionWords(
+  words: VttWordTiming[],
+  wordOverrides: CaptionWordOverride[] = [],
+  groupEdits: CaptionTextOverride[] = []
+): VttWordTiming[] {
+  const base = expandWordTimings(words);
+  const patches = mergeWordPatches([
+    ...compileGroupEditsToWords(base, groupEdits),
+    ...wordOverrides,
+  ]);
+  const next: VttWordTiming[] = [];
+  for (const word of base) {
+    const edit = patches.get(msKey(word.t));
+    if (edit?.hidden) continue;
+    const text = edit?.word?.trim();
+    next.push({ t: word.t, word: text || word.word });
+  }
+  return expandWordTimings(next);
+}
+
+function lcsAlign(a: string[], b: string[]): Array<{ oldIdx?: number; newIdx?: number }> {
+  const n = a.length;
+  const m = b.length;
+  const dp: Uint16Array[] = Array.from({ length: n + 1 }, () => new Uint16Array(m + 1));
+  for (let i = 1; i <= n; i++) {
+    for (let j = 1; j <= m; j++) {
+      dp[i]![j] = a[i - 1] === b[j - 1] ? dp[i - 1]![j - 1]! + 1 : Math.max(dp[i - 1]![j]!, dp[i]![j - 1]!);
+    }
+  }
+  const ops: Array<{ oldIdx?: number; newIdx?: number }> = [];
+  let i = n;
+  let j = m;
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && a[i - 1] === b[j - 1]) {
+      ops.push({ oldIdx: i - 1, newIdx: j - 1 });
+      i--;
+      j--;
+    } else if (j > 0 && (i === 0 || dp[i]![j - 1]! >= dp[i - 1]![j]!)) {
+      ops.push({ newIdx: j - 1 });
+      j--;
+    } else {
+      ops.push({ oldIdx: i - 1 });
+      i--;
+    }
+  }
+  return ops.reverse();
+}
+
+/**
+ * Align an edited transcript to the existing word onsets. Extra words hang on
+ * the previous timestamp and are spread until the next spoken word. Words typed
+ * before the first onset stay on that first onset — they must not be appended
+ * after it, or the first-word edit jumps later in the line.
+ */
+export function bindTranscriptToTimings(
+  words: VttWordTiming[],
+  transcript: string
+): CaptionWordOverride[] {
+  const oldWords = expandWordTimings(words).filter((word) => word.word.trim());
+  const newTokens = tokenizeCaption(transcript);
+  if (oldWords.length === 0) return [];
+  if (newTokens.length === 0) return oldWords.map((word) => ({ t: word.t, hidden: true }));
+
+  const ops = lcsAlign(oldWords.map((word) => alignKey(word.word)), newTokens.map(alignKey));
+  const extras = new Map<number, { before: string[]; after: string[] }>();
+  const out = new Map<number, CaptionWordOverride>();
+  let lastKept = -1;
+
+  for (const step of ops) {
+    if (step.oldIdx != null && step.newIdx != null) {
+      lastKept = step.oldIdx;
+      const orig = oldWords[step.oldIdx]!;
+      const next = newTokens[step.newIdx]!;
+      if (orig.word !== next) out.set(msKey(orig.t), { t: orig.t, word: next });
+    } else if (step.oldIdx != null) {
+      const orig = oldWords[step.oldIdx]!;
+      out.set(msKey(orig.t), { t: orig.t, hidden: true });
+    } else if (step.newIdx != null) {
+      const token = newTokens[step.newIdx]!;
+      const attach = lastKept >= 0 ? lastKept : 0;
+      const bucket = extras.get(attach) ?? { before: [], after: [] };
+      if (lastKept >= 0) bucket.after.push(token);
+      else bucket.before.push(token);
+      extras.set(attach, bucket);
+    }
+  }
+
+  for (const [oldIdx, extra] of extras) {
+    const orig = oldWords[oldIdx]!;
+    const key = msKey(orig.t);
+    const existing = out.get(key);
+    const nextWords = existing?.hidden
+      ? [...extra.before, ...extra.after]
+      : [...extra.before, existing?.word ?? orig.word, ...extra.after];
+    if (nextWords.length === 0) continue;
+    out.set(key, { t: orig.t, word: nextWords.join(" ") });
+  }
+
+  return [...out.values()].sort((a, b) => a.t - b.t);
 }
 
 /**
@@ -57,43 +242,37 @@ export function buildTimelineCaptions(
   peakSec?: number,
   chunkSize = DEFAULT_CHUNK_SIZE,
   textOverrides: CaptionTextOverride[] = [],
-  peakEmphasis = true
+  peakEmphasis = true,
+  wordOverrides: CaptionWordOverride[] = []
 ): TimelineCaption[] {
-  const inClip = wordTimings
+  const prepared = applyCaptionWords(wordTimings, wordOverrides, textOverrides);
+  const inClip = prepared
     .map((w) => ({ t: w.t - clipStartSec, word: w.word }))
     // Only words actually inside the clip. A negative tolerance here pulled the
-    // previous word into the first caption.
-    .filter((w) => w.t >= -0.05 && w.t <= duration);
+    // previous word into the first caption. The out-pad keeps the outro join clean.
+    .filter((w) => w.t >= -0.05 && w.t < duration - AFTER_WORD_PAD_SEC);
   const peakWindow = peakEmphasis ? resolvePeakWindow(inClip, duration, peakLine, peakSec) : null;
-  const overrideByStart = new Map(
-    textOverrides
-      .filter((item) => !item.custom)
-      .map((item) => [Math.round(item.startSec * 1000), item])
-  );
 
   const size = Math.max(1, Math.round(chunkSize));
   const out: TimelineCaption[] = [];
   for (let i = 0; i < inClip.length; ) {
-    const sourceStart = clipStartSec + Math.max(0, inClip[i]!.t);
-    const edit = overrideByStart.get(Math.round(sourceStart * 1000));
-    const take = edit?.hidden ? 1 : size;
+    const take = Math.min(size, inClip.length - i);
     const group = inClip.slice(i, i + take);
     const start = Math.max(0, group[0]!.t);
     const next = inClip[i + take];
-    const end = Math.min(duration, next ? next.t : start + 1.1);
+    const lastAbs = clipStartSec + group[group.length - 1]!.t;
+    const following = next ? undefined : prepared.find((word) => word.t > lastAbs + 0.001);
+    const nextT = next != null ? next.t : following != null ? following.t - clipStartSec : undefined;
+    const end = clipCaptionEnd(start, nextT, duration);
     i += take;
     if (end <= start) continue;
-    if (edit?.hidden) continue;
-    const editedStart = Math.max(0, (edit?.displayStartSec ?? sourceStart) - clipStartSec);
-    const editedEnd = Math.min(duration, (edit?.endSec ?? clipStartSec + end) - clipStartSec);
-    const text = edit?.text ?? group.map((g) => g.word).join(" ");
-    if (editedEnd <= editedStart || !text.trim()) continue;
+    const text = group.map((g) => g.word).join(" ");
+    if (!text.trim()) continue;
     out.push({
-      start: editedStart,
-      end: editedEnd,
+      start,
+      end,
       text,
-      emphasis:
-        peakWindow !== null && editedEnd > peakWindow.start && editedStart < peakWindow.end,
+      emphasis: peakWindow !== null && end > peakWindow.start && start < peakWindow.end,
     });
   }
 
@@ -102,7 +281,7 @@ export function buildTimelineCaptions(
     const absoluteEnd = edit.endSec ?? edit.startSec + 1.5;
     if (absoluteEnd <= clipStartSec || edit.startSec >= clipStartSec + duration) continue;
     const start = Math.max(0, edit.startSec - clipStartSec);
-    const end = Math.min(duration, absoluteEnd - clipStartSec);
+    const end = Math.min(duration - AFTER_WORD_PAD_SEC, absoluteEnd - clipStartSec);
     if (end <= start) continue;
     out.push({
       start,
@@ -249,8 +428,8 @@ export function renderAss(captions: TimelineCaption[], options: AssOptions = {})
   const peakColor = options.peakColor ?? PEAK_COLOR;
   const uppercase = options.uppercase ?? false;
 
-  const captionSize = Math.round(CAPTION_BASE_FONT * scale);
-  const peakSize = Math.round(PEAK_BASE_FONT * scale);
+  const captionSize = Math.round(CAPTION_BASE_FONT * scale * ASS_FONT_SIZE_MATCH);
+  const peakSize = Math.round(PEAK_BASE_FONT * scale * ASS_FONT_SIZE_MATCH);
   const marginV = Math.round(verticalFrac * OUTPUT_HEIGHT);
   const positionX = Math.round(Math.max(0.05, Math.min(0.95, horizontalFrac)) * OUTPUT_WIDTH);
   const positionY = Math.round((1 - Math.max(0.05, Math.min(0.95, verticalFrac))) * OUTPUT_HEIGHT);

@@ -13,6 +13,7 @@ import { Clip, ClipProject, type IClip, type IClipProject } from "../models";
 import type {
   CleanupRegion,
   CaptionTextOverride,
+  CaptionWordOverride,
   ClipSegment,
   CropKeyframe,
   ReframeTrack,
@@ -36,11 +37,13 @@ import { activeCleanupRegions, cleanupDelogoChain, inpaintCleanupPrepass } from 
 import { getVideoMetadata, hasAudioStream } from "./ffmpeg.service";
 import { ensureProjectMedia } from "./ingest.service";
 import { buildWordTimeline } from "./mining.service";
+import { expandWordTimings } from "./transcript.service";
 import { resolveReframe } from "./reframe.service";
 import { holdCropUntilCuts } from "./speaker-reframe.service";
 import { cdnUrlFor, deleteKey, isS3Configured, uploadFileAtKey } from "./s3.service";
 import { recomputeProjectStorage } from "./clip.service";
-import { mixSoundtrackOntoClip, soundtrackNeedsMix } from "./soundtrack.service";
+import { mixSoundtrackOntoClip, soundtrackNeedsMix, soundtrackSpansOutro } from "./soundtrack.service";
+import { appendOutroToClip, loadSharedOutroLibrary, overlaySharedOutroLibrary, pickProjectOutro } from "./outro.service";
 
 // ============================================
 // CLIP RENDER
@@ -191,9 +194,11 @@ function wordTimingsFor(project: {
   wordTimings?: VttWordTiming[];
   captions?: { startSec: number; endSec: number; text: string }[];
 }): VttWordTiming[] {
-  if (project.wordTimings?.length) return project.wordTimings;
+  if (project.wordTimings?.length) return expandWordTimings(project.wordTimings);
   if (!project.captions?.length) return [];
-  return buildWordTimeline(project.captions).map((w) => ({ t: w.startSec, word: w.text }));
+  return expandWordTimings(
+    buildWordTimeline(project.captions).map((w) => ({ t: w.startSec, word: w.text }))
+  );
 }
 
 /** The caption preset for a clip, with per-clip overrides layered on. */
@@ -232,7 +237,8 @@ async function writeCaptions(
   peakSec: number,
   style: CaptionStyle,
   textOverrides: CaptionTextOverride[] = [],
-  peakEmphasis = true
+  peakEmphasis = true,
+  wordOverrides: CaptionWordOverride[] = []
 ): Promise<string | undefined> {
   const captions = buildTimelineCaptions(
     wordTimingsFor(project),
@@ -242,7 +248,8 @@ async function writeCaptions(
     peakSec,
     style.chunkWords,
     textOverrides,
-    peakEmphasis
+    peakEmphasis,
+    wordOverrides
   );
   if (captions.length === 0) return undefined;
 
@@ -471,7 +478,12 @@ export async function renderClip(clipId: string, options: RenderClipOptions = {}
 
     await validateArtifact(outputPath, duration);
 
-    if (soundtrackNeedsMix(clip.edit?.soundtrack)) {
+    await loadSharedOutroLibrary();
+    const library = overlaySharedOutroLibrary(project);
+    const chosen = pickProjectOutro(library.items, clip.edit?.outro?.outroId, library.defaultOutroId);
+    const mixAfterJoin = soundtrackSpansOutro(clip.edit?.soundtrack, duration);
+
+    if (soundtrackNeedsMix(clip.edit?.soundtrack) && !mixAfterJoin) {
       reportProgress(clipId, revision, 90);
       outputPath = await mixSoundtrackOntoClip(
         String(project._id),
@@ -481,6 +493,31 @@ export async function renderClip(clipId: string, options: RenderClipOptions = {}
         scratchDir
       );
       await validateArtifact(outputPath, duration);
+    }
+
+    reportProgress(clipId, revision, 94);
+    const joined = await appendOutroToClip(
+      String(project._id),
+      outputPath,
+      duration,
+      clip.edit?.outro,
+      scratchDir,
+      chosen
+    );
+    outputPath = joined.path;
+    await validateArtifact(outputPath, joined.durationSec);
+
+    if (soundtrackNeedsMix(clip.edit?.soundtrack) && mixAfterJoin) {
+      reportProgress(clipId, revision, 96);
+      outputPath = await mixSoundtrackOntoClip(
+        String(project._id),
+        outputPath,
+        joined.durationSec,
+        clip.edit?.soundtrack,
+        scratchDir,
+        { voiceUntilSec: duration }
+      );
+      await validateArtifact(outputPath, joined.durationSec);
     }
 
     const delivered = await deliverArtifact(clip, project, outputPath);
@@ -970,7 +1007,8 @@ async function prepareSegments(input: {
         input.clip.peakSec,
         styleForClip(input.clip, window),
         input.clip.edit?.captionTextOverrides,
-        input.clip.edit?.captionOverrides?.peakEmphasis !== false
+        input.clip.edit?.captionOverrides?.peakEmphasis !== false,
+        input.clip.edit?.captionWordOverrides
       );
     }
 
@@ -1133,7 +1171,7 @@ async function validateArtifact(outputPath: string, duration: number): Promise<v
     );
   }
   const rendered = await getVideoMetadata(outputPath).catch(() => null);
-  if (!rendered || rendered.durationSec < duration * 0.5) {
+  if (!rendered || rendered.durationSec < duration * 0.85) {
     throw new Error(
       `Render produced only ${rendered?.durationSec?.toFixed(1) ?? "0"}s of a ` +
         `${duration.toFixed(1)}s clip.`
@@ -1245,7 +1283,7 @@ async function encodeMerge(
     "-pix_fmt", "yuv420p"
   );
   if (audio) args.push("-c:a", "aac", "-b:a", "128k");
-  args.push("-movflags", "+faststart", "-progress", "pipe:1", outputPath);
+  args.push("-t", totalDuration.toFixed(4), "-movflags", "+faststart", "-progress", "pipe:1", outputPath);
 
   await runCommand(config.ffmpegPath, args, {
     label: "merge render",

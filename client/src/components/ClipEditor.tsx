@@ -24,14 +24,18 @@ import {
   api,
   clipDownloadUrl,
   MAX_CLEANUP_REGIONS,
+  pickProjectOutro,
+  projectOutroPreviewUrl,
   type CaptionFontInfo,
   type CaptionOverrides,
   type CaptionStyleInfo,
   type CaptionTextOverride,
+  type CaptionWordOverride,
   type CleanupRegion,
   type ClipEdit,
   type ClipPayload,
   type ClipSegment,
+  type ClipOutro,
   type ProjectSummary,
   type ReframeTrack,
   type Soundtrack,
@@ -41,10 +45,17 @@ import { CaptionOverlay } from "./CaptionOverlay";
 import { CleanupLayer } from "./CleanupLayer";
 import { CutCheckPanel } from "./CutCheckPanel";
 import { MixPanel, MixTimeline, soundtrackPayload } from "./MixPanel";
+import { OutroAttachCard } from "./OutroBuilder";
+import { ShareCopyButton } from "./ShareCopyButton";
 import {
+  applyCaptionWords,
+  assignTokensToWords,
+  bindTranscriptToTimings,
   buildTimelineCaptions,
   captionAt,
+  compileGroupEditsToWords,
   effectiveCaptionStyle,
+  expandWordTimings,
   type WordTiming,
 } from "@/lib/captions";
 import { checkSceneCuts, sceneCutsInWindow } from "@/lib/cut-check";
@@ -75,8 +86,11 @@ interface ClipEditorProps {
   onSave: (draft: ClipEditDraft) => Promise<void>;
   onRender: (draft: ClipEditDraft) => Promise<void>;
   onRequestDelete: () => void;
+  /** Open the project sting builder, then return to this clip. */
+  onOpenOutro: (outroId?: string) => void;
   /** Back to the clip's board. */
   onBack: () => void;
+  onClipUpdated?: (clip: ClipPayload) => void;
 }
 
 interface TrimHistoryEntry {
@@ -112,7 +126,9 @@ export function ClipEditor({
   onSave,
   onRender,
   onRequestDelete,
+  onOpenOutro,
   onBack,
+  onClipUpdated,
 }: ClipEditorProps) {
   const isMerge = clip.kind === "merge";
   const [searchParams, setSearchParams] = useSearchParams();
@@ -129,9 +145,17 @@ export function ClipEditor({
   const [captionTextOverrides, setCaptionTextOverrides] = useState<CaptionTextOverride[]>(
     clip.edit?.captionTextOverrides ?? []
   );
+  const [captionWordOverrides, setCaptionWordOverrides] = useState<CaptionWordOverride[]>(
+    clip.edit?.captionWordOverrides ?? []
+  );;
   const [editTemplateId, setEditTemplateId] = useState(clip.edit?.editTemplateId ?? "custom");
   const [videoEffects, setVideoEffects] = useState<VideoEffects>(clip.edit?.videoEffects ?? {});
   const [soundtrack, setSoundtrack] = useState<Soundtrack>(clip.edit?.soundtrack ?? {});
+  const [clipOutro, setClipOutro] = useState<ClipOutro>({
+    enabled: clip.edit?.outro?.enabled !== false,
+    transitionId: clip.edit?.outro?.transitionId ?? "smash",
+    outroId: clip.edit?.outro?.outroId,
+  });
   const [reframeMode, setReframeMode] = useState<"center" | "smart">(
     clip.edit?.reframeMode ?? "smart"
   );
@@ -146,6 +170,10 @@ export function ClipEditor({
   const [activeIndex, setActiveIndex] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(0);
+  const [previewStage, setPreviewStage] = useState<"clip" | "outro">("clip");
+  const [outroTime, setOutroTime] = useState(0);
+  const [outroDuration, setOutroDuration] = useState(0);
+  const [joinFlash, setJoinFlash] = useState<null | "white" | "black" | "fade">(null);
   const [frameHeight, setFrameHeight] = useState(0);
   // Default to the source (trim handles need its clock). When it is not on disk
   // yet, fall back to the last render so the page still shows something.
@@ -172,11 +200,19 @@ export function ClipEditor({
   );
   const [showCleanup, setShowCleanup] = useState(false);
   const [positioningCaptions, setPositioningCaptions] = useState(false);
+  const [cleaningCaptions, setCleaningCaptions] = useState(false);
+  const [cleanNote, setCleanNote] = useState<string | null>(null);
 
   const videoRef = useRef<HTMLVideoElement>(null);
+  const outroVideoRef = useRef<HTMLVideoElement>(null);
   const previewCanvasRef = useRef<HTMLCanvasElement>(null);
   const frameRef = useRef<HTMLDivElement>(null);
+  const previewStageRef = useRef<"clip" | "outro">("clip");
+  const handingToOutroRef = useRef(false);
+  const beginOutroRef = useRef<() => void>(() => undefined);
+  const outroPlaythroughRef = useRef(false);
   const titleId = useRef(`clip-editor-${clip.id}`).current;
+  const migratedWordsFor = useRef<string | null>(null);
 
   // ---- word onsets for local caption preview ----
   useEffect(() => {
@@ -207,6 +243,19 @@ export function ClipEditor({
   const active = previewSegments[safeIndex] ?? { startSec: trimStart, endSec: trimEnd };
   const sourceDuration =
     project.durationSec ?? Math.max(trimEnd, active.endSec, clip.endSec, 0.1);
+  const projectOutros = project.outros ?? (project.outro ? [project.outro] : []);
+  const selectedOutro = pickProjectOutro(projectOutros, clipOutro.outroId, project.defaultOutroId);
+  const outroPlaythrough =
+    desk === "mix" && mode === "source" && clipOutro.enabled !== false && Boolean(selectedOutro?.ready);
+  const outroPreviewUrl =
+    outroPlaythrough && selectedOutro
+      ? projectOutroPreviewUrl(project.id, selectedOutro.id, selectedOutro.updatedAt)
+      : undefined;
+  const clipWindowDur = Math.max(0.1, active.endSec - active.startSec);
+  const outroDur = outroDuration > 0.05 ? outroDuration : selectedOutro?.durationSec ?? 2.4;
+  const playthroughDur = outroPlaythrough ? clipWindowDur + outroDur : clipWindowDur;
+  previewStageRef.current = previewStage;
+  outroPlaythroughRef.current = outroPlaythrough;
 
   // ---- effective caption look + captions for the active window ----
   const preset = styles.find((s) => s.id === styleId) ?? styles[0] ?? FALLBACK_STYLE;
@@ -225,7 +274,8 @@ export function ClipEditor({
       clip.peakSec,
       style.chunkWords,
       captionTextOverrides,
-      overrides.peakEmphasis !== false
+      overrides.peakEmphasis !== false,
+      captionWordOverrides
     );
   }, [
     words,
@@ -236,11 +286,60 @@ export function ClipEditor({
     clip.peakLine,
     clip.peakSec,
     captionTextOverrides,
+    captionWordOverrides,
     overrides.peakEmphasis,
   ]);
 
   const activeCaption = mode === "source" ? captionAt(captions, time - active.startSec) : null;
+  const boundTranscript = useMemo(() => {
+    if (!words) return "";
+    return applyCaptionWords(words, captionWordOverrides, captionTextOverrides)
+      .filter((word) => word.t >= active.startSec - 0.05 && word.t <= active.endSec)
+      .map((word) => word.word)
+      .join(" ");
+  }, [words, captionWordOverrides, captionTextOverrides, active.startSec, active.endSec]);
+  const [transcriptDraft, setTranscriptDraft] = useState(boundTranscript);
+  const [transcriptFocused, setTranscriptFocused] = useState(false);
   const removedCaptionSections = captionTextOverrides.filter((item) => item.hidden);
+  const removedWordSpans = useMemo(() => {
+    if (!words) return [];
+    const hidden = new Set(
+      captionWordOverrides.filter((item) => item.hidden).map((item) => Math.round(item.t * 1000))
+    );
+    const spans: { key: string; text: string; ts: number[] }[] = [];
+    let current: WordTiming[] = [];
+    const flush = () => {
+      if (current.length === 0) return;
+      spans.push({
+        key: `words:${Math.round(current[0]!.t * 1000)}`,
+        text: current.map((word) => word.word).join(" "),
+        ts: current.map((word) => word.t),
+      });
+      current = [];
+    };
+    for (const word of expandWordTimings(words)) {
+      if (hidden.has(Math.round(word.t * 1000))) current.push(word);
+      else flush();
+    }
+    flush();
+    return spans;
+  }, [words, captionWordOverrides]);
+
+  useEffect(() => {
+    if (!transcriptFocused) setTranscriptDraft(boundTranscript);
+  }, [boundTranscript, transcriptFocused]);
+
+  useEffect(() => {
+    if (!words || migratedWordsFor.current === clip.id) return;
+    migratedWordsFor.current = clip.id;
+    if ((clip.edit?.captionWordOverrides ?? []).length > 0) return;
+    const generated = captionTextOverrides.filter((item) => !item.custom);
+    if (generated.length === 0) return;
+    const compiled = compileGroupEditsToWords(expandWordTimings(words), generated);
+    if (compiled.length === 0) return;
+    setCaptionWordOverrides(compiled);
+    setCaptionTextOverrides((prev) => prev.filter((item) => item.custom));
+  }, [words, clip.id, clip.edit?.captionWordOverrides, captionTextOverrides]);
 
   // ---- player plumbing ----
   const seekTo = useCallback((seconds: number) => {
@@ -251,13 +350,14 @@ export function ClipEditor({
   }, []);
 
   // Keep the playhead inside the active window: switching segment, or moving a
-  // handle past the playhead, both land here.
+  // handle past the playhead, both land here. Skip while the sting is on screen.
   useEffect(() => {
+    if (previewStage === "outro" || handingToOutroRef.current) return;
     const video = videoRef.current;
     if (!video) return;
     const outside = video.currentTime < active.startSec - 0.05 || video.currentTime > active.endSec + 0.05;
     if (outside) seekTo(active.startSec);
-  }, [active.startSec, active.endSec, seekTo]);
+  }, [active.startSec, active.endSec, seekTo, previewStage]);
 
   useEffect(() => {
     const element = frameRef.current;
@@ -280,8 +380,81 @@ export function ClipEditor({
     setTime(video.currentTime);
   }
 
+  function leaveOutroStage() {
+    outroVideoRef.current?.pause();
+    setPreviewStage("clip");
+    setJoinFlash(null);
+    setOutroTime(0);
+    handingToOutroRef.current = false;
+  }
+
+  beginOutroRef.current = () => {
+    const sting = outroVideoRef.current;
+    const clipEl = videoRef.current;
+    if (!sting) {
+      clipEl?.pause();
+      return;
+    }
+    handingToOutroRef.current = true;
+    clipEl?.pause();
+    setPreviewStage("outro");
+    setJoinFlash(null);
+    setOutroTime(0);
+    try {
+      sting.currentTime = 0;
+    } catch {
+      /* some engines throw if metadata is not ready */
+    }
+    void sting.play();
+  };
+
+  useEffect(() => {
+    if (outroPlaythrough) return;
+    if (previewStage === "clip" && joinFlash == null) return;
+    outroVideoRef.current?.pause();
+    setPreviewStage("clip");
+    setJoinFlash(null);
+    setOutroTime(0);
+    handingToOutroRef.current = false;
+  }, [outroPlaythrough, previewStage, joinFlash]);
+
+  function seekPlaythrough(local: number) {
+    const clipped = Math.max(0, Math.min(playthroughDur, local));
+    if (!outroPlaythrough || clipped < clipWindowDur - 0.02) {
+      leaveOutroStage();
+      seekTo(active.startSec + Math.min(clipWindowDur, clipped));
+      return;
+    }
+    videoRef.current?.pause();
+    setPreviewStage("outro");
+    setJoinFlash(null);
+    const stingTime = Math.min(outroDur, Math.max(0, clipped - clipWindowDur));
+    const sting = outroVideoRef.current;
+    if (sting) {
+      sting.currentTime = stingTime;
+      setOutroTime(stingTime);
+    }
+  }
+
   function togglePlay() {
     const video = videoRef.current;
+    const sting = outroVideoRef.current;
+    if (previewStage === "outro" && sting) {
+      if (sting.paused) {
+        if (sting.ended || sting.currentTime >= (sting.duration || outroDur) - 0.05) {
+          leaveOutroStage();
+          if (video) {
+            video.currentTime = active.startSec;
+            void video.play();
+          }
+          return;
+        }
+        void sting.play();
+      } else {
+        sting.pause();
+      }
+      return;
+    }
     if (!video) return;
     if (video.paused) {
       if (video.currentTime < active.startSec || video.currentTime >= active.endSec - 0.02) {
@@ -294,6 +467,7 @@ export function ClipEditor({
   }
 
   function selectSegment(index: number) {
+    leaveOutroStage();
     setActiveIndex(index);
     seekTo(previewSegments[index]?.startSec ?? 0);
   }
@@ -408,9 +582,11 @@ export function ClipEditor({
       segments,
       cleanup,
       captionTextOverrides,
+      captionWordOverrides,
       editTemplateId,
       videoEffects,
       soundtrack,
+      clipOutro,
     });
   }
   const [saved, setSaved] = useState(snapshot);
@@ -425,9 +601,15 @@ export function ClipEditor({
       // omitting this would make the Reset button unable to clear the overrides.
       captionOverrides: overrides,
       captionTextOverrides,
+      captionWordOverrides,
       editTemplateId,
       videoEffects,
       soundtrack: soundtrackPayload(soundtrack),
+      outro: {
+        enabled: clipOutro.enabled !== false,
+        transitionId: clipOutro.transitionId ?? "smash",
+        outroId: clipOutro.outroId,
+      },
       // Same rule: an empty array is an explicit reset of the cleanup regions.
       cleanup,
     };
@@ -687,7 +869,7 @@ export function ClipEditor({
   );
   // WYSIWYG only when the crop is showing: in "fit" the whole source is visible,
   // so a caption at the burned-in position would sit in the wrong place.
-  const showCaptionsInFrame = mode === "source" && fitMode === "crop";
+  const showCaptionsInFrame = mode === "source" && fitMode === "crop" && previewStage === "clip";
   const cropPreview = mode === "source" && fitMode === "crop" && frameWidth > 0;
   const sceneCuts = useMemo(
     () => (reframeMode === "smart" ? sceneCutsInWindow(track, trimStart, trimEnd) : []),
@@ -703,6 +885,7 @@ export function ClipEditor({
   const cutFlashes = cutChecks.filter((item) => item.status === "flash").length;
   const resolvedEffects = resolveVideoEffects(videoEffects);
   const localPreviewTime = Math.max(0, time - active.startSec);
+  const playheadLocal = previewStage === "outro" ? clipWindowDur + outroTime : localPreviewTime;
   const peakAt = clip.peakSec - active.startSec;
   const previewZoom = motionZoom(resolvedEffects, localPreviewTime, peakAt);
   const picturePreviewStyle = {
@@ -741,7 +924,10 @@ export function ClipEditor({
       setTime(mediaTime);
       paintPreview(mediaTime);
       if (!video.paused && mediaTime >= active.endSec - 0.03) {
-        if (!isMerge || safeIndex >= previewSegments.length - 1) {
+        const lastPart = !isMerge || safeIndex >= previewSegments.length - 1;
+        if (lastPart && outroPlaythroughRef.current) {
+          beginOutroRef.current();
+        } else if (lastPart) {
           video.pause();
         } else {
           setActiveIndex(safeIndex + 1);
@@ -800,22 +986,46 @@ export function ClipEditor({
     setCleanup((prev) => prev.map((region) => (region.id === id ? { ...region, ...patch } : region)));
   }
 
+  function mergeWordPatches(patch: CaptionWordOverride[]) {
+    setCaptionWordOverrides((prev) => {
+      const map = new Map(prev.map((item) => [Math.round(item.t * 1000), item]));
+      for (const item of patch) map.set(Math.round(item.t * 1000), item);
+      return [...map.values()].sort((a, b) => a.t - b.t);
+    });
+  }
+
+  function dropGeneratedGroupEdit(startSec: number) {
+    setCaptionTextOverrides((prev) =>
+      prev.filter(
+        (item) => item.custom || Math.round(item.startSec * 1000) !== Math.round(startSec * 1000)
+      )
+    );
+  }
+
   function updateCaptionSection(caption: (typeof captions)[number], patch: Partial<CaptionTextOverride>) {
+    if (!caption.custom) {
+      if (patch.hidden) {
+        mergeWordPatches(caption.words.map((word) => ({ t: word.t, hidden: true })));
+        dropGeneratedGroupEdit(caption.sourceStartSec);
+        return;
+      }
+      if (patch.text !== undefined) {
+        mergeWordPatches(assignTokensToWords(caption.words, patch.text.trim().split(/\s+/).filter(Boolean)));
+        dropGeneratedGroupEdit(caption.sourceStartSec);
+      }
+      return;
+    }
     setCaptionTextOverrides((prev) => {
       const matches = (item: CaptionTextOverride) =>
-        caption.custom
-          ? item.custom && `custom:${item.id}` === caption.editId
-          : !item.custom && Math.round(item.startSec * 1000) === Math.round(caption.sourceStartSec * 1000);
+        Boolean(item.custom && `custom:${item.id}` === caption.editId);
       const existing = prev.find(matches);
-      const base: CaptionTextOverride = caption.custom
-        ? {
-            id: caption.editId.replace(/^custom:/, ""),
-            custom: true,
-            startSec: round3(caption.sourceStartSec),
-            endSec: round3(caption.sourceEndSec),
-            text: caption.text,
-          }
-        : { startSec: round3(caption.sourceStartSec), text: caption.text };
+      const base: CaptionTextOverride = {
+        id: caption.editId.replace(/^custom:/, ""),
+        custom: true,
+        startSec: round3(caption.sourceStartSec),
+        endSec: round3(caption.sourceEndSec),
+        text: caption.text,
+      };
       const next = prev.filter((item) => !matches(item));
       next.push({ ...base, ...existing, ...patch });
       return next.sort(
@@ -825,13 +1035,30 @@ export function ClipEditor({
   }
 
   function resetCaptionSection(caption: (typeof captions)[number]) {
+    if (!caption.custom) {
+      const drop = new Set(caption.words.map((word) => Math.round(word.t * 1000)));
+      setCaptionWordOverrides((prev) => prev.filter((item) => !drop.has(Math.round(item.t * 1000))));
+      dropGeneratedGroupEdit(caption.sourceStartSec);
+      return;
+    }
     setCaptionTextOverrides((prev) =>
-      prev.filter((item) =>
-        caption.custom
-          ? `custom:${item.id}` !== caption.editId
-          : item.custom || Math.round(item.startSec * 1000) !== Math.round(caption.sourceStartSec * 1000)
-      )
+      prev.filter((item) => `custom:${item.id}` !== caption.editId)
     );
+  }
+
+  function commitTranscript() {
+    if (!words) return;
+    const source = expandWordTimings(words).filter(
+      (word) => word.t >= active.startSec - 0.05 && word.t <= active.endSec
+    );
+    const next = bindTranscriptToTimings(source, transcriptDraft);
+    setCaptionWordOverrides((prev) => {
+      const kept = prev.filter((item) => item.t < active.startSec - 0.05 || item.t > active.endSec + 0.05);
+      const map = new Map(kept.map((item) => [Math.round(item.t * 1000), item]));
+      for (const item of next) map.set(Math.round(item.t * 1000), item);
+      return [...map.values()].sort((a, b) => a.t - b.t);
+    });
+    setCaptionTextOverrides((prev) => prev.filter((item) => item.custom));
   }
 
   function addCaptionSection() {
@@ -848,6 +1075,32 @@ export function ClipEditor({
       },
     ]);
     setCaptionsOn(true);
+  }
+
+  async function cleanCaptions() {
+    if (cleaningCaptions) return;
+    setCleaningCaptions(true);
+    setCleanNote(null);
+    try {
+      const result = await api.cleanClipCaptions(clip.id, {
+        startSec: trimStart,
+        endSec: trimEnd,
+        chunkWords: style.chunkWords,
+        listen: project.mediaReady,
+      });
+      setCaptionTextOverrides(result.overrides);
+      setCaptionWordOverrides(result.wordOverrides ?? []);
+      setCaptionsOn(true);
+      setCleanNote(
+        result.changed === 0
+          ? "Already clean."
+          : `Fixed ${result.changed} line${result.changed === 1 ? "" : "s"}${result.listened ? " · heard the clip" : ""}.`
+      );
+    } catch (error) {
+      setCleanNote(error instanceof Error ? error.message : "Could not clean captions");
+    } finally {
+      setCleaningCaptions(false);
+    }
   }
 
   function restoreRemovedSection(edit: CaptionTextOverride) {
@@ -907,6 +1160,7 @@ export function ClipEditor({
           <span className="text-micro hidden shrink-0 text-muted sm:inline">
             {isMerge ? `merge · ${segments.length} parts` : `#${clip.rank}`}
           </span>
+          <ShareCopyButton clip={clip} onUpdated={onClipUpdated} />
           <div className="flex shrink-0 rounded-lg border border-border p-0.5">
             <button
               type="button"
@@ -1014,7 +1268,14 @@ export function ClipEditor({
               }}
               onTimeUpdate={handleTimeUpdate}
               onPlay={() => setPlaying(true)}
-              onPause={() => setPlaying(false)}
+              onPause={() => {
+                if (handingToOutroRef.current) {
+                  handingToOutroRef.current = false;
+                  return;
+                }
+                if (previewStageRef.current === "outro") return;
+                setPlaying(false);
+              }}
               className="absolute"
               style={
                 cropPreview
@@ -1030,6 +1291,43 @@ export function ClipEditor({
                   : { inset: 0, width: "100%", height: "100%", objectFit: "contain" }
               }
             />
+            {outroPreviewUrl ? (
+              <video
+                ref={outroVideoRef}
+                key={outroPreviewUrl}
+                src={outroPreviewUrl}
+                playsInline
+                preload="auto"
+                className={cn(
+                  "absolute inset-0 z-[2] h-full w-full object-cover",
+                  previewStage === "outro" ? "opacity-100" : "pointer-events-none opacity-0",
+                  joinFlash === "fade" && "transition-opacity duration-300"
+                )}
+                onLoadedMetadata={(event) => {
+                  const duration = event.currentTarget.duration;
+                  if (duration && Number.isFinite(duration)) setOutroDuration(duration);
+                }}
+                onTimeUpdate={(event) => {
+                  if (previewStageRef.current === "outro") setOutroTime(event.currentTarget.currentTime);
+                }}
+                onPlay={() => setPlaying(true)}
+                onPause={() => {
+                  if (previewStageRef.current === "outro") setPlaying(false);
+                }}
+                onEnded={() => {
+                  setPlaying(false);
+                  const duration = outroVideoRef.current?.duration;
+                  if (duration && Number.isFinite(duration)) setOutroTime(duration);
+                }}
+              />
+            ) : null}
+            {joinFlash === "white" || joinFlash === "black" ? (
+              <div
+                aria-hidden="true"
+                className="pointer-events-none absolute inset-0 z-[3]"
+                style={{ background: joinFlash === "white" ? "#fff" : "#000" }}
+              />
+            ) : null}
             {cropPreview ? (
               <canvas
                 ref={previewCanvasRef}
@@ -1174,7 +1472,7 @@ export function ClipEditor({
               type="button"
               onClick={togglePlay}
               className="press inline-flex size-12 items-center justify-center rounded-full bg-accent text-accent-fg hover:opacity-90"
-              aria-label={playing ? "Pause preview" : "Play window"}
+              aria-label={playing ? "Pause preview" : outroPlaythrough ? "Play clip and sting" : "Play window"}
             >
               {playing ? (
                 <Pause className="size-5" aria-hidden="true" />
@@ -1239,28 +1537,38 @@ export function ClipEditor({
           ) : null}
 
           <p className="num text-meta text-muted">
-            source {timecode(time)} · window {timecode(active.startSec)}–
-            {timecode(active.endSec)} · {(active.endSec - active.startSec).toFixed(1)}s
-            {isMerge ? ` · part ${safeIndex + 1}/${previewSegments.length}` : ""}
+            {previewStage === "outro"
+              ? `sting ${timecode(outroTime)} · ${outroDur.toFixed(1)}s after the window`
+              : `source ${timecode(time)} · window ${timecode(active.startSec)}–${timecode(active.endSec)} · ${(active.endSec - active.startSec).toFixed(1)}s`}
+            {isMerge && previewStage !== "outro" ? ` · part ${safeIndex + 1}/${previewSegments.length}` : ""}
           </p>
 
-          {/* playhead within the active window */}
+          {/* playhead: clip window, or clip + sting on the mix desk */}
           <input
             type="range"
-            min={active.startSec}
-            max={Math.max(active.startSec + 0.1, active.endSec)}
+            min={outroPlaythrough ? 0 : active.startSec}
+            max={outroPlaythrough ? playthroughDur : Math.max(active.startSec + 0.1, active.endSec)}
             step={0.05}
-            value={Math.min(Math.max(time, active.startSec), active.endSec)}
-            onChange={(event) => seekTo(Number(event.target.value))}
-            aria-label="Playhead"
+            value={
+              outroPlaythrough
+                ? Math.min(playthroughDur, Math.max(0, playheadLocal))
+                : Math.min(Math.max(time, active.startSec), active.endSec)
+            }
+            onChange={(event) => {
+              const next = Number(event.target.value);
+              if (outroPlaythrough) seekPlaythrough(next);
+              else seekTo(next);
+            }}
+            aria-label={outroPlaythrough ? "Playhead through clip and sting" : "Playhead"}
             className="accent-accent h-8 w-full"
           />
           {desk === "mix" ? (
             <MixTimeline
               soundtrack={soundtrack}
-              localTime={localPreviewTime}
-              durationSec={Math.max(0.1, active.endSec - active.startSec)}
-              onSeekLocal={(sec) => seekTo(active.startSec + sec)}
+              localTime={playheadLocal}
+              durationSec={clipWindowDur}
+              outroSec={outroPlaythrough ? outroDur : 0}
+              onSeekLocal={seekPlaythrough}
             />
           ) : null}
 
@@ -1316,16 +1624,26 @@ export function ClipEditor({
           </Panel>
 
           {desk === "mix" ? (
-            <MixPanel
-              projectId={project.id}
-              soundtrack={soundtrack}
-              onChange={setSoundtrack}
-              localTime={localPreviewTime}
-              durationSec={Math.max(0.1, active.endSec - active.startSec)}
-              playing={playing}
-              live={mode === "source"}
-              videoRef={videoRef}
-            />
+            <>
+              <MixPanel
+                projectId={project.id}
+                soundtrack={soundtrack}
+                onChange={setSoundtrack}
+                localTime={playheadLocal}
+                durationSec={outroPlaythrough ? playthroughDur : clipWindowDur}
+                outroSec={outroPlaythrough ? outroDur : 0}
+                playing={playing}
+                live={mode === "source"}
+                videoRef={videoRef}
+              />
+              <OutroAttachCard
+                items={projectOutros}
+                defaultOutroId={project.defaultOutroId}
+                attach={clipOutro}
+                onChange={setClipOutro}
+                onEdit={(id) => onOpenOutro(id)}
+              />
+            </>
           ) : (
             <>
           {/* window */}
@@ -1560,6 +1878,21 @@ export function ClipEditor({
               </select>
             </label>
 
+            <button
+              type="button"
+              disabled={cleaningCaptions}
+              onClick={() => void cleanCaptions()}
+              className="press text-ui mt-2 inline-flex h-10 w-full items-center justify-center gap-1.5 rounded-lg border border-control px-2 font-semibold text-muted hover:border-accent disabled:opacity-50"
+            >
+              {cleaningCaptions ? (
+                <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />
+              ) : (
+                <Sparkles className="size-3.5" aria-hidden="true" />
+              )}
+              {cleaningCaptions ? "Cleaning captions…" : "Clean captions"}
+            </button>
+            {cleanNote ? <p className="text-meta mt-1 text-muted">{cleanNote}</p> : null}
+
             <div className="mt-2 grid grid-cols-2 gap-2">
               <button
                 type="button"
@@ -1579,11 +1912,14 @@ export function ClipEditor({
               </button>
               <button
                 type="button"
-                onClick={() => setCaptionTextOverrides([])}
-                disabled={captionTextOverrides.length === 0}
+                onClick={() => {
+                  setCaptionTextOverrides([]);
+                  setCaptionWordOverrides([]);
+                }}
+                disabled={captionTextOverrides.length === 0 && captionWordOverrides.length === 0}
                 className="press text-ui h-10 rounded-lg border border-control px-2 font-medium text-muted hover:border-accent disabled:opacity-40"
               >
-                Reset sections ({captionTextOverrides.length})
+                  Reset transcript ({captionTextOverrides.length + captionWordOverrides.length})
               </button>
             </div>
 
@@ -1619,6 +1955,7 @@ export function ClipEditor({
                   format={(value) => String(value)}
                   onChange={(value) => setOverrides((prev) => ({ ...prev, chunkWords: value }))}
                 />
+                <p className="text-meta mt-1 text-muted">Groups the transcript. Edits stay on the words.</p>
                 <Slider
                   label="Size"
                   value={style.sizeScale}
@@ -1710,6 +2047,36 @@ export function ClipEditor({
               </div>
             </details>
 
+            <details open className="mt-2 rounded-lg border border-border bg-panel-2/40">
+              <summary className="text-ui cursor-pointer px-3 py-2 font-semibold text-muted">
+                Transcript
+              </summary>
+              <div className="border-t border-border p-2">
+                <p className="text-meta mb-2 text-muted">
+                  Edit the words. Words per caption only groups them on the video.
+                </p>
+                <textarea
+                  value={transcriptDraft}
+                  rows={8}
+                  spellCheck
+                  onFocus={() => setTranscriptFocused(true)}
+                  onBlur={() => {
+                    setTranscriptFocused(false);
+                    commitTranscript();
+                  }}
+                  onChange={(event) => setTranscriptDraft(event.target.value)}
+                  className="text-ui min-h-36 w-full resize-y rounded-md border border-control bg-panel px-2 py-2 outline-none focus:border-accent"
+                />
+                <button
+                  type="button"
+                  onClick={commitTranscript}
+                  className="press text-ui mt-2 h-9 w-full rounded-lg border border-control font-semibold text-muted hover:border-accent"
+                >
+                  Bind to video
+                </button>
+              </div>
+            </details>
+
             <details className="mt-2 rounded-lg border border-border bg-panel-2/40">
               <summary className="text-ui cursor-pointer px-3 py-2 font-semibold text-muted">
                 Edit subtitle sections
@@ -1717,7 +2084,7 @@ export function ClipEditor({
               <div className="border-t border-border p-2">
                 <div className="mb-2 flex items-center justify-between gap-2">
                   <span className="text-meta text-muted">
-                    {captions.length} active · {removedCaptionSections.length} removed
+                    {captions.length} active · {removedCaptionSections.length + removedWordSpans.length} removed
                   </span>
                   <button
                     type="button"
@@ -1735,12 +2102,15 @@ export function ClipEditor({
                   </p>
                 ) : (
                   captions.map((caption) => {
-                    const edited = captionTextOverrides.some(
-                      (item) =>
-                        caption.custom
-                          ? item.custom && `custom:${item.id}` === caption.editId
-                          : !item.custom && Math.round(item.startSec * 1000) === Math.round(caption.sourceStartSec * 1000)
-                    );
+                    const edited = caption.custom
+                      ? captionTextOverrides.some(
+                          (item) => item.custom && `custom:${item.id}` === caption.editId
+                        )
+                      : caption.words.some((word) =>
+                          captionWordOverrides.some(
+                            (item) => Math.round(item.t * 1000) === Math.round(word.t * 1000)
+                          )
+                        );
                     return (
                       <div key={caption.editId} className="rounded-lg border border-border bg-panel p-2">
                         <div className="mb-2 flex items-center gap-2">
@@ -1763,53 +2133,72 @@ export function ClipEditor({
                           ) : null}
                           <button
                             type="button"
-                            onClick={() => updateCaptionSection(caption, { hidden: true })}
+                            onClick={() =>
+                              updateCaptionSection(caption, {
+                                hidden: true,
+                                endSec: caption.sourceEndSec,
+                              })
+                            }
                             aria-label={`Remove subtitle at ${timecode(caption.sourceStartSec)}`}
                             className="press inline-flex size-8 items-center justify-center rounded-md text-muted hover:bg-bad/15 hover:text-bad"
                           >
                             <Trash2 className="size-3.5" aria-hidden="true" />
                           </button>
                         </div>
-                        <input
+                        <CaptionSectionField
                           value={caption.text}
-                          maxLength={160}
-                          onFocus={() => seekTo(caption.start + active.startSec)}
-                          onChange={(event) => updateCaptionSection(caption, { text: event.target.value })}
-                          className="text-ui h-10 w-full rounded-md border border-control bg-panel-2 px-2 outline-none focus:border-accent"
+                          onFocusSeek={() => seekTo(caption.start + active.startSec)}
+                          onCommit={(text) => updateCaptionSection(caption, { text })}
                         />
+                        {caption.custom ? (
                         <div className="mt-2 grid grid-cols-2 gap-2">
                           <TimestampInput
                             label="Start"
-                            value={caption.custom ? caption.sourceStartSec : caption.start + active.startSec}
+                            value={caption.sourceStartSec}
                             min={active.startSec}
                             max={caption.sourceEndSec - 0.05}
-                            onChange={(value) =>
-                              updateCaptionSection(
-                                caption,
-                                caption.custom ? { startSec: value } : { displayStartSec: value }
-                              )
-                            }
+                            onChange={(value) => updateCaptionSection(caption, { startSec: value })}
                           />
                           <TimestampInput
                             label="End"
                             value={caption.sourceEndSec}
-                            min={(caption.custom ? caption.sourceStartSec : caption.start + active.startSec) + 0.05}
+                            min={caption.sourceStartSec + 0.05}
                             max={active.endSec}
                             onChange={(endSec) => updateCaptionSection(caption, { endSec })}
                           />
                         </div>
+                        ) : null}
                       </div>
                     );
                   })
                 )}
                 </div>
 
-                {removedCaptionSections.length > 0 ? (
+                {removedCaptionSections.length + removedWordSpans.length > 0 ? (
                   <details className="mt-2 rounded-lg border border-border bg-panel-2/50">
                     <summary className="text-meta cursor-pointer px-2.5 py-2 font-semibold text-muted">
-                      Removed sections ({removedCaptionSections.length})
+                      Removed sections ({removedCaptionSections.length + removedWordSpans.length})
                     </summary>
                     <ul className="space-y-1 border-t border-border p-2">
+                      {removedWordSpans.map((span) => (
+                        <li key={span.key} className="flex items-center gap-2 rounded-md bg-panel px-2 py-1.5">
+                          <span className="num text-micro flex-1 text-muted">
+                            {timecode(span.ts[0] ?? 0)} · {span.text || "Generated subtitle"}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const drop = new Set(span.ts.map((t) => Math.round(t * 1000)));
+                              setCaptionWordOverrides((prev) =>
+                                prev.filter((item) => !item.hidden || !drop.has(Math.round(item.t * 1000)))
+                              );
+                            }}
+                            className="text-micro font-semibold text-accent"
+                          >
+                            Restore
+                          </button>
+                        </li>
+                      ))}
                       {removedCaptionSections.map((edit) => (
                         <li key={edit.custom ? edit.id : edit.startSec} className="flex items-center gap-2 rounded-md bg-panel px-2 py-1.5">
                           <span className="num text-micro flex-1 text-muted">
@@ -2193,6 +2582,43 @@ function ColorControl({
         aria-label={`${label} caption colour`}
       />
     </label>
+  );
+}
+
+function CaptionSectionField({
+  value,
+  onCommit,
+  onFocusSeek,
+}: {
+  value: string;
+  onCommit: (text: string) => void;
+  onFocusSeek: () => void;
+}) {
+  const [draft, setDraft] = useState(value);
+  const focused = useRef(false);
+
+  useEffect(() => {
+    if (!focused.current) setDraft(value);
+  }, [value]);
+
+  return (
+    <input
+      value={draft}
+      maxLength={160}
+      onFocus={() => {
+        focused.current = true;
+        onFocusSeek();
+      }}
+      onChange={(event) => setDraft(event.target.value)}
+      onBlur={() => {
+        focused.current = false;
+        onCommit(draft);
+      }}
+      onKeyDown={(event) => {
+        if (event.key === "Enter") event.currentTarget.blur();
+      }}
+      className="text-ui h-10 w-full rounded-md border border-control bg-panel-2 px-2 outline-none focus:border-accent"
+    />
   );
 }
 

@@ -17,6 +17,8 @@ import { getErrorMessage } from "../types";
 import { fileExists, projectOutputDir, serveLocalVideo } from "../utils";
 import { fail, ok } from "../utils/response.utils";
 import { previewClipReframe as runPreviewClipReframe } from "../services/clip-render.service";
+import { generateClipShareCopy } from "../services/share-copy.service";
+import { cleanClipCaptions } from "../services/caption-clean.service";
 
 type Ctx = ApiContext;
 
@@ -178,6 +180,35 @@ export async function getClipWords({ params, query, set }: Ctx) {
         endSec: Number.isFinite(endSec) ? endSec : undefined,
       })
     );
+  } catch (error: unknown) {
+    const message = getErrorMessage(error);
+    set.status = message === "Clip not found" ? 404 : 500;
+    return fail(message);
+  }
+}
+
+/** POST /api/clips/:id/captions/clean — fix fillers and ASR on the current window. */
+export async function cleanClipCaptionsRoute({ params, body, set }: Ctx) {
+  try {
+    const input = (body ?? {}) as {
+      startSec?: number;
+      endSec?: number;
+      chunkWords?: number;
+      listen?: boolean;
+    };
+    return ok(await cleanClipCaptions(params.id, input));
+  } catch (error: unknown) {
+    const message = getErrorMessage(error);
+    set.status = message === "Clip not found" ? 404 : message.includes("no word") ? 409 : 500;
+    return fail(message);
+  }
+}
+
+/** POST /api/clips/:id/share-copy — write Shorts title + description from the transcript. */
+export async function writeClipShareCopy({ params, body, set }: Ctx) {
+  try {
+    const force = Boolean((body as { force?: boolean } | undefined)?.force);
+    return ok(serializeClip(await generateClipShareCopy(params.id, force)));
   } catch (error: unknown) {
     const message = getErrorMessage(error);
     set.status = message === "Clip not found" ? 404 : 500;

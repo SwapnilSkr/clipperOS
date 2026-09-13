@@ -38,6 +38,13 @@ export type ScoreMap = Record<string, number>;
 // Peak
 // ---------------------------------------------------------------------------
 
+/** Paste-ready YouTube Shorts title + description for a clip. */
+export interface ShareCopy {
+  title: string;
+  description: string;
+  generatedAt: string;
+}
+
 export type PeakKind =
   /** The peak is a spoken line, burnable on screen. */
   | "line"
@@ -180,6 +187,18 @@ export interface CaptionTextOverride {
   custom?: boolean;
 }
 
+/**
+ * A correction on one spoken onset. Words-per-caption only groups these;
+ * the text stays bound to the video timestamp.
+ */
+export interface CaptionWordOverride {
+  t: number;
+  word?: string;
+  hidden?: boolean;
+}
+
+export const MAX_CAPTION_WORD_OVERRIDES = 800;
+
 /** Whole-picture and soundtrack treatment applied after framing. */
 export interface VideoEffects {
   grade?: "natural" | "vibrant" | "warm" | "cool" | "cinematic";
@@ -201,8 +220,8 @@ export interface SoundtrackHit {
 
 /**
  * Music bed + hits mixed under the voice. Built-in asset ids are names like
- * `warm`; uploads are `custom:<uuid>`. Empty / omitted means the source audio
- * is left alone.
+ * `warm`; uploads are `custom:<uuid>` from the shared library. Empty / omitted
+ * means the source audio is left alone.
  */
 export interface Soundtrack {
   voiceGain?: number;
@@ -211,8 +230,79 @@ export interface Soundtrack {
     gain?: number;
     /** Duck the bed when the voice is present. Default true. */
     duck?: boolean;
+    /** Keep the bed playing through the sting. Default true. */
+    carryIntoOutro?: boolean;
   };
   sfx?: SoundtrackHit[];
+}
+
+export type OutroTemplateId = "lockup" | "sting" | "rise" | "card";
+export type OutroTransitionId = "smash" | "punch" | "whip" | "flash" | "dip" | "blur" | "push";
+export type OutroLineAnimation = "none" | "pop" | "fade";
+
+/** Type on the sting — same knobs as burned captions, plus free placement. */
+export interface OutroLineStyle {
+  fontFamily?: string;
+  /** Multiplier on the sting's base line size. */
+  sizeScale?: number;
+  textColor?: string;
+  uppercase?: boolean;
+  /** Extra letter-spacing, in ASS pixels. */
+  spacing?: number;
+  animation?: OutroLineAnimation;
+  /** Horizontal centre of the line, 0 = left edge, 1 = right edge. */
+  x?: number;
+  /** Vertical centre of the line, 0 = top, 1 = bottom. */
+  y?: number;
+}
+
+/** Logo size, centre, and optional circular avatar treatment. */
+export interface OutroMarkStyle {
+  sizeScale?: number;
+  /** Horizontal centre of the mark, 0 = left edge, 1 = right edge. */
+  x?: number;
+  /** Vertical centre of the mark, 0 = top, 1 = bottom. */
+  y?: number;
+  /** When true, the mark sits in a circular avatar disc; the sting animates the whole disc. */
+  circle?: boolean;
+}
+
+export interface OutroPalette {
+  bg: string;
+  ink: string;
+  accent: string;
+  glow: string;
+}
+
+/** One sting in the shared outro library. Any project can pick it. */
+export interface ProjectOutro {
+  id: string;
+  /** Short label in the library and on the mix desk. */
+  name?: string;
+  ready: boolean;
+  logoName?: string;
+  palette?: OutroPalette;
+  templateId?: OutroTemplateId;
+  durationSec?: number;
+  cta?: string;
+  handle?: string;
+  mark?: OutroMarkStyle;
+  ctaStyle?: OutroLineStyle;
+  handleStyle?: OutroLineStyle;
+  sfxAssetId?: string;
+  musicAssetId?: string;
+  sfxGain?: number;
+  musicGain?: number;
+  previewBytes?: number;
+  updatedAt?: string;
+}
+
+/** Per-clip join onto a shared library sting. */
+export interface ClipOutro {
+  enabled?: boolean;
+  transitionId?: OutroTransitionId;
+  /** Which library sting to join. Absent means the project's default. */
+  outroId?: string;
 }
 
 /**
@@ -233,10 +323,14 @@ export interface ClipEdit {
   captionOverrides?: CaptionOverrides;
   /** User corrections to generated subtitle groups. Empty array clears them. */
   captionTextOverrides?: CaptionTextOverride[];
+  /** Word-level transcript edits. Empty array clears them. */
+  captionWordOverrides?: CaptionWordOverride[];
   /** The short-form recipe selected in the editor; effects remain explicit for stable renders. */
   editTemplateId?: string;
   videoEffects?: VideoEffects;
   soundtrack?: Soundtrack;
+  /** How this clip joins a shared library outro. Absent means the project default. */
+  outro?: ClipOutro;
   /** Burned-in text / watermark regions to reconstruct away, in source pixels. */
   cleanup?: CleanupRegion[];
 }
@@ -296,9 +390,15 @@ export interface TimelineCaption {
 export const OUTPUT_WIDTH = 1080;
 export const OUTPUT_HEIGHT = 1920;
 
-/** Base ASS font sizes, in output pixels, that `sizeScale` multiplies. */
+/** Base caption/peak sizes the preview uses, in 1080×1920 pixels. */
 export const CAPTION_BASE_FONT = 70;
 export const PEAK_BASE_FONT = 91;
+/**
+ * libass Fontsize reads smaller than the same CSS px at weight 900, especially
+ * after a 16:9→9:16 reframe. Applied only when writing ASS so the download
+ * matches the editor overlay.
+ */
+export const ASS_FONT_SIZE_MATCH = 1.4;
 export const CAPTION_SIZE_SCALE = 1;
 /** Caption baseline as a fraction of output height, up from the bottom. */
 export const CAPTION_VERTICAL_FRAC = 340 / OUTPUT_HEIGHT;

@@ -1,6 +1,6 @@
 import { rm } from "node:fs/promises";
 import { Clip, ClipProject, type IClip, type IClipProject } from "../models";
-import type { ReframeTrack } from "../types/clip.types";
+import type { ProjectOutro, ReframeTrack } from "../types/clip.types";
 import { getErrorMessage } from "../types";
 import { resolveGenreProfile } from "../config/genres";
 import { projectOutputDir } from "../utils";
@@ -8,6 +8,8 @@ import { deletePrefix } from "./s3.service";
 import { detectGenre } from "./genre-detect.service";
 import { mineMoments } from "./mining.service";
 import { holdCropUntilCuts } from "./speaker-reframe.service";
+import { overlaySharedOutroLibrary, pickProjectOutro } from "./outro.service";
+import { generateProjectShareCopy } from "./share-copy.service";
 
 // ---------------------------------------------------------------------------
 // Mining orchestration + API serialization
@@ -175,6 +177,13 @@ export async function mineProject(projectId: string, genreId?: string): Promise<
       }))
     );
 
+    if (clips.length > 0) {
+      await ClipProject.findByIdAndUpdate(projectId, {
+        $set: { stage: "Writing post copy", progress: 96 },
+      }).catch(() => undefined);
+      await generateProjectShareCopy(projectId, { force: true });
+    }
+
     const miningMs = Date.now() - startedAt;
     const ingestMs = doc.timings?.ingestMs ?? 0;
     await ClipProject.findByIdAndUpdate(projectId, {
@@ -255,12 +264,18 @@ export interface ProjectSummary {
   clipDuration: { min: number; target: number; max: number };
   timings?: IClipProject["timings"];
   createdAt: string;
+  /** Default sting from the shared library. */
+  outro?: ProjectOutro;
+  /** Shared outro library. The same list on every project. */
+  outros?: ProjectOutro[];
+  defaultOutroId?: string;
 }
 
 export function serializeProject(doc: IClipProject): ProjectSummary {
   // A project always has a genre, but be defensive: a legacy row written before
   // this field existed must still serialize.
   const profile = resolveGenreProfile(doc.genreId);
+  const library = overlaySharedOutroLibrary(doc);
   return {
     id: String(doc._id),
     sourceType: doc.sourceType,
@@ -292,6 +307,9 @@ export function serializeProject(doc: IClipProject): ProjectSummary {
     clipDuration: profile.clipDuration,
     timings: doc.timings,
     createdAt: doc.createdAt?.toISOString?.() ?? new Date().toISOString(),
+    outro: pickProjectOutro(library.items, undefined, library.defaultOutroId),
+    outros: library.items,
+    defaultOutroId: library.defaultOutroId,
   };
 }
 
@@ -311,6 +329,7 @@ export interface ClipPayload {
   /** Absent for a "moment" peak that isn't a spoken line. */
   peakLine?: string;
   hookText: string;
+  shareCopy?: { title: string; description: string; generatedAt: string };
   /** Axis id -> 0-10. The axis set is the project's genre. */
   scores: Record<string, number>;
   totalScore: number;
@@ -352,6 +371,14 @@ export function serializeClip(doc: IClip): ClipPayload {
     peakKind: doc.peakKind,
     peakLine: doc.peakLine || undefined,
     hookText: doc.hookText,
+    shareCopy:
+      doc.shareCopy?.title && doc.shareCopy.description
+        ? {
+            title: doc.shareCopy.title,
+            description: doc.shareCopy.description,
+            generatedAt: doc.shareCopy.generatedAt,
+          }
+        : undefined,
     scores: (doc.scores ?? {}) as Record<string, number>,
     totalScore: doc.totalScore,
     rationale: doc.rationale,
@@ -394,6 +421,7 @@ export function serializeClip(doc: IClip): ClipPayload {
                       assetId: doc.edit.soundtrack.music.assetId,
                       gain: doc.edit.soundtrack.music.gain,
                       duck: doc.edit.soundtrack.music.duck,
+                      carryIntoOutro: doc.edit.soundtrack.music.carryIntoOutro,
                     }
                   : undefined,
                 sfx: doc.edit.soundtrack.sfx?.map((hit) => ({
@@ -402,6 +430,13 @@ export function serializeClip(doc: IClip): ClipPayload {
                   atSec: hit.atSec,
                   gain: hit.gain,
                 })),
+              }
+            : undefined,
+          outro: doc.edit.outro
+            ? {
+                enabled: doc.edit.outro.enabled,
+                transitionId: doc.edit.outro.transitionId,
+                outroId: doc.edit.outro.outroId,
               }
             : undefined,
           captionOverrides: doc.edit.captionOverrides
@@ -427,6 +462,11 @@ export function serializeClip(doc: IClip): ClipPayload {
             endSec: item.endSec,
             hidden: item.hidden,
             custom: item.custom,
+          })),
+          captionWordOverrides: doc.edit.captionWordOverrides?.map((item) => ({
+            t: item.t,
+            word: item.word,
+            hidden: item.hidden,
           })),
           cleanup: doc.edit.cleanup?.map((region) => ({
             id: String(region.id),

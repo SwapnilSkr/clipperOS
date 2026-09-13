@@ -7,6 +7,7 @@ import type {
   ReframeMode,
   ReframeTrack,
   ScoreMap,
+  ShareCopy,
 } from "../types/clip.types";
 
 export type ClipStatus = "available" | "rendering" | "rendered" | "failed" | "dismissed";
@@ -34,6 +35,8 @@ export interface IClip extends Document {
   peakLine?: string;
   /** First sentence of the transcript — shown on the board as the hook. */
   hookText: string;
+  /** Generated Shorts title + description. Absent until written. */
+  shareCopy?: ShareCopy;
 
   /**
    * Per-axis scores keyed by the genre profile's axis ids. Shape varies by
@@ -114,6 +117,15 @@ const captionTextOverrideSchema = new Schema(
   { _id: false }
 );
 
+const captionWordOverrideSchema = new Schema(
+  {
+    t: { type: Number, required: true, min: 0 },
+    word: { type: String, maxlength: 120 },
+    hidden: { type: Boolean },
+  },
+  { _id: false }
+);
+
 const videoEffectsSchema = new Schema(
   {
     grade: { type: String, enum: ["natural", "vibrant", "warm", "cool", "cinematic"] },
@@ -145,6 +157,7 @@ const soundtrackSchema = new Schema(
           assetId: { type: String, trim: true },
           gain: { type: Number, min: 0, max: 1.5 },
           duck: { type: Boolean },
+          carryIntoOutro: { type: Boolean },
         },
         { _id: false }
       ),
@@ -176,9 +189,23 @@ const clipEditSchema = new Schema(
     captionStyleId: { type: String, trim: true },
     captionOverrides: { type: captionOverridesSchema },
     captionTextOverrides: { type: [captionTextOverrideSchema], default: undefined },
+    captionWordOverrides: { type: [captionWordOverrideSchema], default: undefined },
     editTemplateId: { type: String, trim: true, maxlength: 40 },
     videoEffects: { type: videoEffectsSchema },
     soundtrack: { type: soundtrackSchema },
+    outro: {
+      type: new Schema(
+        {
+          enabled: { type: Boolean },
+          transitionId: {
+            type: String,
+            enum: ["smash", "punch", "whip", "flash", "dip", "blur", "push"],
+          },
+          outroId: { type: String, trim: true, maxlength: 24 },
+        },
+        { _id: false }
+      ),
+    },
     // Omitting this here silently drops every region on write — the whole feature
     // no-ops with no error anywhere.
     cleanup: { type: [cleanupRegionSchema], default: undefined },
@@ -215,6 +242,17 @@ const clipSchema = new Schema<IClip>(
     peakKind: { type: String, enum: ["line", "moment"], required: true },
     peakLine: { type: String },
     hookText: { type: String, default: "" },
+    shareCopy: {
+      type: new Schema(
+        {
+          title: { type: String, default: "" },
+          description: { type: String, default: "" },
+          generatedAt: { type: String, default: "" },
+        },
+        { _id: false }
+      ),
+      default: undefined,
+    },
 
     // Mixed because the axis set is per-genre. The miner is the only writer, and
     // it only ever writes the axes the profile declares.

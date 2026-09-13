@@ -9,13 +9,17 @@ import {
   previewClipReframe,
   renderClips,
   updateClip,
+  writeClipShareCopy,
+  cleanClipCaptionsRoute,
 } from "../controllers";
 import {
+  CleanCaptionsBody,
   ClipParams,
   ClipWordsQuery,
   MergeClipsBody,
   PreviewReframeBody,
   RenderClipsBody,
+  ShareCopyBody,
   UpdateClipBody,
 } from "../types/guards";
 
@@ -29,6 +33,8 @@ export const clipRoutes = new Elysia({ prefix: "/api/clips" })
   .patch("/:id", updateClip, { params: ClipParams, body: UpdateClipBody })
   .delete("/:id", deleteClip, { params: ClipParams })
   .post("/:id/dismiss", dismissClip, { params: ClipParams })
+  .post("/:id/share-copy", writeClipShareCopy, { params: ClipParams, body: ShareCopyBody })
+  .post("/:id/captions/clean", cleanClipCaptionsRoute, { params: ClipParams, body: CleanCaptionsBody })
   .post("/:id/reframe/preview", previewClipReframe, {
     params: ClipParams,
     body: PreviewReframeBody,

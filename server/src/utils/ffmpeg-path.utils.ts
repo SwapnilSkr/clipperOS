@@ -19,10 +19,17 @@ export function escapeFilterPath(p: string): string {
     .replace(/;/g, "\\;");
 }
 
-/** Build an `ass=` video-filter fragment for a subtitle file. */
+/**
+ * Build an `ass=` video-filter fragment for a subtitle file.
+ *
+ * `original_size` is the 9:16 canvas the ASS file was written for. FFmpeg's
+ * ASS aspect-ratio math otherwise scales fonts from the landscape source
+ * (typically 1920×1080), which is why burned captions looked much smaller
+ * than the editor preview.
+ */
 export function assVideoFilter(assPath: string, extras?: string): string {
   const fontsDir = captionFontsDir();
   const fonts = fontsDir ? `:fontsdir='${escapeFilterPath(fontsDir)}'` : "";
-  const base = `ass='${escapeFilterPath(assPath)}'${fonts}`;
+  const base = `ass='${escapeFilterPath(assPath)}':original_size=1080x1920${fonts}`;
   return extras ? `${base},${extras}` : base;
 }

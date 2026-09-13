@@ -11,7 +11,9 @@ import {
   createYoutubeProject,
   ensureProjectMedia,
 } from "../services/ingest.service";
+import { loadSharedOutroLibrary } from "../services/outro.service";
 import { serializeClip, serializeProject } from "../services/project.service";
+import { generateProjectShareCopy } from "../services/share-copy.service";
 import type { ApiContext } from "../types/api.types";
 import { getErrorMessage } from "../types";
 import { enqueueIngest, enqueueMining } from "../queue/queues";
@@ -23,6 +25,7 @@ import {
   projectAudioDir,
   projectMediaDir,
   projectOutputDir,
+  projectOutroDir,
   serveLocalVideo,
 } from "../utils";
 import { fail, ok } from "../utils/response.utils";
@@ -54,6 +57,7 @@ export async function createProject({ body, set }: Ctx) {
     if (project.status === "pending") {
       await enqueueIngest(String(project._id));
     }
+    await loadSharedOutroLibrary();
     return ok(serializeProject(project));
   } catch (error: unknown) {
     set.status = 400;
@@ -125,12 +129,25 @@ export async function remineProject({ params, body, set }: Ctx) {
   }
 }
 
+/** POST /api/projects/:id/share-copy — write Shorts paste-copy for clips that lack it. */
+export async function writeProjectShareCopy({ params, body, set }: Ctx) {
+  try {
+    const force = Boolean((body as { force?: boolean } | undefined)?.force);
+    return ok(await generateProjectShareCopy(params.id, { force }));
+  } catch (error: unknown) {
+    const message = getErrorMessage(error);
+    set.status = message === "Project not found" ? 404 : 500;
+    return fail(message);
+  }
+}
+
 /** GET /api/projects — newest first. */
 export async function listProjects({ query, set }: Ctx) {
   try {
     const q = query as { limit?: string; status?: string };
     const limit = Math.min(200, Math.max(1, parseInt(q.limit ?? "50") || 50));
     const filter = q.status ? { status: q.status as ClipProjectStatus } : {};
+    await loadSharedOutroLibrary();
     const docs = await ClipProject.find(filter).sort({ createdAt: -1 }).limit(limit).lean();
     return ok(docs.map(serializeProject));
   } catch (error: unknown) {
@@ -147,6 +164,7 @@ export async function getProject({ params, set }: Ctx) {
       set.status = 404;
       return fail("Project not found");
     }
+    await loadSharedOutroLibrary();
     const clips = await Clip.find({ projectId: project._id, status: { $ne: "dismissed" } })
       .sort({ rank: 1 })
       .lean();
@@ -237,6 +255,7 @@ export async function deleteProject({ params, set }: Ctx) {
       rm(projectMediaDir(String(project._id)), { recursive: true, force: true }).catch(() => undefined),
       rm(projectOutputDir(String(project._id)), { recursive: true, force: true }).catch(() => undefined),
       rm(projectAudioDir(String(project._id)), { recursive: true, force: true }).catch(() => undefined),
+      rm(projectOutroDir(String(project._id)), { recursive: true, force: true }).catch(() => undefined),
     ]);
     let s3Warning: string | undefined;
     if (project.storage === "s3" && project.s3Prefix) {

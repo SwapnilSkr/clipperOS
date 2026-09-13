@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Navigate, Route, Routes, useNavigate, useParams } from "react-router-dom";
+import { Navigate, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { AlertTriangle, CheckCircle2, Plus, RotateCcw, Scissors, Sparkles, X } from "lucide-react";
 import {
   api,
   clipDownloadUrl,
+  pickProjectOutro,
   type CaptionFontInfo,
   type CaptionStyleInfo,
   type ClipPayload,
@@ -13,6 +14,7 @@ import {
 } from "@/api";
 import { ClipBoard, type Density } from "@/components/ClipBoard";
 import { ClipEditor, type ClipEditDraft } from "@/components/ClipEditor";
+import { OutroBuilder } from "@/components/OutroBuilder";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { PipelineRail } from "@/components/PipelineRail";
 import { ProjectList } from "@/components/ProjectList";
@@ -167,6 +169,8 @@ export default function App() {
     <Routes>
       <Route path={routes.root} element={<Studio />} />
       <Route path="/projects/:projectId" element={<Studio />} />
+      <Route path="/projects/:projectId/outro" element={<Studio />} />
+      <Route path="/projects/:projectId/outro/:outroId" element={<Studio />} />
       <Route path="/projects/:projectId/clips/:clipId" element={<Studio />} />
       {/* An unknown URL is a typo, not a blank page. */}
       <Route path="*" element={<Navigate to={routes.root} replace />} />
@@ -175,12 +179,16 @@ export default function App() {
 }
 
 export function Studio() {
-  const { projectId, clipId } = useParams<{ projectId?: string; clipId?: string }>();
+  const { projectId, clipId, outroId } = useParams<{ projectId?: string; clipId?: string; outroId?: string }>();
+  const [searchParams] = useSearchParams();
+  const location = useLocation();
   const navigate = useNavigate();
   // The URL is the source of truth for what is selected — that is what makes a
   // refresh land in the same place. There is no local "selected project" state.
   const selectedId = projectId ?? null;
   const editingClipId = clipId ?? null;
+  const outroRoute = Boolean(selectedId && location.pathname.includes("/outro"));
+  const returnClipId = searchParams.get("returnClip") || undefined;
 
   const selectProject = useCallback(
     (id: string | null) => {
@@ -221,6 +229,7 @@ export function Studio() {
   const [cleaningStorage, setCleaningStorage] = useState(false);
   /** Success feedback (bytes reclaimed), which is not an error. */
   const [notice, setNotice] = useState<string | null>(null);
+  const [writingCopy, setWritingCopy] = useState(false);
 
   // Optimistic dismissal with an undo window.
   const [hiddenClipIds, setHiddenClipIds] = useState<Set<string>>(new Set());
@@ -348,6 +357,33 @@ export function Studio() {
       );
     });
 
+  function patchClip(clip: ClipPayload) {
+    setDetail((prev) =>
+      prev
+        ? { ...prev, clips: prev.clips.map((item) => (item.id === clip.id ? { ...item, ...clip } : item)) }
+        : prev
+    );
+  }
+
+  async function handleWriteCopy(force: boolean) {
+    if (!selectedId) return;
+    setWritingCopy(true);
+    setError(null);
+    try {
+      const result = await api.generateProjectShareCopy(selectedId, force);
+      setDetail(await api.getProject(selectedId));
+      setNotice(
+        result.written === 0
+          ? "Post copy is already written."
+          : `Wrote post copy for ${result.written} clip${result.written === 1 ? "" : "s"}.`
+      );
+    } catch (err) {
+      setError(messageOf(err));
+    } finally {
+      setWritingCopy(false);
+    }
+  }
+
   /** Re-mine under a different genre. Cheap: the transcript is already stored. */
   async function handleRemine(genreId: string) {
     if (!selectedId) return;
@@ -383,11 +419,47 @@ export function Studio() {
 
   async function renderClipDraft(clipId: string, draft: ClipEditDraft) {
     await saveClipDraft(clipId, draft);
+    const skipOutro = draft.edit.outro?.enabled === false;
+    if (!skipOutro && selectedId) {
+      const chosen = pickProjectOutro(
+        detail?.project.outros,
+        draft.edit.outro?.outroId,
+        detail?.project.defaultOutroId
+      );
+      if (!chosen?.ready) {
+        navigate(routes.outro(selectedId, clipId, chosen?.id));
+        setNotice("Finish the outro, then we send you back to export.");
+        return;
+      }
+    }
     await api.renderClips(
       [clipId],
       draft.edit.reframeMode ?? reframeMode,
       draft.edit.captionsOn
     );
+  }
+
+  async function skipOutroAndReturn(clipId: string) {
+    if (!selectedId) return;
+    try {
+      await api.updateClip(clipId, { edit: { outro: { enabled: false } } });
+      setDetail((prev) =>
+        prev
+          ? {
+              ...prev,
+              clips: prev.clips.map((clip) =>
+                clip.id === clipId
+                  ? { ...clip, edit: { ...clip.edit, outro: { enabled: false } } }
+                  : clip
+              ),
+            }
+          : prev
+      );
+      navigate(routes.clipMix(selectedId, clipId));
+      setNotice("This export will skip the outro.");
+    } catch (err) {
+      setError(messageOf(err));
+    }
   }
 
   /** Merge the board selection into a new clip. Sources are left alone. */
@@ -598,7 +670,7 @@ export function Studio() {
     (c) => !hiddenClipIds.has(c.id)
   );
   const processing = Boolean(project && ACTIVE_STATUSES.includes(project.status));
-  const editingClipRoute = Boolean(selectedId && editingClipId);
+  const editingClipRoute = Boolean(selectedId && editingClipId && !outroRoute);
   // The clip under edit, kept live by the poller so render progress shows in the
   // editor without the editor reaching for its own copy of the data.
   const editingClip =
@@ -661,6 +733,19 @@ export function Studio() {
           {project ? (
             <button
               type="button"
+              onClick={() => navigate(routes.outro(project.id))}
+              aria-current={outroRoute ? "page" : undefined}
+              className={`press text-ui inline-flex h-11 shrink-0 items-center rounded-md border px-2.5 font-medium sm:h-8 ${
+                outroRoute ? "border-accent bg-accent/10" : "border-border hover:border-control"
+              }`}
+            >
+              Outro
+            </button>
+          ) : null}
+
+          {project ? (
+            <button
+              type="button"
               onClick={() => setIntakeOpen((open) => !open)}
               aria-expanded={intakeOpen}
               className="press text-ui inline-flex h-11 shrink-0 items-center gap-1.5 rounded-md border border-border px-2.5 font-medium hover:border-control sm:h-8"
@@ -690,7 +775,48 @@ export function Studio() {
 
         {/* The editor is a page, not a layer: it takes the whole content column
             so a refresh on a clip URL renders that clip's editor directly. */}
-        {editingClipRoute ? (
+        {outroRoute ? (
+          <div className="flex min-h-0 flex-1 flex-col">
+            {project && selectedId ? (
+              <OutroBuilder
+                projectId={selectedId}
+                outroId={outroId}
+                projectTitle={project.title}
+                spec={pickProjectOutro(project.outros, outroId, project.defaultOutroId) ?? project.outro}
+                returnClipId={returnClipId}
+                onLibraryChange={(library) =>
+                  setDetail((prev) =>
+                    prev
+                      ? {
+                          ...prev,
+                          project: {
+                            ...prev.project,
+                            outros: library.items,
+                            defaultOutroId: library.defaultOutroId,
+                            outro: pickProjectOutro(library.items, undefined, library.defaultOutroId),
+                          },
+                        }
+                      : prev
+                  )
+                }
+                onSelectOutro={(id) => navigate(routes.outro(selectedId, returnClipId, id))}
+                onBack={() => navigate(routes.project(selectedId))}
+                onReturnToClip={(id) => navigate(routes.clipMix(selectedId, id))}
+                onSkipExport={(id) => void skipOutroAndReturn(id)}
+              />
+            ) : (
+              <EditorLoading />
+            )}
+            <div className="px-3 pb-3 lg:px-5">
+              <ErrorNotice
+                error={error}
+                notice={notice}
+                onDismissError={() => setError(null)}
+                onDismissNotice={() => setNotice(null)}
+              />
+            </div>
+          </div>
+        ) : editingClipRoute ? (
           <div className="flex min-h-0 flex-1 flex-col">
             {editingClip && project ? (
               <ClipEditor
@@ -710,7 +836,11 @@ export function Studio() {
                     bytes: editingClip.outputBytes ?? 0,
                   })
                 }
+                onOpenOutro={(id) =>
+                  selectedId ? navigate(routes.outro(selectedId, editingClip.id, id)) : undefined
+                }
                 onBack={() => navigate(routes.clipParent(editingClip.projectId))}
+                onClipUpdated={patchClip}
               />
             ) : editingClipLoaded ? (
               <ClipNotFound
@@ -882,6 +1012,9 @@ export function Studio() {
                   onDismiss={handleDismiss}
                   onUndoDismiss={undoDismiss}
                   onDownloadAll={() => downloadAll(visibleClips)}
+                  onWriteCopy={(force) => void handleWriteCopy(force)}
+                  writingCopy={writingCopy}
+                  onClipUpdated={patchClip}
                 />
               </div>
             ) : null}
@@ -893,7 +1026,7 @@ export function Studio() {
             the panel, which is out of reach one-handed on a phone. Padded for
             the home indicator / gesture bar via .safe-b. The editor has its own
             footer, so this stays off that route. */}
-        {!editingClipRoute && project && selectedClipIds.size > 0 ? (
+        {!editingClipRoute && !outroRoute && project && selectedClipIds.size > 0 ? (
           <div className="safe-b sticky bottom-0 z-10 border-t border-border bg-panel/95 px-3 pt-3 backdrop-blur lg:hidden">
             <button
               type="button"

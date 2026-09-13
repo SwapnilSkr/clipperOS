@@ -5,18 +5,23 @@ import { getErrorMessage } from "../types";
 import type {
   CaptionOverrides,
   CaptionTextOverride,
+  CaptionWordOverride,
   CleanupRegion,
   ClipEdit,
+  ClipOutro,
   ClipSegment,
   Soundtrack,
   SoundtrackHit,
   VideoEffects,
   VttWordTiming,
 } from "../types/clip.types";
-import { MAX_CLEANUP_REGIONS } from "../types/clip.types";
+import { sanitizeClipOutro } from "./outro.service";
+import { generateClipShareCopy } from "./share-copy.service";
+import { MAX_CAPTION_WORD_OVERRIDES, MAX_CLEANUP_REGIONS } from "../types/clip.types";
 import { resolveCaptionFont } from "../config/caption-fonts";
 import { deleteFile, getFileSize, listFiles, projectOutputDir } from "../utils";
 import { buildWordTimeline } from "./mining.service";
+import { expandWordTimings } from "./transcript.service";
 import { deleteKey, getS3KeyFromUrl } from "./s3.service";
 
 // ============================================
@@ -92,6 +97,12 @@ function toPlainEdit(edit: IClip["edit"] | null | undefined): ClipEdit {
     if (!isEmptySoundtrack(clean)) out.soundtrack = clean;
   }
 
+  const outro = source.outro as Record<string, unknown> | null | undefined;
+  if (outro && typeof outro === "object") {
+    const clean = plainClipOutro(outro);
+    if (!isEmptyClipOutro(clean)) out.outro = clean;
+  }
+
   const captionTextOverrides = source.captionTextOverrides;
   if (Array.isArray(captionTextOverrides) && captionTextOverrides.length > 0) {
     out.captionTextOverrides = captionTextOverrides.map((item) => ({
@@ -102,6 +113,15 @@ function toPlainEdit(edit: IClip["edit"] | null | undefined): ClipEdit {
       ...(item.endSec !== undefined ? { endSec: Number(item.endSec) } : {}),
       ...(item.hidden !== undefined ? { hidden: Boolean(item.hidden) } : {}),
       ...(item.custom !== undefined ? { custom: Boolean(item.custom) } : {}),
+    }));
+  }
+
+  const captionWordOverrides = source.captionWordOverrides;
+  if (Array.isArray(captionWordOverrides) && captionWordOverrides.length > 0) {
+    out.captionWordOverrides = captionWordOverrides.map((item) => ({
+      t: Number(item.t ?? 0),
+      ...(typeof item.word === "string" ? { word: item.word } : {}),
+      ...(item.hidden !== undefined ? { hidden: Boolean(item.hidden) } : {}),
     }));
   }
 
@@ -188,11 +208,17 @@ export async function updateClipEdit(clipId: string, input: UpdateClipInput): Pr
     if (edit.captionTextOverrides !== undefined && edit.captionTextOverrides.length === 0) {
       delete next.captionTextOverrides;
     }
+    if (edit.captionWordOverrides !== undefined && edit.captionWordOverrides.length === 0) {
+      delete next.captionWordOverrides;
+    }
     if (edit.videoEffects !== undefined && Object.keys(edit.videoEffects).length === 0) {
       delete next.videoEffects;
     }
     if (edit.soundtrack !== undefined && isEmptySoundtrack(edit.soundtrack)) {
       delete next.soundtrack;
+    }
+    if (edit.outro !== undefined && isEmptyClipOutro(edit.outro)) {
+      delete next.outro;
     }
     assertWindowValid(clip, next);
     if (Object.keys(next).length > 0) $set.edit = next;
@@ -249,12 +275,16 @@ function sanitizeEdit(raw: ClipEdit): ClipEdit {
   if (raw.captionTextOverrides !== undefined) {
     edit.captionTextOverrides = sanitizeCaptionTextOverrides(raw.captionTextOverrides);
   }
+  if (raw.captionWordOverrides !== undefined) {
+    edit.captionWordOverrides = sanitizeCaptionWordOverrides(raw.captionWordOverrides);
+  }
   if (raw.editTemplateId !== undefined) {
     if (typeof raw.editTemplateId !== "string") throw new Error("editTemplateId must be a string");
     edit.editTemplateId = raw.editTemplateId.trim().slice(0, 40);
   }
   if (raw.videoEffects !== undefined) edit.videoEffects = sanitizeVideoEffects(raw.videoEffects);
   if (raw.soundtrack !== undefined) edit.soundtrack = sanitizeSoundtrack(raw.soundtrack);
+  if (raw.outro !== undefined) edit.outro = sanitizeClipOutro(raw.outro);
   if (raw.cleanup !== undefined) {
     edit.cleanup = sanitizeCleanup(raw.cleanup);
   }
@@ -284,6 +314,18 @@ function sanitizeVideoEffects(raw: VideoEffects): VideoEffects {
   return out;
 }
 
+function isEmptyClipOutro(attach: ClipOutro): boolean {
+  return attach.enabled === undefined && attach.transitionId === undefined && attach.outroId === undefined;
+}
+
+function plainClipOutro(source: Record<string, unknown>): ClipOutro {
+  const out: ClipOutro = {};
+  if (source.enabled !== undefined) out.enabled = Boolean(source.enabled);
+  if (typeof source.transitionId === "string") out.transitionId = source.transitionId as ClipOutro["transitionId"];
+  if (typeof source.outroId === "string") out.outroId = source.outroId;
+  return out;
+}
+
 function isEmptySoundtrack(track: Soundtrack): boolean {
   return (
     (track.voiceGain === undefined || Math.abs(track.voiceGain - 1) < 0.001) &&
@@ -301,6 +343,7 @@ function plainSoundtrack(source: Record<string, unknown>): Soundtrack {
       assetId: music.assetId,
       ...(music.gain !== undefined ? { gain: Number(music.gain) } : {}),
       ...(music.duck !== undefined ? { duck: Boolean(music.duck) } : {}),
+      ...(music.carryIntoOutro !== undefined ? { carryIntoOutro: Boolean(music.carryIntoOutro) } : {}),
     };
   }
   if (Array.isArray(source.sfx) && source.sfx.length > 0) {
@@ -329,6 +372,7 @@ function sanitizeSoundtrack(raw: Soundtrack): Soundtrack {
         assetId: sanitizeAssetId(assetId),
         ...(raw.music.gain !== undefined ? { gain: clampNumber(raw.music.gain, 0, 1.5) } : {}),
         ...(raw.music.duck !== undefined ? { duck: Boolean(raw.music.duck) } : {}),
+        ...(raw.music.carryIntoOutro !== undefined ? { carryIntoOutro: Boolean(raw.music.carryIntoOutro) } : {}),
       };
     }
   }
@@ -421,6 +465,27 @@ function sanitizeOverrides(raw: CaptionOverrides): CaptionOverrides {
   }
   if (raw.uppercase !== undefined) out.uppercase = Boolean(raw.uppercase);
   return out;
+}
+
+function sanitizeCaptionWordOverrides(raw: CaptionWordOverride[]): CaptionWordOverride[] {
+  if (!Array.isArray(raw)) throw new Error("captionWordOverrides must be an array");
+  if (raw.length > MAX_CAPTION_WORD_OVERRIDES) {
+    throw new Error(`At most ${MAX_CAPTION_WORD_OVERRIDES} word corrections are allowed`);
+  }
+  const unique = new Map<number, CaptionWordOverride>();
+  for (const [index, item] of raw.entries()) {
+    if (typeof item !== "object" || item === null) throw new Error(`Word correction ${index + 1} is invalid`);
+    const t = Math.round(clampNumber(item.t, 0, 24 * 3600) * 1000) / 1000;
+    const out: CaptionWordOverride = { t };
+    if (item.word !== undefined) {
+      if (typeof item.word !== "string") throw new Error(`Word correction ${index + 1} text is invalid`);
+      out.word = item.word.replace(/\s+/g, " ").trim().slice(0, 120);
+    }
+    if (item.hidden !== undefined) out.hidden = Boolean(item.hidden);
+    if (!out.word && !out.hidden) continue;
+    unique.set(Math.round(t * 1000), out);
+  }
+  return [...unique.values()].sort((a, b) => a.t - b.t);
 }
 
 function sanitizeCaptionTextOverrides(raw: CaptionTextOverride[]): CaptionTextOverride[] {
@@ -575,7 +640,7 @@ export async function createMergeClip(input: CreateMergeInput): Promise<IClip> {
 
   // The source clips have no render for this new clip yet.
   await recomputeProjectStorage(String(project._id));
-  return created;
+  return generateClipShareCopy(String(created._id), true);
 }
 
 export interface DeleteClipResult {
@@ -674,9 +739,11 @@ export async function wordsForClip(
   if (!clip) throw new Error("Clip not found");
 
   const project = await ClipProject.findById(clip.projectId).select("wordTimings captions").lean();
-  const all: VttWordTiming[] = project?.wordTimings?.length
-    ? project.wordTimings
-    : buildWordTimeline(project?.captions ?? []).map((w) => ({ t: w.startSec, word: w.text }));
+  const all: VttWordTiming[] = expandWordTimings(
+    project?.wordTimings?.length
+      ? project.wordTimings
+      : buildWordTimeline(project?.captions ?? []).map((w) => ({ t: w.startSec, word: w.text }))
+  );
 
   const startSec = Number.isFinite(range?.startSec)
     ? Number(range!.startSec)

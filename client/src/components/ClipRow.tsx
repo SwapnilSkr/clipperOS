@@ -1,5 +1,6 @@
 import { Check, Download, Loader2, Pencil, Sparkles, X } from "lucide-react";
 import { clipDownloadUrl, type ClipPayload, type ScoringAxisInfo } from "@/api";
+import { clipHeadline, ShareCopyButton } from "./ShareCopyButton";
 import { cn, SCORE_TONE, scoreBand, timecode } from "@/lib/utils";
 
 interface ClipRowProps {
@@ -12,6 +13,7 @@ interface ClipRowProps {
   onRender: (id: string) => void;
   onEdit: (id: string) => void;
   onDismiss: (id: string) => void;
+  onClipUpdated?: (clip: ClipPayload) => void;
 }
 
 /**
@@ -36,11 +38,12 @@ export function ClipRow({
   onRender,
   onEdit,
   onDismiss,
+  onClipUpdated,
 }: ClipRowProps) {
   const band = scoreBand(clip.totalScore);
   const rendering = clip.status === "rendering";
   const rendered = clip.status === "rendered" && Boolean(clip.outputUrl);
-  const title = clip.title || clip.hookText;
+  const title = clipHeadline(clip);
 
   return (
     <li
@@ -114,6 +117,8 @@ export function ClipRow({
             <Download className="size-3.5" aria-hidden="true" />
           </a>
         ) : null}
+
+        <ShareCopyButton clip={clip} onUpdated={onClipUpdated} />
 
         <button
           type="button"

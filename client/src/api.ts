@@ -38,6 +38,13 @@ export interface CaptionTextOverride {
   custom?: boolean;
 }
 
+/** A correction on one spoken onset. Words-per-caption only groups these. */
+export interface CaptionWordOverride {
+  t: number;
+  word?: string;
+  hidden?: boolean;
+}
+
 export interface VideoEffects {
   grade?: "natural" | "vibrant" | "warm" | "cool" | "cinematic";
   motion?: "none" | "hook_push" | "peak_punch";
@@ -60,8 +67,98 @@ export interface Soundtrack {
     assetId: string;
     gain?: number;
     duck?: boolean;
+    /** Keep the bed playing through the sting. Default true. */
+    carryIntoOutro?: boolean;
   };
   sfx?: SoundtrackHit[];
+}
+
+export type OutroTemplateId = "lockup" | "sting" | "rise" | "card";
+export type OutroTransitionId = "smash" | "punch" | "whip" | "flash" | "dip" | "blur" | "push";
+
+export type OutroLineAnimation = "none" | "pop" | "fade";
+
+export interface OutroLineStyle {
+  fontFamily?: string;
+  sizeScale?: number;
+  textColor?: string;
+  uppercase?: boolean;
+  spacing?: number;
+  animation?: OutroLineAnimation;
+  x?: number;
+  y?: number;
+}
+
+export interface OutroMarkStyle {
+  sizeScale?: number;
+  x?: number;
+  y?: number;
+  /** When true, the mark sits in a circular avatar disc; the sting animates the whole disc. */
+  circle?: boolean;
+}
+
+export interface OutroPalette {
+  bg: string;
+  ink: string;
+  accent: string;
+  glow: string;
+}
+
+export interface ProjectOutro {
+  id: string;
+  name?: string;
+  ready: boolean;
+  logoName?: string;
+  palette?: OutroPalette;
+  templateId?: OutroTemplateId;
+  durationSec?: number;
+  cta?: string;
+  handle?: string;
+  mark?: OutroMarkStyle;
+  ctaStyle?: OutroLineStyle;
+  handleStyle?: OutroLineStyle;
+  sfxAssetId?: string;
+  musicAssetId?: string;
+  sfxGain?: number;
+  musicGain?: number;
+  previewBytes?: number;
+  updatedAt?: string;
+}
+
+export interface ClipOutro {
+  enabled?: boolean;
+  transitionId?: OutroTransitionId;
+  outroId?: string;
+}
+
+export interface OutroTemplateInfo {
+  id: OutroTemplateId;
+  label: string;
+  summary: string;
+}
+
+export interface OutroTransitionInfo {
+  id: OutroTransitionId;
+  label: string;
+  summary: string;
+  durationSec: number;
+}
+
+export interface OutroPayload {
+  spec: ProjectOutro | null;
+  items: ProjectOutro[];
+  defaultOutroId?: string;
+  hasLogo: boolean;
+  hasPreview: boolean;
+  templates: OutroTemplateInfo[];
+  transitions: OutroTransitionInfo[];
+  fonts?: CaptionFontInfo[];
+  maxOutros?: number;
+  defaults?: {
+    mark: Required<OutroMarkStyle>;
+    ctaStyle: Required<OutroLineStyle>;
+    handleStyle: Required<OutroLineStyle>;
+  };
 }
 
 export interface AudioAsset {
@@ -131,9 +228,12 @@ export interface ClipEdit {
   captionStyleId?: string;
   captionOverrides?: CaptionOverrides;
   captionTextOverrides?: CaptionTextOverride[];
+  captionWordOverrides?: CaptionWordOverride[];
   editTemplateId?: string;
   videoEffects?: VideoEffects;
   soundtrack?: Soundtrack;
+  /** How this clip joins the project sting. Absent means attach if a sting exists. */
+  outro?: ClipOutro;
   /** Burned-in text / watermark regions to remove. Empty array clears them. */
   cleanup?: CleanupRegion[];
 }
@@ -224,6 +324,11 @@ export interface ProjectSummary {
   clipDuration: { min: number; target: number; max: number };
   timings?: { ingestMs?: number; miningMs?: number; totalMs?: number };
   createdAt: string;
+  /** Default sting, for older callers. Same as the default entry in `outros`. */
+  outro?: ProjectOutro;
+  /** Shared outro library. The same list on every project. */
+  outros?: ProjectOutro[];
+  defaultOutroId?: string;
 }
 
 export interface ClipPayload {
@@ -242,6 +347,7 @@ export interface ClipPayload {
   /** Absent when the peak is a moment with no spoken line. */
   peakLine?: string;
   hookText: string;
+  shareCopy?: { title: string; description: string; generatedAt: string };
   /** Axis id -> 0-10. Axis set comes from the project's genre. */
   scores: Record<string, number>;
   totalScore: number;
@@ -358,6 +464,32 @@ export const api = {
       body: JSON.stringify({ genreId: genreId || undefined }),
     }),
 
+  generateClipShareCopy: (id: string, force = false) =>
+    request<ClipPayload>(`/clips/${id}/share-copy`, {
+      method: "POST",
+      body: JSON.stringify({ force }),
+    }),
+
+  cleanClipCaptions: (
+    id: string,
+    body?: { startSec?: number; endSec?: number; chunkWords?: number; listen?: boolean }
+  ) =>
+    request<{
+      overrides: CaptionTextOverride[];
+      wordOverrides: CaptionWordOverride[];
+      changed: number;
+      listened: boolean;
+    }>(
+      `/clips/${id}/captions/clean`,
+      { method: "POST", body: JSON.stringify(body ?? {}) }
+    ),
+
+  generateProjectShareCopy: (id: string, force = false) =>
+    request<{ written: number; skipped: number }>(`/projects/${id}/share-copy`, {
+      method: "POST",
+      body: JSON.stringify({ force }),
+    }),
+
   renderClips: (
     clipIds: string[],
     reframeMode: "center" | "smart",
@@ -405,7 +537,7 @@ export const api = {
 
   listAudioLibrary: (projectId?: string) => {
     const query = projectId ? `?projectId=${encodeURIComponent(projectId)}` : "";
-    return request<{ builtin: AudioAsset[]; custom: AudioAsset[] }>(`/audio-library${query}`);
+    return request<{ builtin: AudioAsset[]; custom: AudioAsset[]; maxCustom?: number }>(`/audio-library${query}`);
   },
 
   uploadProjectAudio: async (projectId: string, file: File, kind: "music" | "sfx") => {
@@ -417,6 +549,35 @@ export const api = {
 
   deleteProjectAudio: (projectId: string, fileId: string) =>
     request<{ deleted: boolean }>(`/projects/${projectId}/audio/${fileId}`, { method: "DELETE" }),
+
+  getProjectOutros: (projectId: string) => request<OutroPayload>(`/projects/${projectId}/outros`),
+
+  createProjectOutro: (projectId: string, name?: string) =>
+    request<OutroPayload>(`/projects/${projectId}/outros`, {
+      method: "POST",
+      body: JSON.stringify(name ? { name } : {}),
+    }),
+
+  getProjectOutro: (projectId: string, outroId: string) =>
+    request<OutroPayload>(`/projects/${projectId}/outros/${outroId}`),
+
+  updateProjectOutro: (projectId: string, outroId: string, spec: Partial<ProjectOutro> & { makeDefault?: boolean }) =>
+    request<OutroPayload>(`/projects/${projectId}/outros/${outroId}`, {
+      method: "PATCH",
+      body: JSON.stringify(spec),
+    }),
+
+  uploadOutroLogo: async (projectId: string, outroId: string, file: File) => {
+    const form = new FormData();
+    form.append("file", file);
+    return request<OutroPayload>(`/projects/${projectId}/outros/${outroId}/logo`, { method: "POST", body: form });
+  },
+
+  rebuildOutroPreview: (projectId: string, outroId: string) =>
+    request<OutroPayload>(`/projects/${projectId}/outros/${outroId}/preview`, { method: "POST" }),
+
+  deleteProjectOutro: (projectId: string, outroId: string) =>
+    request<OutroPayload>(`/projects/${projectId}/outros/${outroId}`, { method: "DELETE" }),
 
   /** Reclaim S3 objects no live clip owns. Dry run unless `dryRun` is false. */
   reconcileProject: (id: string, dryRun = true) =>
@@ -456,4 +617,35 @@ export function builtinAudioUrl(id: string): string {
 
 export function projectAudioUrl(projectId: string, fileId: string): string {
   return `${BASE}/projects/${projectId}/audio/${fileId}`;
+}
+
+export function sharedAudioUrl(fileId: string): string {
+  return `${BASE}/audio-library/custom/${fileId}`;
+}
+
+export function projectOutroPreviewUrl(projectId: string, outroId: string, bust?: string): string {
+  const query = bust ? `?v=${encodeURIComponent(bust)}` : "";
+  return `${BASE}/projects/${projectId}/outros/${outroId}/preview${query}`;
+}
+
+export function projectOutroLogoUrl(projectId: string, outroId: string, bust?: string): string {
+  const query = bust ? `?v=${encodeURIComponent(bust)}` : "";
+  return `${BASE}/projects/${projectId}/outros/${outroId}/logo${query}`;
+}
+
+export function pickProjectOutro(
+  items: ProjectOutro[] | undefined,
+  outroId?: string,
+  defaultOutroId?: string
+): ProjectOutro | undefined {
+  const list = items ?? [];
+  if (outroId) {
+    const hit = list.find((item) => item.id === outroId);
+    if (hit) return hit;
+  }
+  if (defaultOutroId) {
+    const hit = list.find((item) => item.id === defaultOutroId);
+    if (hit) return hit;
+  }
+  return list.find((item) => item.ready) ?? list[0];
 }

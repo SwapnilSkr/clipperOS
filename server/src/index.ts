@@ -13,7 +13,8 @@ import {
   sweepOrphanedOutputs,
   sweepUnownedLocalOutputs,
 } from "./services/storage-custody.service";
-import { sweepOrphanedAudio } from "./services/soundtrack.service";
+import { loadSharedAudioLibrary, sweepOrphanedAudio } from "./services/soundtrack.service";
+import { loadSharedOutroLibrary, sweepOrphanedOutros } from "./services/outro.service";
 import { initializeStorage, sweepProcessingDir } from "./utils";
 import { getErrorMessage } from "./types";
 
@@ -36,6 +37,7 @@ function runCustodySweep(label: string): void {
     // fragments plus a status stuck on "fetching".
     sweepMediaFragments(),
     sweepOrphanedAudio(),
+    sweepOrphanedOutros(),
   ]).catch((error: unknown) => {
     console.error(`⚠️  Storage sweep (${label}) failed: ${getErrorMessage(error)}`);
   });
@@ -125,6 +127,7 @@ const app = new Elysia({
       captionStyles: "GET /api/caption-styles",
       captionFonts: "GET /api/caption-styles/fonts",
       audioLibrary: "GET /api/audio-library",
+      outro: "GET /api/projects/:id/outros",
       render: "POST /api/clips/render",
       merge: "POST /api/clips/merge",
       clip: "GET /api/clips/:id",
@@ -163,6 +166,12 @@ async function initialize(): Promise<void> {
   );
   await connectDatabase();
   await initializeStorage();
+  await loadSharedOutroLibrary().catch((error: unknown) => {
+    console.error(`⚠️  Shared outro library failed to load: ${getErrorMessage(error)}`);
+  });
+  await loadSharedAudioLibrary().catch((error: unknown) => {
+    console.error(`⚠️  Shared audio library failed to load: ${getErrorMessage(error)}`);
+  });
   // Reclaim anything a previous process was killed in the middle of leaving.
   runCustodySweep("boot");
   await assertRedisReady();

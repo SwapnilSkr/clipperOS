@@ -1,5 +1,6 @@
 import { Check, Download, Loader2, Pencil, Sparkles, X } from "lucide-react";
 import { clipDownloadUrl, type ClipPayload, type ScoringAxisInfo } from "@/api";
+import { clipHeadline, ShareCopyButton } from "./ShareCopyButton";
 import { cn, SCORE_TONE, scoreBand, timecode } from "@/lib/utils";
 
 interface ClipCardProps {
@@ -11,6 +12,7 @@ interface ClipCardProps {
   onRender: (id: string) => void;
   onEdit: (id: string) => void;
   onDismiss: (id: string) => void;
+  onClipUpdated?: (clip: ClipPayload) => void;
 }
 
 function ScoreRing({ score }: { score: number }) {
@@ -52,6 +54,7 @@ export function ClipCard({
   onRender,
   onEdit,
   onDismiss,
+  onClipUpdated,
 }: ClipCardProps) {
   const rendering = clip.status === "rendering";
   const rendered = clip.status === "rendered" && Boolean(clip.outputUrl);
@@ -122,7 +125,7 @@ export function ClipCard({
           <p className="num text-micro font-medium text-muted">
             {timecode(clip.startSec)}–{timecode(clip.endSec)} · {clip.durationSec.toFixed(0)}s
           </p>
-          <p className="text-ui mt-0.5 line-clamp-2 font-semibold">{clip.hookText}</p>
+          <p className="text-ui mt-0.5 line-clamp-2 font-semibold">{clipHeadline(clip)}</p>
           {clip.peakLine ? (
             <p className="text-meta mt-1 line-clamp-2 text-accent-2">“{clip.peakLine}”</p>
           ) : null}
@@ -172,6 +175,8 @@ export function ClipCard({
               <Download className="size-3.5" aria-hidden="true" />
             </a>
           ) : null}
+
+          <ShareCopyButton clip={clip} compact={false} onUpdated={onClipUpdated} />
 
           <button
             type="button"

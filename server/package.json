@@ -16,6 +16,8 @@
     "captions:validate": "bun run scripts/validate-captions.ts",
     "video-effects:validate": "bun run scripts/validate-video-effects.ts",
     "soundtrack:validate": "bun run scripts/validate-soundtrack.ts",
+    "outro:validate": "bun run scripts/validate-outro.ts",
+    "share-copy:validate": "bun run scripts/validate-share-copy.ts",
     "audio:generate": "bun run scripts/generate-audio-library.ts"
   },
   "dependencies": {

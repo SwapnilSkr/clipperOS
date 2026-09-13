@@ -1,5 +1,6 @@
 import { useState } from "react";
 import {
+  Copy,
   Download,
   Languages,
   LayoutGrid,
@@ -47,6 +48,9 @@ interface ClipBoardProps {
   onDismiss: (clip: ClipPayload) => void;
   onUndoDismiss: () => void;
   onDownloadAll: () => void;
+  onWriteCopy: (force: boolean) => void;
+  writingCopy?: boolean;
+  onClipUpdated?: (clip: ClipPayload) => void;
 }
 
 const REFRAME_OPTIONS = [
@@ -79,12 +83,16 @@ export function ClipBoard({
   onDismiss,
   onUndoDismiss,
   onDownloadAll,
+  onWriteCopy,
+  writingCopy,
+  onClipUpdated,
 }: ClipBoardProps) {
   const renderedCount = clips.filter((c) => c.status === "rendered").length;
   const allSelected = clips.length > 0 && selectedIds.size === clips.length;
   const selectedCount = selectedIds.size;
   const genreSummary = genres.find((g) => g.id === project.genreId)?.summary;
   const [setupOpen, setSetupOpen] = useState(false);
+  const missingCopy = clips.some((clip) => !clip.shareCopy?.title);
 
   const sourceLabel =
     project.transcriptSource === "youtube_captions"
@@ -183,6 +191,10 @@ export function ClipBoard({
 
           <MoreMenu label="More actions">
             <MenuItem onClick={onToggleAll}>{allSelected ? "Clear selection" : "Select all"}</MenuItem>
+            <MenuItem disabled={writingCopy || clips.length === 0} onClick={() => onWriteCopy(!missingCopy)}>
+              <Copy className="size-3.5" aria-hidden="true" />
+              {writingCopy ? "Writing post copy…" : missingCopy ? "Write post copy" : "Rewrite post copy"}
+            </MenuItem>
             {renderedCount > 0 ? (
               <MenuItem onClick={onDownloadAll}>
                 <Download className="size-3.5" aria-hidden="true" />
@@ -285,6 +297,7 @@ export function ClipBoard({
               onRender={onRenderOne}
               onEdit={onEdit}
               onDismiss={() => onDismiss(clip)}
+              onClipUpdated={onClipUpdated}
             />
           ))}
         </ul>
@@ -304,6 +317,7 @@ export function ClipBoard({
                 onRender={onRenderOne}
                 onEdit={onEdit}
                 onDismiss={() => onDismiss(clip)}
+                onClipUpdated={onClipUpdated}
               />
             </div>
           ))}

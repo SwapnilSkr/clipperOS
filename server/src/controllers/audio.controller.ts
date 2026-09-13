@@ -9,22 +9,23 @@ import {
   ingestCustomAudio,
   listBuiltinAudio,
   listCustomAudio,
+  loadSharedAudioLibrary,
+  MAX_CUSTOM_AUDIO,
   MAX_CUSTOM_AUDIO_BYTES,
+  resolveCustomAudioFile,
 } from "../services/soundtrack.service";
 import type { ApiContext } from "../types/api.types";
 import { getErrorMessage } from "../types";
-import { containedPath, fileExists, projectAudioDir, serveLocalVideo } from "../utils";
+import { serveLocalVideo } from "../utils";
 import { fail, ok } from "../utils/response.utils";
 
 type Ctx = ApiContext;
 
-/** GET /api/audio-library — built-in pads, plus this project's uploads when asked. */
-export async function listAudioLibrary({ query, set }: Ctx) {
-  const input = query as { projectId?: string };
+/** GET /api/audio-library — built-in pads plus the shared upload library. */
+export async function listAudioLibrary({ set }: Ctx) {
   try {
-    const builtin = listBuiltinAudio();
-    const custom = input.projectId ? await listCustomAudio(input.projectId) : [];
-    return ok({ builtin, custom });
+    const [builtin, custom] = await Promise.all([listBuiltinAudio(), listCustomAudio()]);
+    return ok({ builtin, custom, maxCustom: MAX_CUSTOM_AUDIO });
   } catch (error: unknown) {
     set.status = 500;
     return fail(getErrorMessage(error));
@@ -41,6 +42,22 @@ export async function streamBuiltinAudio({ params, set }: Ctx) {
   return serveLocalVideo(set, path, { "content-type": "audio/mp4" });
 }
 
+/** GET /api/audio-library/custom/:fileId — stream a shared upload. */
+export async function streamSharedAudio({ params, set }: Ctx) {
+  try {
+    await loadSharedAudioLibrary();
+    const path = await resolveCustomAudioFile(params.fileId);
+    if (!path) {
+      set.status = 404;
+      return fail("Unknown audio file");
+    }
+    return serveLocalVideo(set, path, { "content-type": "audio/mp4" });
+  } catch (error: unknown) {
+    set.status = 400;
+    return fail(getErrorMessage(error));
+  }
+}
+
 /** GET /api/projects/:id/audio/:fileId — stream an uploaded pad. */
 export async function streamProjectAudio({ params, set }: Ctx) {
   try {
@@ -49,8 +66,9 @@ export async function streamProjectAudio({ params, set }: Ctx) {
       set.status = 404;
       return fail("Project not found");
     }
-    const path = containedPath(projectAudioDir(params.id), `${params.fileId}.m4a`);
-    if (!(await fileExists(path))) {
+    await loadSharedAudioLibrary();
+    const path = await resolveCustomAudioFile(params.fileId, params.id);
+    if (!path) {
       set.status = 404;
       return fail("Unknown audio file");
     }

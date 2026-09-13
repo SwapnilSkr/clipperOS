@@ -9,14 +9,27 @@ export {
   listGenres,
   remineProject,
   reconcileProject,
+  writeProjectShareCopy,
 } from "./project.controller";
 export {
   listAudioLibrary,
   streamBuiltinAudio,
+  streamSharedAudio,
   streamProjectAudio,
   uploadProjectAudio,
   deleteProjectAudio,
 } from "./audio.controller";
+export {
+  listProjectOutros,
+  createProjectOutro,
+  getProjectOutro,
+  uploadOutroLogo,
+  updateProjectOutro,
+  rebuildOutroPreview,
+  streamOutroPreview,
+  streamOutroLogo,
+  deleteProjectOutro,
+} from "./outro.controller";
 export {
   renderClips,
   getClip,
@@ -27,4 +40,6 @@ export {
   mergeClips,
   getClipWords,
   previewClipReframe,
+  writeClipShareCopy,
+  cleanClipCaptionsRoute,
 } from "./clip.controller";

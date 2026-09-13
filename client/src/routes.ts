@@ -11,6 +11,11 @@ export const routes = {
   clip: (projectId: string, clipId: string) => `/projects/${projectId}/clips/${clipId}`,
   /** Picture is already cut; this desk is music / SFX before export. */
   clipMix: (projectId: string, clipId: string) => `/projects/${projectId}/clips/${clipId}?desk=mix`,
+  /** Project-level logo sting library. `returnClip` sends you back to mix after. */
+  outro: (projectId: string, returnClip?: string, outroId?: string) => {
+    const path = outroId ? `/projects/${projectId}/outro/${outroId}` : `/projects/${projectId}/outro`;
+    return returnClip ? `${path}?returnClip=${encodeURIComponent(returnClip)}` : path;
+  },
   /** The board a clip belongs to — where Back goes. */
   clipParent: (projectId: string) => `/projects/${projectId}`,
 } as const;

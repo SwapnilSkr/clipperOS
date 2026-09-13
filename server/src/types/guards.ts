@@ -87,6 +87,12 @@ const CaptionTextOverrideBody = t.Object({
   custom: t.Optional(t.Boolean()),
 });
 
+const CaptionWordOverrideBody = t.Object({
+  t: t.Number(),
+  word: t.Optional(t.String({ maxLength: 120 })),
+  hidden: t.Optional(t.Boolean()),
+});
+
 const VideoEffectsBody = t.Object({
   grade: t.Optional(t.Union([
     t.Literal("natural"), t.Literal("vibrant"), t.Literal("warm"),
@@ -115,6 +121,7 @@ const SoundtrackBody = t.Object({
       assetId: t.Optional(t.String({ maxLength: 80 })),
       gain: t.Optional(t.Number()),
       duck: t.Optional(t.Boolean()),
+      carryIntoOutro: t.Optional(t.Boolean()),
     })
   ),
   sfx: t.Optional(t.Array(SoundtrackHitBody, { maxItems: 16 })),
@@ -138,9 +145,27 @@ const ClipEditBody = t.Object({
   captionStyleId: t.Optional(t.String({ maxLength: 40 })),
   captionOverrides: t.Optional(CaptionOverridesBody),
   captionTextOverrides: t.Optional(t.Array(CaptionTextOverrideBody, { maxItems: 240 })),
+  captionWordOverrides: t.Optional(t.Array(CaptionWordOverrideBody, { maxItems: 800 })),
   editTemplateId: t.Optional(t.String({ maxLength: 40 })),
   videoEffects: t.Optional(VideoEffectsBody),
   soundtrack: t.Optional(SoundtrackBody),
+  outro: t.Optional(
+    t.Object({
+      enabled: t.Optional(t.Boolean()),
+      transitionId: t.Optional(
+        t.Union([
+          t.Literal("smash"),
+          t.Literal("punch"),
+          t.Literal("whip"),
+          t.Literal("flash"),
+          t.Literal("dip"),
+          t.Literal("blur"),
+          t.Literal("push"),
+        ])
+      ),
+      outroId: t.Optional(t.String({ minLength: 4, maxLength: 24, pattern: "^[a-z0-9]+$" })),
+    })
+  ),
   cleanup: t.Optional(t.Array(CleanupRegionBody, { maxItems: 8 })),
 });
 
@@ -150,6 +175,12 @@ export const AudioLibraryQuery = t.Object({
 
 export const BuiltinAudioParams = t.Object({
   id: t.String({ minLength: 1, maxLength: 40, pattern: "^[a-z][a-z0-9_]{0,31}$" }),
+});
+
+export const SharedAudioParams = t.Object({
+  fileId: t.String({
+    pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+  }),
 });
 
 export const ProjectAudioParams = t.Object({
@@ -184,6 +215,64 @@ export const MergeClipsBody = t.Object({
 
 export const ProjectParams = t.Object({ id: t.String({ pattern: OBJECT_ID_PATTERN }) });
 export const ClipParams = t.Object({ id: t.String({ pattern: OBJECT_ID_PATTERN }) });
+export const ShareCopyBody = t.Object({
+  force: t.Optional(t.Boolean()),
+});
+export const ProjectOutroParams = t.Object({
+  id: t.String({ pattern: OBJECT_ID_PATTERN }),
+  outroId: t.String({ minLength: 4, maxLength: 24, pattern: "^[a-z0-9]+$" }),
+});
+
+export const CreateProjectOutroBody = t.Object({
+  name: t.Optional(t.String({ maxLength: 40 })),
+});
+
+export const ProjectOutroBody = t.Object({
+  name: t.Optional(t.String({ maxLength: 40 })),
+  makeDefault: t.Optional(t.Boolean()),
+  templateId: t.Optional(
+    t.Union([t.Literal("lockup"), t.Literal("sting"), t.Literal("rise"), t.Literal("card")])
+  ),
+  durationSec: t.Optional(t.Number()),
+  cta: t.Optional(t.String({ maxLength: 42 })),
+  handle: t.Optional(t.String({ maxLength: 32 })),
+  mark: t.Optional(
+    t.Object({
+      sizeScale: t.Optional(t.Number()),
+      x: t.Optional(t.Number()),
+      y: t.Optional(t.Number()),
+      circle: t.Optional(t.Boolean()),
+    })
+  ),
+  ctaStyle: t.Optional(
+    t.Object({
+      fontFamily: t.Optional(t.String({ maxLength: 60 })),
+      sizeScale: t.Optional(t.Number()),
+      textColor: t.Optional(t.String({ maxLength: 9 })),
+      uppercase: t.Optional(t.Boolean()),
+      spacing: t.Optional(t.Number()),
+      animation: t.Optional(t.Union([t.Literal("none"), t.Literal("pop"), t.Literal("fade")])),
+      x: t.Optional(t.Number()),
+      y: t.Optional(t.Number()),
+    })
+  ),
+  handleStyle: t.Optional(
+    t.Object({
+      fontFamily: t.Optional(t.String({ maxLength: 60 })),
+      sizeScale: t.Optional(t.Number()),
+      textColor: t.Optional(t.String({ maxLength: 9 })),
+      uppercase: t.Optional(t.Boolean()),
+      spacing: t.Optional(t.Number()),
+      animation: t.Optional(t.Union([t.Literal("none"), t.Literal("pop"), t.Literal("fade")])),
+      x: t.Optional(t.Number()),
+      y: t.Optional(t.Number()),
+    })
+  ),
+  sfxAssetId: t.Optional(t.String({ maxLength: 80 })),
+  musicAssetId: t.Optional(t.String({ maxLength: 80 })),
+  sfxGain: t.Optional(t.Number()),
+  musicGain: t.Optional(t.Number()),
+});
 
 /** `?dryRun=0` is the only value that actually deletes; anything else reports. */
 export const ReconcileQuery = t.Object({
@@ -194,6 +283,14 @@ export const ReconcileQuery = t.Object({
 export const ClipWordsQuery = t.Object({
   startSec: t.Optional(t.String()),
   endSec: t.Optional(t.String()),
+});
+
+/** POST /api/clips/:id/captions/clean — fix fillers and ASR from the word grid. */
+export const CleanCaptionsBody = t.Object({
+  startSec: t.Optional(t.Number()),
+  endSec: t.Optional(t.Number()),
+  chunkWords: t.Optional(t.Number()),
+  listen: t.Optional(t.Boolean()),
 });
 
 /** POST /api/clips/:id/reframe/preview — analyse the live trim for editor WYSIWYG. */

@@ -1,16 +1,17 @@
 import { existsSync } from "node:fs";
-import { readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { config } from "../config";
 import type { Soundtrack, SoundtrackHit } from "../types/clip.types";
 import { getErrorMessage } from "../types";
-import { ensureDir, fileExists, getFileSize, projectAudioDir } from "../utils/file.utils";
+import { containedPath, ensureDir, fileExists, getFileSize, projectAudioDir } from "../utils/file.utils";
 import { runCommand } from "../utils/process.utils";
 import { getVideoMetadata, hasAudioStream } from "./ffmpeg.service";
 
 export const MAX_SOUNDTRACK_HITS = 16;
-export const MAX_CUSTOM_AUDIO = 8;
+export const MAX_CUSTOM_AUDIO = 24;
 export const MAX_CUSTOM_AUDIO_BYTES = 8 * 1024 * 1024;
+export const SHARED_AUDIO_OWNER = "shared";
 
 export type AudioKind = "music" | "sfx";
 
@@ -58,13 +59,30 @@ export function customAssetFileId(id: string): string | undefined {
   return rest;
 }
 
+export function sharedAudioDir(): string {
+  return join(config.audioPath, SHARED_AUDIO_OWNER);
+}
+
+export async function resolveCustomAudioFile(
+  fileId: string,
+  hintProjectId?: string
+): Promise<string | undefined> {
+  if (!customAssetFileId(`custom:${fileId}`)) return undefined;
+  const shared = containedPath(sharedAudioDir(), `${fileId}.m4a`);
+  if (await fileExists(shared)) return shared;
+  if (hintProjectId) {
+    const local = containedPath(projectAudioDir(hintProjectId), `${fileId}.m4a`);
+    if (await fileExists(local)) return local;
+  }
+  return undefined;
+}
+
 export async function resolveAssetPath(projectId: string, assetId: string): Promise<string | undefined> {
   const builtin = builtinAudioPath(assetId);
   if (builtin) return builtin;
   const fileId = customAssetFileId(assetId);
   if (!fileId) return undefined;
-  const path = join(projectAudioDir(projectId), `${fileId}.m4a`);
-  return (await fileExists(path)) ? path : undefined;
+  return resolveCustomAudioFile(fileId, projectId);
 }
 
 interface CustomMeta {
@@ -74,8 +92,7 @@ interface CustomMeta {
   durationSec: number;
 }
 
-export async function listCustomAudio(projectId: string): Promise<AudioAsset[]> {
-  const dir = projectAudioDir(projectId);
+async function listAudioInDir(dir: string): Promise<AudioAsset[]> {
   const names = await readdir(dir).catch(() => [] as string[]);
   const out: AudioAsset[] = [];
   for (const name of names) {
@@ -84,7 +101,9 @@ export async function listCustomAudio(projectId: string): Promise<AudioAsset[]> 
     try {
       const meta = JSON.parse(raw) as CustomMeta;
       if (!meta?.id || (meta.kind !== "music" && meta.kind !== "sfx")) continue;
-      const file = join(dir, `${customAssetFileId(meta.id) ?? ""}.m4a`);
+      const fileId = customAssetFileId(meta.id);
+      if (!fileId) continue;
+      const file = join(dir, `${fileId}.m4a`);
       if (!(await fileExists(file))) continue;
       out.push({
         id: meta.id,
@@ -99,22 +118,76 @@ export async function listCustomAudio(projectId: string): Promise<AudioAsset[]> 
   return out;
 }
 
+export async function promoteProjectAudioToShared(projectId: string): Promise<number> {
+  const src = projectAudioDir(projectId);
+  const dest = sharedAudioDir();
+  await ensureDir(dest);
+  const names = await readdir(src).catch(() => [] as string[]);
+  let copied = 0;
+  for (const name of names) {
+    if (!name.endsWith(".m4a") && !name.endsWith(".json")) continue;
+    const from = join(src, name);
+    const to = join(dest, name);
+    if ((await fileExists(from)) && !(await fileExists(to))) {
+      await cp(from, to).catch(() => undefined);
+      copied += 1;
+    }
+  }
+  return copied;
+}
+
+let audioHydrated = false;
+let audioHydrate: Promise<void> | null = null;
+
+export async function loadSharedAudioLibrary(force = false): Promise<void> {
+  if (audioHydrated && !force) return;
+  if (audioHydrate && !force) return audioHydrate;
+  audioHydrate = hydrateSharedAudioLibrary().finally(() => {
+    audioHydrate = null;
+  });
+  return audioHydrate;
+}
+
+async function hydrateSharedAudioLibrary(): Promise<void> {
+  const dest = sharedAudioDir();
+  await ensureDir(dest);
+  const flag = join(dest, ".imported");
+  if (await fileExists(flag)) {
+    audioHydrated = true;
+    return;
+  }
+  const entries = await readdir(config.audioPath, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name === SHARED_AUDIO_OWNER) continue;
+    if (!/^[0-9a-f]{24}$/.test(entry.name)) continue;
+    await promoteProjectAudioToShared(entry.name);
+  }
+  await writeFile(flag, new Date().toISOString());
+  audioHydrated = true;
+}
+
+export async function listCustomAudio(_projectId?: string): Promise<AudioAsset[]> {
+  await loadSharedAudioLibrary();
+  return listAudioInDir(sharedAudioDir());
+}
+
 export async function ingestCustomAudio(
-  projectId: string,
+  _projectId: string,
   kind: AudioKind,
   sourcePath: string,
   originalName: string
 ): Promise<AudioAsset> {
-  const existing = await listCustomAudio(projectId);
+  await loadSharedAudioLibrary();
+  const existing = await listAudioInDir(sharedAudioDir());
   if (existing.length >= MAX_CUSTOM_AUDIO) {
-    throw new Error(`At most ${MAX_CUSTOM_AUDIO} custom audio files per project`);
+    throw new Error(`The audio library can hold ${MAX_CUSTOM_AUDIO} uploads`);
   }
   const size = await getFileSize(sourcePath);
   if (size > MAX_CUSTOM_AUDIO_BYTES) {
     throw new Error("Audio file is too large (8 MB max)");
   }
 
-  const dir = projectAudioDir(projectId);
+  const dir = sharedAudioDir();
   await ensureDir(dir);
   const fileId = crypto.randomUUID();
   const dest = join(dir, `${fileId}.m4a`);
@@ -146,11 +219,13 @@ export async function ingestCustomAudio(
 export async function deleteCustomAudio(projectId: string, assetId: string): Promise<void> {
   const fileId = customAssetFileId(assetId);
   if (!fileId) throw new Error("Unknown audio file");
-  const dir = projectAudioDir(projectId);
-  await Promise.all([
-    rm(join(dir, `${fileId}.m4a`), { force: true }),
-    rm(join(dir, `${fileId}.json`), { force: true }),
-  ]);
+  const dirs = [sharedAudioDir(), projectAudioDir(projectId)];
+  await Promise.all(
+    dirs.flatMap((dir) => [
+      rm(join(dir, `${fileId}.m4a`), { force: true }),
+      rm(join(dir, `${fileId}.json`), { force: true }),
+    ])
+  );
 }
 
 export function soundtrackNeedsMix(track: Soundtrack | undefined): boolean {
@@ -158,6 +233,13 @@ export function soundtrackNeedsMix(track: Soundtrack | undefined): boolean {
   if (track.voiceGain != null && Math.abs(track.voiceGain - 1) > 0.001) return true;
   if (track.music?.assetId) return true;
   return (track.sfx ?? []).length > 0;
+}
+
+/** Music or hits that should be mixed after the sting is joined. */
+export function soundtrackSpansOutro(track: Soundtrack | undefined, clipDurationSec: number): boolean {
+  if (!track) return false;
+  if (track.music?.assetId && track.music.carryIntoOutro !== false) return true;
+  return (track.sfx ?? []).some((hit) => (hit.atSec ?? 0) > clipDurationSec - 0.02);
 }
 
 export function buildSoundtrackGraph(input: {
@@ -168,14 +250,34 @@ export function buildSoundtrackGraph(input: {
   musicIndex?: number;
   musicGain: number;
   hits: { index: number; atSec: number; gain: number }[];
+  /** Apply voiceGain only up to this time; later audio (the sting) stays at unity. */
+  voiceUntilSec?: number;
 }): string {
   const duration = Math.max(0.05, input.durationSec);
   const graph: string[] = [];
   const mixParts: string[] = [];
   const duckMusic = input.musicIndex != null && input.duck && input.voiceHasAudio && input.voiceGain > 0.05;
+  const voiceUntil = input.voiceUntilSec;
+  const splitVoice =
+    input.voiceHasAudio &&
+    voiceUntil != null &&
+    voiceUntil < duration - 0.05 &&
+    Math.abs(input.voiceGain - 1) > 0.001;
 
   if (input.voiceHasAudio) {
-    graph.push(`[0:a]volume=${input.voiceGain.toFixed(3)}[voicefull]`);
+    if (splitVoice) {
+      const cut = Math.max(0.05, voiceUntil!);
+      graph.push(`[0:a]asplit=2[pre][postsrc]`);
+      graph.push(
+        `[pre]atrim=0:${cut.toFixed(3)},asetpts=PTS-STARTPTS,volume=${input.voiceGain.toFixed(3)}[v1]`
+      );
+      graph.push(`[postsrc]atrim=${cut.toFixed(3)}:${duration.toFixed(3)},asetpts=PTS-STARTPTS[v2]`);
+      graph.push(`[v1][v2]concat=n=2:v=0:a=1,apad=whole_dur=${duration.toFixed(3)}[voicefull]`);
+    } else {
+      graph.push(
+        `[0:a]volume=${input.voiceGain.toFixed(3)},apad=whole_dur=${duration.toFixed(3)}[voicefull]`
+      );
+    }
     graph.push(duckMusic ? `[voicefull]asplit=2[voice][voicekey]` : `[voicefull]anull[voice]`);
     mixParts.push("[voice]");
   }
@@ -184,7 +286,7 @@ export function buildSoundtrackGraph(input: {
     const fade = Math.min(1.2, duration / 6);
     const fadeOutStart = Math.max(0, duration - fade);
     graph.push(
-      `[${input.musicIndex}:a]atrim=0:${duration.toFixed(3)},asetpts=PTS-STARTPTS,afade=t=in:d=${fade.toFixed(2)},afade=t=out:st=${fadeOutStart.toFixed(3)}:d=${fade.toFixed(2)},volume=${input.musicGain.toFixed(3)}[musicraw]`
+      `[${input.musicIndex}:a]atrim=0:${duration.toFixed(3)},asetpts=PTS-STARTPTS,afade=t=in:d=${fade.toFixed(2)},afade=t=out:st=${fadeOutStart.toFixed(3)}:d=${fade.toFixed(2)},volume=${input.musicGain.toFixed(3)},apad=whole_dur=${duration.toFixed(3)}[musicraw]`
     );
     graph.push(
       duckMusic
@@ -220,7 +322,8 @@ export async function mixSoundtrackOntoClip(
   videoPath: string,
   durationSec: number,
   soundtrack: Soundtrack | undefined,
-  scratchDir: string
+  scratchDir: string,
+  options?: { voiceUntilSec?: number }
 ): Promise<string> {
   if (!soundtrackNeedsMix(soundtrack)) return videoPath;
   const track = soundtrack!;
@@ -258,6 +361,7 @@ export async function mixSoundtrackOntoClip(
     duck,
     musicIndex,
     musicGain,
+    voiceUntilSec: options?.voiceUntilSec,
     hits: hitInputs.map(({ index, hit }) => ({
       index,
       atSec: hit.atSec ?? 0,
@@ -283,7 +387,8 @@ export async function mixSoundtrackOntoClip(
         "aac",
         "-b:a",
         "160k",
-        "-shortest",
+        "-t",
+        durationSec.toFixed(3),
         "-movflags",
         "+faststart",
         mixedPath,
@@ -302,6 +407,7 @@ export async function sweepOrphanedAudio(): Promise<number> {
   let removed = 0;
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
+    if (entry.name === SHARED_AUDIO_OWNER) continue;
     if (!/^[0-9a-f]{24}$/.test(entry.name)) continue;
     const exists = await ClipProject.exists({ _id: entry.name });
     if (exists) continue;

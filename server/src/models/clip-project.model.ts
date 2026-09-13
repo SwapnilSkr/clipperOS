@@ -1,5 +1,5 @@
 import { Schema, model, type Document, type Types } from "mongoose";
-import type { CaptionCue, VttWordTiming } from "../types/clip.types";
+import type { CaptionCue, ProjectOutro, VttWordTiming } from "../types/clip.types";
 
 /** Where the source media came from. */
 export type ClipProjectSourceType = "youtube" | "upload";
@@ -81,6 +81,12 @@ export interface IClipProject extends Document {
   /** True when no genre was supplied and detection inferred it. */
   genreAutoDetected?: boolean;
 
+  /** Legacy single sting. Prefer the shared vault. Still read on first import. */
+  outro?: ProjectOutro;
+  /** Legacy per-project copies. Prefer the shared vault. */
+  outros?: ProjectOutro[];
+  defaultOutroId?: string;
+
   /** Wall-clock timings for the latency dashboard. */
   timings?: {
     ingestMs?: number;
@@ -155,6 +161,157 @@ const clipProjectSchema = new Schema<IClipProject>(
 
     genreId: { type: String, required: true, default: "motivation", index: true },
     genreAutoDetected: { type: Boolean },
+
+    outro: {
+      type: new Schema(
+        {
+          id: { type: String, trim: true, maxlength: 24 },
+          name: { type: String, trim: true, maxlength: 40 },
+          ready: { type: Boolean, default: false },
+          logoName: { type: String, trim: true, maxlength: 80 },
+          palette: {
+            type: new Schema(
+              {
+                bg: { type: String, trim: true },
+                ink: { type: String, trim: true },
+                accent: { type: String, trim: true },
+                glow: { type: String, trim: true },
+              },
+              { _id: false }
+            ),
+          },
+          templateId: { type: String, enum: ["lockup", "sting", "rise", "card"] },
+          durationSec: { type: Number, min: 1.8, max: 3.2 },
+          cta: { type: String, trim: true, maxlength: 42 },
+          handle: { type: String, trim: true, maxlength: 32 },
+          mark: {
+            type: new Schema(
+              {
+                sizeScale: { type: Number, min: 0.35, max: 1.8 },
+                x: { type: Number, min: 0, max: 1 },
+                y: { type: Number, min: 0, max: 1 },
+                circle: { type: Boolean },
+              },
+              { _id: false }
+            ),
+          },
+          ctaStyle: {
+            type: new Schema(
+              {
+                fontFamily: { type: String, trim: true, maxlength: 60 },
+                sizeScale: { type: Number, min: 0.5, max: 2.5 },
+                textColor: { type: String, trim: true },
+                uppercase: { type: Boolean },
+                spacing: { type: Number, min: 0, max: 16 },
+                animation: { type: String, enum: ["none", "pop", "fade"] },
+                x: { type: Number, min: 0, max: 1 },
+                y: { type: Number, min: 0, max: 1 },
+              },
+              { _id: false }
+            ),
+          },
+          handleStyle: {
+            type: new Schema(
+              {
+                fontFamily: { type: String, trim: true, maxlength: 60 },
+                sizeScale: { type: Number, min: 0.5, max: 2.5 },
+                textColor: { type: String, trim: true },
+                uppercase: { type: Boolean },
+                spacing: { type: Number, min: 0, max: 16 },
+                animation: { type: String, enum: ["none", "pop", "fade"] },
+                x: { type: Number, min: 0, max: 1 },
+                y: { type: Number, min: 0, max: 1 },
+              },
+              { _id: false }
+            ),
+          },
+          sfxAssetId: { type: String, trim: true, maxlength: 80 },
+          musicAssetId: { type: String, trim: true, maxlength: 80 },
+          sfxGain: { type: Number, min: 0, max: 1.5 },
+          musicGain: { type: Number, min: 0, max: 1.5 },
+          previewBytes: { type: Number, min: 0 },
+          updatedAt: { type: String, trim: true },
+        },
+        { _id: false }
+      ),
+    },
+    outros: {
+      type: [
+        new Schema(
+          {
+            id: { type: String, trim: true, maxlength: 24 },
+            name: { type: String, trim: true, maxlength: 40 },
+            ready: { type: Boolean, default: false },
+            logoName: { type: String, trim: true, maxlength: 80 },
+            palette: {
+              type: new Schema(
+                {
+                  bg: { type: String, trim: true },
+                  ink: { type: String, trim: true },
+                  accent: { type: String, trim: true },
+                  glow: { type: String, trim: true },
+                },
+                { _id: false }
+              ),
+            },
+            templateId: { type: String, enum: ["lockup", "sting", "rise", "card"] },
+            durationSec: { type: Number, min: 1.8, max: 3.2 },
+            cta: { type: String, trim: true, maxlength: 42 },
+            handle: { type: String, trim: true, maxlength: 32 },
+            mark: {
+              type: new Schema(
+                {
+                  sizeScale: { type: Number, min: 0.35, max: 1.8 },
+                  x: { type: Number, min: 0, max: 1 },
+                  y: { type: Number, min: 0, max: 1 },
+                  circle: { type: Boolean },
+                },
+                { _id: false }
+              ),
+            },
+            ctaStyle: {
+              type: new Schema(
+                {
+                  fontFamily: { type: String, trim: true, maxlength: 60 },
+                  sizeScale: { type: Number, min: 0.5, max: 2.5 },
+                  textColor: { type: String, trim: true },
+                  uppercase: { type: Boolean },
+                  spacing: { type: Number, min: 0, max: 16 },
+                  animation: { type: String, enum: ["none", "pop", "fade"] },
+                  x: { type: Number, min: 0, max: 1 },
+                  y: { type: Number, min: 0, max: 1 },
+                },
+                { _id: false }
+              ),
+            },
+            handleStyle: {
+              type: new Schema(
+                {
+                  fontFamily: { type: String, trim: true, maxlength: 60 },
+                  sizeScale: { type: Number, min: 0.5, max: 2.5 },
+                  textColor: { type: String, trim: true },
+                  uppercase: { type: Boolean },
+                  spacing: { type: Number, min: 0, max: 16 },
+                  animation: { type: String, enum: ["none", "pop", "fade"] },
+                  x: { type: Number, min: 0, max: 1 },
+                  y: { type: Number, min: 0, max: 1 },
+                },
+                { _id: false }
+              ),
+            },
+            sfxAssetId: { type: String, trim: true, maxlength: 80 },
+            musicAssetId: { type: String, trim: true, maxlength: 80 },
+            sfxGain: { type: Number, min: 0, max: 1.5 },
+            musicGain: { type: Number, min: 0, max: 1.5 },
+            previewBytes: { type: Number, min: 0 },
+            updatedAt: { type: String, trim: true },
+          },
+          { _id: false }
+        ),
+      ],
+      default: undefined,
+    },
+    defaultOutroId: { type: String, trim: true, maxlength: 24 },
 
     timings: {
       ingestMs: { type: Number },

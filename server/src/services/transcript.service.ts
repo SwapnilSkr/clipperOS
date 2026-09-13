@@ -120,6 +120,35 @@ export function parseVttWordTimings(content: string): VttWordTiming[] {
 }
 
 /**
+ * YouTube / ASR sometimes puts a whole phrase in one onset (`"so I've always"`).
+ * Words-per-caption is a count of tokens, so those have to be split or 1-word
+ * mode still shows three words and edits keyed to the old phrase start miss.
+ */
+export function expandWordTimings(words: VttWordTiming[]): VttWordTiming[] {
+  const sorted = words
+    .filter((item) => item && Number.isFinite(item.t) && item.word?.trim())
+    .sort((a, b) => a.t - b.t);
+  const out: VttWordTiming[] = [];
+  for (let i = 0; i < sorted.length; i++) {
+    const tokens = sorted[i]!.word.trim().split(/\s+/).filter(Boolean);
+    if (tokens.length <= 1) {
+      out.push({ t: sorted[i]!.t, word: tokens[0] ?? sorted[i]!.word });
+      continue;
+    }
+    const nextT = sorted[i + 1]?.t;
+    const span =
+      nextT != null && nextT > sorted[i]!.t + 0.04
+        ? nextT - sorted[i]!.t
+        : Math.max(0.14 * tokens.length, 0.28);
+    const step = span / tokens.length;
+    for (let k = 0; k < tokens.length; k++) {
+      out.push({ t: Math.round((sorted[i]!.t + step * k) * 1000) / 1000, word: tokens[k]! });
+    }
+  }
+  return out;
+}
+
+/**
  * Derive word timings when the transcript carries no inline tags but IS
  * word-granular — which is exactly what the Whisper fallback emits (one cue per
  * word, `-ml 1 -sow`). Returns [] when cues are sentence-sized, so the caller
@@ -143,10 +172,10 @@ export function deriveWordTimingsFromCues(cues: CaptionCue[]): VttWordTiming[] {
  */
 export function resolveWordTimings(vtt: string | undefined, cues: CaptionCue[]): VttWordTiming[] {
   if (vtt) {
-    const tagged = parseVttWordTimings(vtt);
+    const tagged = expandWordTimings(parseVttWordTimings(vtt));
     if (tagged.length >= 3) return tagged;
   }
-  const derived = deriveWordTimingsFromCues(cues);
+  const derived = expandWordTimings(deriveWordTimingsFromCues(cues));
   if (derived.length >= 3) return derived;
   return [];
 }
