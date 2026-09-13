@@ -361,15 +361,10 @@ export function Studio() {
     }
   }
 
-  async function handleRender(ids: string[]) {
-    if (ids.length === 0) return;
-    setError(null);
-    try {
-      await api.renderClips(ids, reframeMode, captions);
-      setSelectedClipIds(new Set());
-    } catch (err) {
-      setError(messageOf(err));
-    }
+  function openMixFor(ids: string[]) {
+    if (!selectedId || ids.length === 0) return;
+    setSelectedClipIds(new Set());
+    navigate(routes.clipMix(selectedId, ids[0]!));
   }
 
   // ---- clip editing -------------------------------------------------------
@@ -868,8 +863,8 @@ export function Studio() {
                         : new Set(visibleClips.map((c) => c.id))
                     )
                   }
-                  onRenderSelected={() => void handleRender([...selectedClipIds])}
-                  onRenderOne={(id) => void handleRender([id])}
+                  onRenderSelected={() => openMixFor([...selectedClipIds])}
+                  onRenderOne={(id) => openMixFor([id])}
                   onEdit={(id) =>
                     selectedId ? navigate(routes.clip(selectedId, id)) : undefined
                   }
@@ -902,7 +897,7 @@ export function Studio() {
           <div className="safe-b sticky bottom-0 z-10 border-t border-border bg-panel/95 px-3 pt-3 backdrop-blur lg:hidden">
             <button
               type="button"
-              onClick={() => void handleRender([...selectedClipIds])}
+              onClick={() => openMixFor([...selectedClipIds])}
               className="press text-ui inline-flex h-12 w-full items-center justify-center gap-2 rounded-lg bg-accent font-semibold text-accent-fg hover:opacity-90"
             >
               <Sparkles className="size-4" aria-hidden="true" />

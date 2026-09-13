@@ -14,7 +14,9 @@
     "validate:mining": "bun run scripts/validate-mining.ts",
     "reframe:validate": "bun run scripts/validate-reframe.ts",
     "captions:validate": "bun run scripts/validate-captions.ts",
-    "video-effects:validate": "bun run scripts/validate-video-effects.ts"
+    "video-effects:validate": "bun run scripts/validate-video-effects.ts",
+    "soundtrack:validate": "bun run scripts/validate-soundtrack.ts",
+    "audio:generate": "bun run scripts/generate-audio-library.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.958.0",

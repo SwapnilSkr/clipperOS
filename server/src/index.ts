@@ -4,7 +4,7 @@ import { cors } from "@elysiajs/cors";
 import "./config/ffmpeg-bootstrap";
 import { config, validateConfig } from "./config";
 import { connectDatabase } from "./db";
-import { captionStyleRoutes, clipRoutes, genreRoutes, projectRoutes, uploadRoutes } from "./routes";
+import { captionStyleRoutes, clipRoutes, genreRoutes, projectRoutes, uploadRoutes, audioLibraryRoutes } from "./routes";
 import { assertRedisReady } from "./queue/queues";
 import { startWorkers } from "./queue/workers";
 import {
@@ -13,6 +13,7 @@ import {
   sweepOrphanedOutputs,
   sweepUnownedLocalOutputs,
 } from "./services/storage-custody.service";
+import { sweepOrphanedAudio } from "./services/soundtrack.service";
 import { initializeStorage, sweepProcessingDir } from "./utils";
 import { getErrorMessage } from "./types";
 
@@ -34,6 +35,7 @@ function runCustodySweep(label: string): void {
     // Source caches are the biggest thing on disk, and a killed download leaves
     // fragments plus a status stuck on "fetching".
     sweepMediaFragments(),
+    sweepOrphanedAudio(),
   ]).catch((error: unknown) => {
     console.error(`⚠️  Storage sweep (${label}) failed: ${getErrorMessage(error)}`);
   });
@@ -122,6 +124,7 @@ const app = new Elysia({
       genres: "GET /api/genres",
       captionStyles: "GET /api/caption-styles",
       captionFonts: "GET /api/caption-styles/fonts",
+      audioLibrary: "GET /api/audio-library",
       render: "POST /api/clips/render",
       merge: "POST /api/clips/merge",
       clip: "GET /api/clips/:id",
@@ -138,7 +141,8 @@ const app = new Elysia({
   .use(clipRoutes)
   .use(uploadRoutes)
   .use(genreRoutes)
-  .use(captionStyleRoutes);
+  .use(captionStyleRoutes)
+  .use(audioLibraryRoutes);
 
 // Nothing in this process listens for a rejected promise, so a stray one from a
 // background worker surfaces only as a default warning from the runtime, if at

@@ -8,6 +8,8 @@ import type {
   CleanupRegion,
   ClipEdit,
   ClipSegment,
+  Soundtrack,
+  SoundtrackHit,
   VideoEffects,
   VttWordTiming,
 } from "../types/clip.types";
@@ -84,6 +86,12 @@ function toPlainEdit(edit: IClip["edit"] | null | undefined): ClipEdit {
     if (Object.keys(clean).length > 0) out.videoEffects = clean;
   }
 
+  const soundtrack = source.soundtrack as Record<string, unknown> | null | undefined;
+  if (soundtrack && typeof soundtrack === "object") {
+    const clean = plainSoundtrack(soundtrack);
+    if (!isEmptySoundtrack(clean)) out.soundtrack = clean;
+  }
+
   const captionTextOverrides = source.captionTextOverrides;
   if (Array.isArray(captionTextOverrides) && captionTextOverrides.length > 0) {
     out.captionTextOverrides = captionTextOverrides.map((item) => ({
@@ -123,6 +131,7 @@ function toPlainEdit(edit: IClip["edit"] | null | undefined): ClipEdit {
       clean.animation = overrides.animation;
     }
     if (typeof overrides.peakColor === "string") clean.peakColor = overrides.peakColor;
+    if (overrides.peakEmphasis !== undefined) clean.peakEmphasis = Boolean(overrides.peakEmphasis);
     if (typeof overrides.fontFamily === "string") clean.fontFamily = resolveCaptionFont(overrides.fontFamily);
     if (overrides.uppercase !== undefined) clean.uppercase = Boolean(overrides.uppercase);
     if (Object.keys(clean).length > 0) out.captionOverrides = clean;
@@ -181,6 +190,9 @@ export async function updateClipEdit(clipId: string, input: UpdateClipInput): Pr
     }
     if (edit.videoEffects !== undefined && Object.keys(edit.videoEffects).length === 0) {
       delete next.videoEffects;
+    }
+    if (edit.soundtrack !== undefined && isEmptySoundtrack(edit.soundtrack)) {
+      delete next.soundtrack;
     }
     assertWindowValid(clip, next);
     if (Object.keys(next).length > 0) $set.edit = next;
@@ -242,6 +254,7 @@ function sanitizeEdit(raw: ClipEdit): ClipEdit {
     edit.editTemplateId = raw.editTemplateId.trim().slice(0, 40);
   }
   if (raw.videoEffects !== undefined) edit.videoEffects = sanitizeVideoEffects(raw.videoEffects);
+  if (raw.soundtrack !== undefined) edit.soundtrack = sanitizeSoundtrack(raw.soundtrack);
   if (raw.cleanup !== undefined) {
     edit.cleanup = sanitizeCleanup(raw.cleanup);
   }
@@ -269,6 +282,82 @@ function sanitizeVideoEffects(raw: VideoEffects): VideoEffects {
     out.audio = raw.audio;
   }
   return out;
+}
+
+function isEmptySoundtrack(track: Soundtrack): boolean {
+  return (
+    (track.voiceGain === undefined || Math.abs(track.voiceGain - 1) < 0.001) &&
+    !track.music?.assetId &&
+    !(track.sfx && track.sfx.length > 0)
+  );
+}
+
+function plainSoundtrack(source: Record<string, unknown>): Soundtrack {
+  const out: Soundtrack = {};
+  if (source.voiceGain !== undefined) out.voiceGain = Number(source.voiceGain);
+  const music = source.music as Record<string, unknown> | null | undefined;
+  if (music && typeof music === "object" && typeof music.assetId === "string" && music.assetId.trim()) {
+    out.music = {
+      assetId: music.assetId,
+      ...(music.gain !== undefined ? { gain: Number(music.gain) } : {}),
+      ...(music.duck !== undefined ? { duck: Boolean(music.duck) } : {}),
+    };
+  }
+  if (Array.isArray(source.sfx) && source.sfx.length > 0) {
+    out.sfx = source.sfx.map((item) => {
+      const hit = item as Record<string, unknown>;
+      return {
+        id: String(hit.id ?? ""),
+        assetId: String(hit.assetId ?? ""),
+        atSec: Number(hit.atSec ?? 0),
+        ...(hit.gain !== undefined ? { gain: Number(hit.gain) } : {}),
+      };
+    });
+  }
+  return out;
+}
+
+function sanitizeSoundtrack(raw: Soundtrack): Soundtrack {
+  if (typeof raw !== "object" || raw === null) throw new Error("Invalid soundtrack");
+  const out: Soundtrack = {};
+  if (raw.voiceGain !== undefined) out.voiceGain = clampNumber(raw.voiceGain, 0, 1.5);
+  if (raw.music !== undefined) {
+    if (raw.music === null || typeof raw.music !== "object") throw new Error("Invalid music bed");
+    const assetId = typeof raw.music.assetId === "string" ? raw.music.assetId.trim() : "";
+    if (assetId) {
+      out.music = {
+        assetId: sanitizeAssetId(assetId),
+        ...(raw.music.gain !== undefined ? { gain: clampNumber(raw.music.gain, 0, 1.5) } : {}),
+        ...(raw.music.duck !== undefined ? { duck: Boolean(raw.music.duck) } : {}),
+      };
+    }
+  }
+  if (raw.sfx !== undefined) {
+    if (!Array.isArray(raw.sfx)) throw new Error("sfx must be an array");
+    if (raw.sfx.length > 16) throw new Error("At most 16 sound effects per clip");
+    out.sfx = raw.sfx.map(sanitizeHit);
+  }
+  return out;
+}
+
+function sanitizeHit(raw: SoundtrackHit): SoundtrackHit {
+  if (typeof raw !== "object" || raw === null) throw new Error("Invalid sound effect");
+  const id = typeof raw.id === "string" ? raw.id.trim().slice(0, 80) : "";
+  if (!id) throw new Error("Each sound effect needs an id");
+  return {
+    id,
+    assetId: sanitizeAssetId(raw.assetId),
+    atSec: clampNumber(raw.atSec, 0, 24 * 3600),
+    ...(raw.gain !== undefined ? { gain: clampNumber(raw.gain, 0, 1.5) } : {}),
+  };
+}
+
+function sanitizeAssetId(raw: unknown): string {
+  if (typeof raw !== "string") throw new Error("Unknown audio file");
+  const id = raw.trim();
+  if (/^[a-z][a-z0-9_]{0,31}$/.test(id)) return id;
+  if (/^custom:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id)) return id;
+  throw new Error("Unknown audio file");
 }
 
 function sanitizeCleanup(raw: CleanupRegion[]): CleanupRegion[] {
@@ -325,6 +414,7 @@ function sanitizeOverrides(raw: CaptionOverrides): CaptionOverrides {
     }
     out.peakColor = raw.peakColor.trim().toLowerCase();
   }
+  if (raw.peakEmphasis !== undefined) out.peakEmphasis = Boolean(raw.peakEmphasis);
   if (raw.fontFamily !== undefined) {
     if (typeof raw.fontFamily !== "string") throw new Error("fontFamily must be a string");
     out.fontFamily = resolveCaptionFont(raw.fontFamily);

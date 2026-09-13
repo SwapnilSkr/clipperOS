@@ -9,6 +9,8 @@ export const routes = {
   root: "/",
   project: (projectId: string) => `/projects/${projectId}`,
   clip: (projectId: string, clipId: string) => `/projects/${projectId}/clips/${clipId}`,
+  /** Picture is already cut; this desk is music / SFX before export. */
+  clipMix: (projectId: string, clipId: string) => `/projects/${projectId}/clips/${clipId}?desk=mix`,
   /** The board a clip belongs to — where Back goes. */
   clipParent: (projectId: string) => `/projects/${projectId}`,
 } as const;

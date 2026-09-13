@@ -386,6 +386,24 @@ export function serializeClip(doc: IClip): ClipPayload {
                 audio: doc.edit.videoEffects.audio,
               }
             : undefined,
+          soundtrack: doc.edit.soundtrack
+            ? {
+                voiceGain: doc.edit.soundtrack.voiceGain,
+                music: doc.edit.soundtrack.music
+                  ? {
+                      assetId: doc.edit.soundtrack.music.assetId,
+                      gain: doc.edit.soundtrack.music.gain,
+                      duck: doc.edit.soundtrack.music.duck,
+                    }
+                  : undefined,
+                sfx: doc.edit.soundtrack.sfx?.map((hit) => ({
+                  id: hit.id,
+                  assetId: hit.assetId,
+                  atSec: hit.atSec,
+                  gain: hit.gain,
+                })),
+              }
+            : undefined,
           captionOverrides: doc.edit.captionOverrides
             ? {
                 chunkWords: doc.edit.captionOverrides.chunkWords,
@@ -396,6 +414,7 @@ export function serializeClip(doc: IClip): ClipPayload {
                 background: doc.edit.captionOverrides.background,
                 animation: doc.edit.captionOverrides.animation,
                 peakColor: doc.edit.captionOverrides.peakColor,
+                peakEmphasis: doc.edit.captionOverrides.peakEmphasis,
                 fontFamily: doc.edit.captionOverrides.fontFamily,
                 uppercase: doc.edit.captionOverrides.uppercase,
               }

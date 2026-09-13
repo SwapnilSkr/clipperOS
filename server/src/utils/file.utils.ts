@@ -87,6 +87,7 @@ export async function initializeStorage(): Promise<void> {
     ensureDir(config.uploadsPath),
     ensureDir(config.outputPath),
     ensureDir(config.mediaPath),
+    ensureDir(config.audioPath),
   ]);
 }
 
@@ -98,4 +99,9 @@ export function projectOutputDir(projectId: string): string {
 /** Directory that holds fetched source media for one project. */
 export function projectMediaDir(projectId: string): string {
   return join(config.mediaPath, projectId);
+}
+
+/** Directory that holds user-uploaded music and SFX for one project. */
+export function projectAudioDir(projectId: string): string {
+  return join(config.audioPath, projectId);
 }

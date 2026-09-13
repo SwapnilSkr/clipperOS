@@ -72,6 +72,7 @@ const CaptionOverridesBody = t.Object({
   background: t.Optional(t.Union([t.Literal("none"), t.Literal("box")])),
   animation: t.Optional(t.Union([t.Literal("none"), t.Literal("pop"), t.Literal("fade")])),
   peakColor: t.Optional(t.String({ maxLength: 9 })),
+  peakEmphasis: t.Optional(t.Boolean()),
   fontFamily: t.Optional(t.String({ maxLength: 60 })),
   uppercase: t.Optional(t.Boolean()),
 });
@@ -100,6 +101,35 @@ const VideoEffectsBody = t.Object({
   audio: t.Optional(t.Union([t.Literal("natural"), t.Literal("voice"), t.Literal("loud")])),
 });
 
+const SoundtrackHitBody = t.Object({
+  id: t.String({ minLength: 1, maxLength: 80 }),
+  assetId: t.String({ minLength: 1, maxLength: 80 }),
+  atSec: t.Number(),
+  gain: t.Optional(t.Number()),
+});
+
+const SoundtrackBody = t.Object({
+  voiceGain: t.Optional(t.Number()),
+  music: t.Optional(
+    t.Object({
+      assetId: t.Optional(t.String({ maxLength: 80 })),
+      gain: t.Optional(t.Number()),
+      duck: t.Optional(t.Boolean()),
+    })
+  ),
+  sfx: t.Optional(t.Array(SoundtrackHitBody, { maxItems: 16 })),
+});
+
+const CleanupRegionBody = t.Object({
+  id: t.String({ maxLength: 80 }),
+  x: t.Number(),
+  y: t.Number(),
+  w: t.Number(),
+  h: t.Number(),
+  start: t.Number(),
+  end: t.Number(),
+});
+
 const ClipEditBody = t.Object({
   trimStartSec: t.Optional(t.Number()),
   trimEndSec: t.Optional(t.Number()),
@@ -110,6 +140,23 @@ const ClipEditBody = t.Object({
   captionTextOverrides: t.Optional(t.Array(CaptionTextOverrideBody, { maxItems: 240 })),
   editTemplateId: t.Optional(t.String({ maxLength: 40 })),
   videoEffects: t.Optional(VideoEffectsBody),
+  soundtrack: t.Optional(SoundtrackBody),
+  cleanup: t.Optional(t.Array(CleanupRegionBody, { maxItems: 8 })),
+});
+
+export const AudioLibraryQuery = t.Object({
+  projectId: t.Optional(t.String({ pattern: OBJECT_ID_PATTERN })),
+});
+
+export const BuiltinAudioParams = t.Object({
+  id: t.String({ minLength: 1, maxLength: 40, pattern: "^[a-z][a-z0-9_]{0,31}$" }),
+});
+
+export const ProjectAudioParams = t.Object({
+  id: t.String({ pattern: OBJECT_ID_PATTERN }),
+  fileId: t.String({
+    pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+  }),
 });
 
 const ClipSegmentBody = t.Object({

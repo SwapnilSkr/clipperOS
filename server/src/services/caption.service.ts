@@ -56,14 +56,15 @@ export function buildTimelineCaptions(
   peakLine?: string,
   peakSec?: number,
   chunkSize = DEFAULT_CHUNK_SIZE,
-  textOverrides: CaptionTextOverride[] = []
+  textOverrides: CaptionTextOverride[] = [],
+  peakEmphasis = true
 ): TimelineCaption[] {
   const inClip = wordTimings
     .map((w) => ({ t: w.t - clipStartSec, word: w.word }))
     // Only words actually inside the clip. A negative tolerance here pulled the
     // previous word into the first caption.
     .filter((w) => w.t >= -0.05 && w.t <= duration);
-  const peakWindow = resolvePeakWindow(inClip, duration, peakLine, peakSec);
+  const peakWindow = peakEmphasis ? resolvePeakWindow(inClip, duration, peakLine, peakSec) : null;
   const overrideByStart = new Map(
     textOverrides
       .filter((item) => !item.custom)

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useSearchParams } from "react-router-dom";
 import {
   ArrowLeft,
   ArrowRight,
@@ -6,6 +7,7 @@ import {
   Eraser,
   Loader2,
   Merge,
+  Music,
   Pause,
   Play,
   Plus,
@@ -32,11 +34,13 @@ import {
   type ClipSegment,
   type ProjectSummary,
   type ReframeTrack,
+  type Soundtrack,
   type VideoEffects,
 } from "@/api";
 import { CaptionOverlay } from "./CaptionOverlay";
 import { CleanupLayer } from "./CleanupLayer";
 import { CutCheckPanel } from "./CutCheckPanel";
+import { MixPanel, MixTimeline, soundtrackPayload } from "./MixPanel";
 import {
   buildTimelineCaptions,
   captionAt,
@@ -111,6 +115,11 @@ export function ClipEditor({
   onBack,
 }: ClipEditorProps) {
   const isMerge = clip.kind === "merge";
+  const [searchParams, setSearchParams] = useSearchParams();
+  const desk = searchParams.get("desk") === "mix" ? "mix" : "cut";
+  function setDesk(next: "cut" | "mix") {
+    setSearchParams(next === "mix" ? { desk: "mix" } : {}, { replace: true });
+  }
 
   // ---- draft state (seeded once; App keys this component by clip id) ----
   const [title, setTitle] = useState(clip.title ?? "");
@@ -122,6 +131,7 @@ export function ClipEditor({
   );
   const [editTemplateId, setEditTemplateId] = useState(clip.edit?.editTemplateId ?? "custom");
   const [videoEffects, setVideoEffects] = useState<VideoEffects>(clip.edit?.videoEffects ?? {});
+  const [soundtrack, setSoundtrack] = useState<Soundtrack>(clip.edit?.soundtrack ?? {});
   const [reframeMode, setReframeMode] = useState<"center" | "smart">(
     clip.edit?.reframeMode ?? "smart"
   );
@@ -214,9 +224,20 @@ export function ClipEditor({
       clip.peakLine,
       clip.peakSec,
       style.chunkWords,
-      captionTextOverrides
+      captionTextOverrides,
+      overrides.peakEmphasis !== false
     );
-  }, [words, captionsOn, active.startSec, active.endSec, style.chunkWords, clip.peakLine, clip.peakSec, captionTextOverrides]);
+  }, [
+    words,
+    captionsOn,
+    active.startSec,
+    active.endSec,
+    style.chunkWords,
+    clip.peakLine,
+    clip.peakSec,
+    captionTextOverrides,
+    overrides.peakEmphasis,
+  ]);
 
   const activeCaption = mode === "source" ? captionAt(captions, time - active.startSec) : null;
   const removedCaptionSections = captionTextOverrides.filter((item) => item.hidden);
@@ -389,6 +410,7 @@ export function ClipEditor({
       captionTextOverrides,
       editTemplateId,
       videoEffects,
+      soundtrack,
     });
   }
   const [saved, setSaved] = useState(snapshot);
@@ -405,6 +427,7 @@ export function ClipEditor({
       captionTextOverrides,
       editTemplateId,
       videoEffects,
+      soundtrack: soundtrackPayload(soundtrack),
       // Same rule: an empty array is an explicit reset of the cleanup regions.
       cleanup,
     };
@@ -446,6 +469,20 @@ export function ClipEditor({
       // onRender persists the spec first, then queues the encode.
       await onRender(buildDraft());
       setSaved(snapshot());
+    } catch (error: unknown) {
+      setActionError(messageOf(error));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function openMixDesk(): Promise<void> {
+    setBusy("save");
+    setActionError(null);
+    try {
+      await onSave(buildDraft());
+      setSaved(snapshot());
+      setDesk("mix");
     } catch (error: unknown) {
       setActionError(messageOf(error));
     } finally {
@@ -500,9 +537,27 @@ export function ClipEditor({
   // This is a page, not a dialog, so there is no focus trap and no inert
   // background. The listener is bound once and reads handlers through a ref, so
   // it never closes over a stale draft.
-  const actionsRef = useRef({ saveNow, renderNow, onBack, markIn, markOut, undoTrimAction, redoTrimAction });
+  const actionsRef = useRef({
+    saveNow,
+    renderNow,
+    onBack,
+    markIn,
+    markOut,
+    undoTrimAction,
+    redoTrimAction,
+    desk,
+  });
   useEffect(() => {
-    actionsRef.current = { saveNow, renderNow, onBack, markIn, markOut, undoTrimAction, redoTrimAction };
+    actionsRef.current = {
+      saveNow,
+      renderNow,
+      onBack,
+      markIn,
+      markOut,
+      undoTrimAction,
+      redoTrimAction,
+      desk,
+    };
   });
 
   useEffect(() => {
@@ -520,6 +575,7 @@ export function ClipEditor({
         return;
       }
       if (typing) return;
+      if (actions.desk === "mix") return;
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "z") {
         event.preventDefault();
         if (event.shiftKey) actions.redoTrimAction();
@@ -851,6 +907,33 @@ export function ClipEditor({
           <span className="text-micro hidden shrink-0 text-muted sm:inline">
             {isMerge ? `merge · ${segments.length} parts` : `#${clip.rank}`}
           </span>
+          <div className="flex shrink-0 rounded-lg border border-border p-0.5">
+            <button
+              type="button"
+              aria-pressed={desk === "cut"}
+              onClick={() => setDesk("cut")}
+              className={cn(
+                "press text-ui h-9 rounded-md px-3 font-medium sm:h-7",
+                desk === "cut" ? "bg-panel-2 text-fg" : "text-muted hover:text-fg"
+              )}
+            >
+              Edit
+            </button>
+            <button
+              type="button"
+              aria-pressed={desk === "mix"}
+              onClick={() => {
+                if (desk === "mix") return;
+                void openMixDesk();
+              }}
+              className={cn(
+                "press text-ui h-9 rounded-md px-3 font-medium sm:h-7",
+                desk === "mix" ? "bg-panel-2 text-fg" : "text-muted hover:text-fg"
+              )}
+            >
+              Sound
+            </button>
+          </div>
         </div>
       </header>
 
@@ -987,7 +1070,7 @@ export function ClipEditor({
                 }
               />
             ) : null}
-            {showCleanup && frameWidth > 0 ? (
+            {showCleanup && desk === "cut" && frameWidth > 0 ? (
               <CleanupLayer
                 regions={cleanup}
                 transform={transform}
@@ -1110,6 +1193,8 @@ export function ClipEditor({
                 <ArrowRight className="size-4" aria-hidden="true" />
               </button>
             ) : null}
+            {desk === "cut" ? (
+              <>
             <button
               type="button"
               onClick={markIn}
@@ -1124,8 +1209,11 @@ export function ClipEditor({
             >
               Mark out
             </button>
+              </>
+            ) : null}
           </div>
 
+          {desk === "cut" ? (
           <div className="grid w-full max-w-[340px] grid-cols-2 gap-2">
             <button
               type="button"
@@ -1148,6 +1236,7 @@ export function ClipEditor({
               {trimFuture.length > 0 ? `Redo ${trimFuture[trimFuture.length - 1]?.label}` : "Redo mark"}
             </button>
           </div>
+          ) : null}
 
           <p className="num text-meta text-muted">
             source {timecode(time)} · window {timecode(active.startSec)}–
@@ -1166,6 +1255,14 @@ export function ClipEditor({
             aria-label="Playhead"
             className="accent-accent h-8 w-full"
           />
+          {desk === "mix" ? (
+            <MixTimeline
+              soundtrack={soundtrack}
+              localTime={localPreviewTime}
+              durationSec={Math.max(0.1, active.endSec - active.startSec)}
+              onSeekLocal={(sec) => seekTo(active.startSec + sec)}
+            />
+          ) : null}
 
           {wordsError ? (
             <p className="text-meta text-warn">
@@ -1218,6 +1315,19 @@ export function ClipEditor({
             ) : null}
           </Panel>
 
+          {desk === "mix" ? (
+            <MixPanel
+              projectId={project.id}
+              soundtrack={soundtrack}
+              onChange={setSoundtrack}
+              localTime={localPreviewTime}
+              durationSec={Math.max(0.1, active.endSec - active.startSec)}
+              playing={playing}
+              live={mode === "source"}
+              videoRef={videoRef}
+            />
+          ) : (
+            <>
           {/* window */}
           <Panel title={isMerge ? "Segments" : "Trim"} icon={Scissors}>
             {isMerge ? (
@@ -1411,6 +1521,20 @@ export function ClipEditor({
               />
             </div>
 
+            <p className="eyebrow mt-3 text-muted">Peak line</p>
+            <div className="mt-1 flex gap-2">
+              <SegmentedButton
+                active={overrides.peakEmphasis !== false}
+                onClick={() => setOverrides((prev) => ({ ...prev, peakEmphasis: true }))}
+                label="Highlight"
+              />
+              <SegmentedButton
+                active={overrides.peakEmphasis === false}
+                onClick={() => setOverrides((prev) => ({ ...prev, peakEmphasis: false }))}
+                label="Match others"
+              />
+            </div>
+
             <label className="mt-3 block">
               <span className="eyebrow text-muted">Caption style</span>
               <select
@@ -1421,7 +1545,10 @@ export function ClipEditor({
                   setEditTemplateId("custom");
                   // A preset is a complete look, so picking one clears the
                   // per-caption tweaks rather than mixing two caption designs.
-                  setOverrides({});
+                  // Peak highlight is independent of the look, so it is kept.
+                  setOverrides((prev) =>
+                    prev.peakEmphasis === false ? { peakEmphasis: false } : {}
+                  );
                 }}
                 className="text-ui mt-1 h-11 w-full rounded-lg border border-control bg-panel-2 px-2 outline-none focus:border-accent"
               >
@@ -1525,11 +1652,13 @@ export function ClipEditor({
                     value={style.textColor}
                     onChange={(textColor) => setOverrides((prev) => ({ ...prev, textColor }))}
                   />
-                  <ColorControl
-                    label="Peak"
-                    value={style.peakColor}
-                    onChange={(peakColor) => setOverrides((prev) => ({ ...prev, peakColor }))}
-                  />
+                  {overrides.peakEmphasis !== false ? (
+                    <ColorControl
+                      label="Peak"
+                      value={style.peakColor}
+                      onChange={(peakColor) => setOverrides((prev) => ({ ...prev, peakColor }))}
+                    />
+                  ) : null}
                   <label className="flex items-center gap-2">
                     <input
                       type="checkbox"
@@ -1569,7 +1698,11 @@ export function ClipEditor({
                 </label>
                 <button
                   type="button"
-                  onClick={() => setOverrides({})}
+                  onClick={() =>
+                    setOverrides((prev) =>
+                      prev.peakEmphasis === false ? { peakEmphasis: false } : {}
+                    )
+                  }
                   className="press text-ui mt-3 rounded-lg border border-control px-2 py-1 font-medium text-muted hover:border-accent"
                 >
                   Reset appearance
@@ -1775,6 +1908,8 @@ export function ClipEditor({
               </p>
             ) : null}
           </Panel>
+            </>
+          )}
         </section>
       </div>
 
@@ -1814,6 +1949,18 @@ export function ClipEditor({
           )}
         </span>
 
+        {desk === "mix" ? (
+          <button
+            type="button"
+            disabled={busy !== null || rendering}
+            onClick={() => setDesk("cut")}
+            className="press text-ui inline-flex h-11 items-center gap-1.5 rounded-md border border-border px-3 font-semibold hover:border-control disabled:opacity-50 sm:h-8"
+          >
+            <Scissors className="size-3.5" aria-hidden="true" />
+            Back to edit
+          </button>
+        ) : null}
+
         <button
           type="button"
           disabled={busy !== null || rendering}
@@ -1828,19 +1975,35 @@ export function ClipEditor({
           Save
         </button>
 
-        <button
-          type="button"
-          disabled={busy !== null || rendering}
-          onClick={() => void renderNow()}
-          className="press text-ui inline-flex h-11 items-center gap-1.5 rounded-md bg-accent px-3 font-semibold text-accent-fg hover:opacity-90 disabled:opacity-50 sm:h-8"
-        >
-          {rendering || busy === "render" ? (
-            <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />
-          ) : (
-            <Sparkles className="size-3.5" aria-hidden="true" />
-          )}
-          {rendered ? "Re-render" : "Render"}
-        </button>
+        {desk === "mix" ? (
+          <button
+            type="button"
+            disabled={busy !== null || rendering}
+            onClick={() => void renderNow()}
+            className="press text-ui inline-flex h-11 items-center gap-1.5 rounded-md bg-accent px-3 font-semibold text-accent-fg hover:opacity-90 disabled:opacity-50 sm:h-8"
+          >
+            {rendering || busy === "render" ? (
+              <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />
+            ) : (
+              <Sparkles className="size-3.5" aria-hidden="true" />
+            )}
+            {rendered ? "Export again" : "Export clip"}
+          </button>
+        ) : (
+          <button
+            type="button"
+            disabled={busy !== null || rendering}
+            onClick={() => void openMixDesk()}
+            className="press text-ui inline-flex h-11 items-center gap-1.5 rounded-md bg-accent px-3 font-semibold text-accent-fg hover:opacity-90 disabled:opacity-50 sm:h-8"
+          >
+            {busy === "save" ? (
+              <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />
+            ) : (
+              <Music className="size-3.5" aria-hidden="true" />
+            )}
+            {rendered ? "Mix & export" : "Render"}
+          </button>
+        )}
       </footer>
     </div>
   );

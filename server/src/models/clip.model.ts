@@ -94,6 +94,7 @@ const captionOverridesSchema = new Schema(
     background: { type: String, enum: ["none", "box"] },
     animation: { type: String, enum: ["none", "pop", "fade"] },
     peakColor: { type: String, trim: true },
+    peakEmphasis: { type: Boolean },
     fontFamily: { type: String, trim: true },
     uppercase: { type: Boolean },
   },
@@ -125,6 +126,34 @@ const videoEffectsSchema = new Schema(
   { _id: false }
 );
 
+const soundtrackHitSchema = new Schema(
+  {
+    id: { type: String, required: true, trim: true },
+    assetId: { type: String, required: true, trim: true },
+    atSec: { type: Number, required: true, min: 0 },
+    gain: { type: Number, min: 0, max: 1.5 },
+  },
+  { _id: false }
+);
+
+const soundtrackSchema = new Schema(
+  {
+    voiceGain: { type: Number, min: 0, max: 1.5 },
+    music: {
+      type: new Schema(
+        {
+          assetId: { type: String, trim: true },
+          gain: { type: Number, min: 0, max: 1.5 },
+          duck: { type: Boolean },
+        },
+        { _id: false }
+      ),
+    },
+    sfx: { type: [soundtrackHitSchema], default: undefined },
+  },
+  { _id: false }
+);
+
 const cleanupRegionSchema = new Schema(
   {
     id: { type: String, required: true, trim: true },
@@ -149,6 +178,7 @@ const clipEditSchema = new Schema(
     captionTextOverrides: { type: [captionTextOverrideSchema], default: undefined },
     editTemplateId: { type: String, trim: true, maxlength: 40 },
     videoEffects: { type: videoEffectsSchema },
+    soundtrack: { type: soundtrackSchema },
     // Omitting this here silently drops every region on write — the whole feature
     // no-ops with no error anywhere.
     cleanup: { type: [cleanupRegionSchema], default: undefined },

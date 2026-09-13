@@ -57,6 +57,7 @@ export const config = {
   uploadsPath: absPath(process.env.UPLOADS_PATH, "./storage/uploads"),
   outputPath: absPath(process.env.OUTPUT_PATH, "./storage/output"),
   mediaPath: absPath(process.env.MEDIA_PATH, "./storage/media"),
+  audioPath: absPath(process.env.AUDIO_PATH, "./storage/audio"),
 
   // ---- FFmpeg ----
   ffmpegPath: process.env.FFMPEG_PATH || "ffmpeg",

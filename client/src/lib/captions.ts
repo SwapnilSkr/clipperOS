@@ -67,12 +67,13 @@ export function buildTimelineCaptions(
   peakLine?: string,
   peakSec?: number,
   chunkSize = 3,
-  textOverrides: CaptionTextOverride[] = []
+  textOverrides: CaptionTextOverride[] = [],
+  peakEmphasis = true
 ): PreviewCaption[] {
   const inClip = wordTimings
     .map((w) => ({ t: w.t - clipStartSec, word: w.word }))
     .filter((w) => w.t >= -0.05 && w.t <= duration);
-  const peakWindow = resolvePeakWindow(inClip, duration, peakLine, peakSec);
+  const peakWindow = peakEmphasis ? resolvePeakWindow(inClip, duration, peakLine, peakSec) : null;
   const overrideByStart = new Map(
     textOverrides
       .filter((item) => !item.custom)

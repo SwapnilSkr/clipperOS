@@ -40,6 +40,7 @@ import { resolveReframe } from "./reframe.service";
 import { holdCropUntilCuts } from "./speaker-reframe.service";
 import { cdnUrlFor, deleteKey, isS3Configured, uploadFileAtKey } from "./s3.service";
 import { recomputeProjectStorage } from "./clip.service";
+import { mixSoundtrackOntoClip, soundtrackNeedsMix } from "./soundtrack.service";
 
 // ============================================
 // CLIP RENDER
@@ -230,7 +231,8 @@ async function writeCaptions(
   peakLine: string | undefined,
   peakSec: number,
   style: CaptionStyle,
-  textOverrides: CaptionTextOverride[] = []
+  textOverrides: CaptionTextOverride[] = [],
+  peakEmphasis = true
 ): Promise<string | undefined> {
   const captions = buildTimelineCaptions(
     wordTimingsFor(project),
@@ -239,7 +241,8 @@ async function writeCaptions(
     peakLine,
     peakSec,
     style.chunkWords,
-    textOverrides
+    textOverrides,
+    peakEmphasis
   );
   if (captions.length === 0) return undefined;
 
@@ -373,7 +376,8 @@ export async function renderClip(clipId: string, options: RenderClipOptions = {}
     const meta = await getVideoMetadata(mediaPath);
     await setProgress(clipId, revision, 15);
 
-    const outputPath = join(scratchDir, "out.mp4");
+    const scratchDir = await createScratchDir(`render-${clipId}`);
+    let outputPath = join(scratchDir, "out.mp4");
     const mergeSegments = clip.kind === "merge" ? (clip.segments ?? []) : [];
 
     // Build the source windows this clip renders from: a merge contributes one per
@@ -466,6 +470,18 @@ export async function renderClip(clipId: string, options: RenderClipOptions = {}
     }
 
     await validateArtifact(outputPath, duration);
+
+    if (soundtrackNeedsMix(clip.edit?.soundtrack)) {
+      reportProgress(clipId, revision, 90);
+      outputPath = await mixSoundtrackOntoClip(
+        String(project._id),
+        outputPath,
+        duration,
+        clip.edit?.soundtrack,
+        scratchDir
+      );
+      await validateArtifact(outputPath, duration);
+    }
 
     const delivered = await deliverArtifact(clip, project, outputPath);
 
@@ -953,7 +969,8 @@ async function prepareSegments(input: {
         input.clip.peakLine,
         input.clip.peakSec,
         styleForClip(input.clip, window),
-        input.clip.edit?.captionTextOverrides
+        input.clip.edit?.captionTextOverrides,
+        input.clip.edit?.captionOverrides?.peakEmphasis !== false
       );
     }
 

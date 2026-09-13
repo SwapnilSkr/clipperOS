@@ -161,6 +161,8 @@ export interface CaptionOverrides {
   background?: "none" | "box";
   animation?: "none" | "pop" | "fade";
   peakColor?: string;
+  /** When false, every caption uses the regular style — no larger/coloured peak line. */
+  peakEmphasis?: boolean;
   fontFamily?: string;
   uppercase?: boolean;
 }
@@ -189,6 +191,30 @@ export interface VideoEffects {
   audio?: "natural" | "voice" | "loud";
 }
 
+/** One hit placed on the clip timeline. `atSec` is clip-local (0 = in-point). */
+export interface SoundtrackHit {
+  id: string;
+  assetId: string;
+  atSec: number;
+  gain?: number;
+}
+
+/**
+ * Music bed + hits mixed under the voice. Built-in asset ids are names like
+ * `warm`; uploads are `custom:<uuid>`. Empty / omitted means the source audio
+ * is left alone.
+ */
+export interface Soundtrack {
+  voiceGain?: number;
+  music?: {
+    assetId: string;
+    gain?: number;
+    /** Duck the bed when the voice is present. Default true. */
+    duck?: boolean;
+  };
+  sfx?: SoundtrackHit[];
+}
+
 /**
  * The user's edits to a clip — a full spec, not a diff against a render.
  *
@@ -210,6 +236,7 @@ export interface ClipEdit {
   /** The short-form recipe selected in the editor; effects remain explicit for stable renders. */
   editTemplateId?: string;
   videoEffects?: VideoEffects;
+  soundtrack?: Soundtrack;
   /** Burned-in text / watermark regions to reconstruct away, in source pixels. */
   cleanup?: CleanupRegion[];
 }

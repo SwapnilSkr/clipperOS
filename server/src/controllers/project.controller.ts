@@ -20,6 +20,7 @@ import {
   ensureDir,
   fileExists,
   isContained,
+  projectAudioDir,
   projectMediaDir,
   projectOutputDir,
   serveLocalVideo,
@@ -235,6 +236,7 @@ export async function deleteProject({ params, set }: Ctx) {
     await Promise.all([
       rm(projectMediaDir(String(project._id)), { recursive: true, force: true }).catch(() => undefined),
       rm(projectOutputDir(String(project._id)), { recursive: true, force: true }).catch(() => undefined),
+      rm(projectAudioDir(String(project._id)), { recursive: true, force: true }).catch(() => undefined),
     ]);
     let s3Warning: string | undefined;
     if (project.storage === "s3" && project.s3Prefix) {

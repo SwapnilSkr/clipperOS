@@ -21,6 +21,8 @@ export interface CaptionOverrides {
   background?: "none" | "box";
   animation?: "none" | "pop" | "fade";
   peakColor?: string;
+  /** When false, every caption uses the regular style — no larger/coloured peak line. */
+  peakEmphasis?: boolean;
   fontFamily?: string;
   uppercase?: boolean;
 }
@@ -43,6 +45,30 @@ export interface VideoEffects {
   sharpen?: number;
   vignette?: boolean;
   audio?: "natural" | "voice" | "loud";
+}
+
+export interface SoundtrackHit {
+  id: string;
+  assetId: string;
+  atSec: number;
+  gain?: number;
+}
+
+export interface Soundtrack {
+  voiceGain?: number;
+  music?: {
+    assetId: string;
+    gain?: number;
+    duck?: boolean;
+  };
+  sfx?: SoundtrackHit[];
+}
+
+export interface AudioAsset {
+  id: string;
+  kind: "music" | "sfx";
+  label: string;
+  durationSec: number;
 }
 
 /**
@@ -107,6 +133,7 @@ export interface ClipEdit {
   captionTextOverrides?: CaptionTextOverride[];
   editTemplateId?: string;
   videoEffects?: VideoEffects;
+  soundtrack?: Soundtrack;
   /** Burned-in text / watermark regions to remove. Empty array clears them. */
   cleanup?: CleanupRegion[];
 }
@@ -376,6 +403,21 @@ export const api = {
   /** Faces burned captions may use. Served so the picker and the encoder agree. */
   listCaptionFonts: () => request<CaptionFontInfo[]>("/caption-styles/fonts"),
 
+  listAudioLibrary: (projectId?: string) => {
+    const query = projectId ? `?projectId=${encodeURIComponent(projectId)}` : "";
+    return request<{ builtin: AudioAsset[]; custom: AudioAsset[] }>(`/audio-library${query}`);
+  },
+
+  uploadProjectAudio: async (projectId: string, file: File, kind: "music" | "sfx") => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("kind", kind);
+    return request<AudioAsset>(`/projects/${projectId}/audio`, { method: "POST", body: form });
+  },
+
+  deleteProjectAudio: (projectId: string, fileId: string) =>
+    request<{ deleted: boolean }>(`/projects/${projectId}/audio/${fileId}`, { method: "DELETE" }),
+
   /** Reclaim S3 objects no live clip owns. Dry run unless `dryRun` is false. */
   reconcileProject: (id: string, dryRun = true) =>
     request<ReconcileResult>(`/projects/${id}/reconcile?dryRun=${dryRun ? "1" : "0"}`, {
@@ -406,4 +448,12 @@ export const api = {
 
 export function clipDownloadUrl(clipId: string): string {
   return `${BASE}/clips/${clipId}/download`;
+}
+
+export function builtinAudioUrl(id: string): string {
+  return `${BASE}/audio-library/${id}`;
+}
+
+export function projectAudioUrl(projectId: string, fileId: string): string {
+  return `${BASE}/projects/${projectId}/audio/${fileId}`;
 }

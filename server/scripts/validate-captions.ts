@@ -70,6 +70,17 @@ check(
   Math.abs((retimed[0]?.start ?? 0) - 0.2) < 0.001 && Math.abs((retimed[0]?.end ?? 0) - 0.9) < 0.001
 );
 
+check(
+  "peak highlight can be turned off so every caption matches",
+  buildTimelineCaptions(words, 10, 2, "original subtitle", 10, 2, [], false).every(
+    (caption) => caption.emphasis === false
+  )
+);
+check(
+  "peak highlight stays on by default",
+  buildTimelineCaptions(words, 10, 2, "original subtitle", 10, 2).some((caption) => caption.emphasis)
+);
+
 const ass = renderAss(captions, {
   horizontalFrac: 0.23,
   verticalFrac: 0.71,

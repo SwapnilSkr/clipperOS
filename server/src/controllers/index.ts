@@ -11,6 +11,13 @@ export {
   reconcileProject,
 } from "./project.controller";
 export {
+  listAudioLibrary,
+  streamBuiltinAudio,
+  streamProjectAudio,
+  uploadProjectAudio,
+  deleteProjectAudio,
+} from "./audio.controller";
+export {
   renderClips,
   getClip,
   downloadClip,
