@@ -104,6 +104,14 @@ export interface CropKeyframe {
   cy: number;
   /** Crop window width in source pixels. Height derives at 9:16. */
   width: number;
+  /**
+   * The tracked speaker's face — centre and width in source pixels — when the
+   * analyser saw one at this keyframe. A camera move anchored on the face zooms
+   * toward this point, not the crop centre.
+   */
+  fx?: number;
+  fy?: number;
+  fw?: number;
 }
 
 export interface ReframeTrack {
@@ -172,6 +180,11 @@ export interface CaptionOverrides {
   peakEmphasis?: boolean;
   fontFamily?: string;
   uppercase?: boolean;
+  /**
+   * `word` colours the word being spoken inside each caption (karaoke), using
+   * `peakColor`. Absent/`none` keeps the whole caption one colour.
+   */
+  highlight?: "none" | "word";
 }
 
 /** A persisted edit to one generated cue, or a user-created cue. */
@@ -297,6 +310,136 @@ export interface ProjectOutro {
   updatedAt?: string;
 }
 
+// ---------------------------------------------------------------------------
+// Creator mode — the beat plan
+//
+// Everything a human Shorts editor does PER SCENE rather than per clip: tighten
+// dead air, punch in on a line, ride the speaker, change the caption look for
+// the hook, put a title behind the subject, drop a whoosh on every move.
+//
+// Times are absolute SOURCE seconds, like the rest of the edit spec. Output
+// time differs once pause cuts remove spans; `creator-timeline.ts` owns that
+// mapping on both sides. An absent plan (or `enabled: false`) leaves the
+// renderer on its original path, byte for byte.
+// ---------------------------------------------------------------------------
+
+/** A span of source time removed from the output (a pause, a false start). */
+export interface PauseCut {
+  id: string;
+  startSec: number;
+  endSec: number;
+  /** Off keeps the candidate on the timeline without cutting it. */
+  enabled: boolean;
+  source: "director" | "user";
+}
+
+/**
+ * The zoom curve inside [startSec, endSec]; 1 outside it.
+ *
+ *   punch  in to `zoom` at the start, hold, release at the end. `ease` sets the
+ *          edges: `cut` is instant (a jump-cut zoom), the others ramp briefly.
+ *   push   creep from 1 up to `zoom` across the span, with a short release at
+ *          the end — a slow build into a line.
+ *   pull   start AT `zoom` and settle back to 1 across the span — the classic
+ *          opening push-in that relaxes as the hook lands.
+ */
+export type CameraMoveKind = "punch" | "push" | "pull";
+
+export type CameraEase = "cut" | "out" | "in_out";
+
+/** Where the digital zoom converges. Fractions are of the OUTPUT frame. */
+export type CameraAnchor = "face" | "center" | { x: number; y: number };
+
+export interface CameraMove {
+  id: string;
+  kind: CameraMoveKind;
+  startSec: number;
+  endSec: number;
+  /** 1 is no zoom. Capped at 1.5 — beyond that a 1080p source visibly softens. */
+  zoom: number;
+  anchor: CameraAnchor;
+  ease: CameraEase;
+}
+
+/** How quickly the follow camera answers the head: a nod, a lean, or only posture. */
+export type FollowResponse = "snappy" | "natural" | "smooth";
+/** Which way the camera follows. */
+export type FollowAxis = "both" | "x" | "y";
+
+export interface CameraFollow {
+  enabled: boolean;
+  /** 0 = today's seat-centred pan; 1 = the crop mirrors the face's motion. */
+  tightness: number;
+  /** A persistent punch-in that rides with the face. 1 = none. */
+  zoom?: number;
+  /** Default "natural". */
+  response?: FollowResponse;
+  /** Default "both". */
+  axis?: FollowAxis;
+}
+
+export interface CameraPlan {
+  follow?: CameraFollow;
+  moves: CameraMove[];
+}
+
+/** A span with its own caption look, layered on the clip's preset. */
+export interface CaptionScene {
+  id: string;
+  startSec: number;
+  endSec: number;
+  label?: string;
+  styleId?: string;
+  overrides?: CaptionOverrides;
+}
+
+export type TitleAnimation = "none" | "pop" | "fade" | "rise";
+
+/** A free-placed title. `behind` renders it between the background and the speaker. */
+export interface BehindTitle {
+  id: string;
+  text: string;
+  startSec: number;
+  endSec: number;
+  /** Centre of the title, fractions of the output frame (0-1). */
+  x: number;
+  y: number;
+  /** Multiplier on the base title size. */
+  sizeScale: number;
+  fontFamily?: string;
+  color: string;
+  uppercase?: boolean;
+  animation: TitleAnimation;
+  depth: "behind" | "front";
+}
+
+export interface DirectorNotes {
+  /** What the user asked for on the last pass. */
+  notes?: string;
+  /** The Director's one-paragraph rationale for the current plan. */
+  summary?: string;
+  generatedAt?: string;
+  model?: string;
+}
+
+export interface CreatorPlan {
+  enabled: boolean;
+  version: 1;
+  cuts?: PauseCut[];
+  camera?: CameraPlan;
+  captionScenes?: CaptionScene[];
+  titles?: BehindTitle[];
+  director?: DirectorNotes;
+}
+
+export const MAX_PAUSE_CUTS = 40;
+export const MAX_CAMERA_MOVES = 24;
+export const MAX_CAPTION_SCENES = 12;
+export const MAX_TITLES = 6;
+/** Digital zoom ceiling. Above ~1.35 the UI warns about softness on 1080p. */
+export const MAX_CAMERA_ZOOM = 1.5;
+export const MAX_FOLLOW_ZOOM = 1.3;
+
 /** Per-clip join onto a shared library sting. */
 export interface ClipOutro {
   enabled?: boolean;
@@ -333,6 +476,8 @@ export interface ClipEdit {
   outro?: ClipOutro;
   /** Burned-in text / watermark regions to reconstruct away, in source pixels. */
   cleanup?: CleanupRegion[];
+  /** Creator-mode beat plan. Absent or disabled leaves the render on the original path. */
+  creator?: CreatorPlan;
 }
 
 /** One ordered piece of a merge. Times are absolute SOURCE seconds. */
@@ -385,6 +530,10 @@ export interface TimelineCaption {
   text: string;
   /** The peak caption renders larger, in the accent colour. */
   emphasis: boolean;
+  /** Spoken onsets inside this caption, clip-local. Empty for a custom cue. */
+  words?: { t: number; word: string }[];
+  /** Caption scene this line falls in (creator mode). Absent = the clip's look. */
+  sceneId?: string;
 }
 
 export const OUTPUT_WIDTH = 1080;

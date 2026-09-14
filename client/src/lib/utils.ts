@@ -49,6 +49,13 @@ export function timecode(seconds: number): string {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
+/** `92.37` -> `1:32.37` — for fields where tenths matter. */
+export function timecodeFine(seconds: number): string {
+  const m = Math.floor(seconds / 60);
+  const s = seconds - m * 60;
+  return `${m}:${s.toFixed(2).padStart(5, "0")}`;
+}
+
 /** `92` -> `1:32`. */
 export function duration(seconds: number): string {
   return timecode(seconds);

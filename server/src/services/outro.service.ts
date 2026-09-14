@@ -153,6 +153,20 @@ export function stingIdOf(spec: ProjectOutro | undefined): string {
   return spec?.id && isOutroId(spec.id) ? spec.id : LEGACY_OUTRO_ID;
 }
 
+/** The clip's explicit pick wins. Falling back to the library default is last. */
+export function resolveOutroJoinId(attach?: ClipOutro, sting?: ProjectOutro): string {
+  if (attach?.outroId && isOutroId(attach.outroId)) return attach.outroId;
+  if (sting?.id && isOutroId(sting.id)) return sting.id;
+  return LEGACY_OUTRO_ID;
+}
+
+/** Nested outro patches must not wipe a stored sting id when the key is omitted. */
+export function mergeClipOutro(prev: ClipOutro | undefined, patch: ClipOutro): ClipOutro {
+  const next: ClipOutro = { ...prev, ...patch };
+  if (patch.outroId === undefined && prev?.outroId) next.outroId = prev.outroId;
+  return next;
+}
+
 export function pickProjectOutro(
   items: ProjectOutro[] | undefined,
   outroId?: string,
@@ -1313,12 +1327,7 @@ export async function appendOutroToClip(
   scratchDir: string,
   sting?: ProjectOutro
 ): Promise<{ path: string; durationSec: number }> {
-  const outroId =
-    sting?.id && isOutroId(sting.id)
-      ? sting.id
-      : attach?.outroId && isOutroId(attach.outroId)
-        ? attach.outroId
-        : LEGACY_OUTRO_ID;
+  const outroId = resolveOutroJoinId(attach, sting);
   await promoteStingToShared(projectId, outroId);
   const owner = await resolveStingOwner(outroId, projectId);
   const preview = outroPreviewPath(owner, outroId);
@@ -1360,7 +1369,7 @@ export async function appendOutroToClip(
         `expected ${expected.toFixed(1)}s).`
     );
   }
-  console.log(`🎬 Joined sting ${outroSec.toFixed(1)}s after ${clipSec.toFixed(1)}s clip`);
+  console.log(`🎬 Joined sting ${outroId} (${outroSec.toFixed(1)}s) after ${clipSec.toFixed(1)}s clip`);
   return { path: mixedPath, durationSec: written.durationSec };
 }
 

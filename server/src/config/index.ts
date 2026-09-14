@@ -88,6 +88,13 @@ export const config = {
     process.env.VISION_FACE_MODEL_PATH,
     "./storage/vision/models/face_detection_yunet_2023mar.onnx"
   ),
+  // Person matte for behind-subject titles (creator mode). Same venv; needs
+  // onnxruntime + the RVM model, both installed by `bun run vision:install`.
+  visionMatteScriptPath: absPath(process.env.VISION_MATTE_SCRIPT_PATH, "./python/person_matte.py"),
+  visionMatteModelPath: absPath(
+    process.env.VISION_MATTE_MODEL_PATH,
+    "./storage/vision/models/rvm_mobilenetv3_fp32.onnx"
+  ),
 
   // ---- Limits ----
   maxFileSizeMB: parseInt(process.env.MAX_FILE_SIZE_MB || "4096"),

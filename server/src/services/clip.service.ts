@@ -15,7 +15,8 @@ import type {
   VideoEffects,
   VttWordTiming,
 } from "../types/clip.types";
-import { sanitizeClipOutro } from "./outro.service";
+import { mergeClipOutro, sanitizeClipOutro } from "./outro.service";
+import { isEmptyCreatorPlan, plainCreatorPlan, sanitizeCreatorPlan } from "./creator-plan.service";
 import { generateClipShareCopy } from "./share-copy.service";
 import { MAX_CAPTION_WORD_OVERRIDES, MAX_CLEANUP_REGIONS } from "../types/clip.types";
 import { resolveCaptionFont } from "../config/caption-fonts";
@@ -154,8 +155,12 @@ function toPlainEdit(edit: IClip["edit"] | null | undefined): ClipEdit {
     if (overrides.peakEmphasis !== undefined) clean.peakEmphasis = Boolean(overrides.peakEmphasis);
     if (typeof overrides.fontFamily === "string") clean.fontFamily = resolveCaptionFont(overrides.fontFamily);
     if (overrides.uppercase !== undefined) clean.uppercase = Boolean(overrides.uppercase);
+    if (overrides.highlight === "none" || overrides.highlight === "word") clean.highlight = overrides.highlight;
     if (Object.keys(clean).length > 0) out.captionOverrides = clean;
   }
+
+  const creator = plainCreatorPlan(source.creator);
+  if (creator) out.creator = creator;
   return out;
 }
 
@@ -194,7 +199,11 @@ export async function updateClipEdit(clipId: string, input: UpdateClipInput): Pr
 
   if (input.edit !== undefined) {
     const edit = sanitizeEdit(input.edit);
-    const next = { ...toPlainEdit(clip.edit), ...edit };
+    const stored = toPlainEdit(clip.edit);
+    const next = { ...stored, ...edit };
+    if (edit.outro !== undefined && !isEmptyClipOutro(edit.outro)) {
+      next.outro = mergeClipOutro(stored.outro, edit.outro);
+    }
     // An explicitly empty array is a RESET, not "no change" — the same rule the
     // caption overrides follow, and the only way the editor can clear the regions.
     if (edit.cleanup !== undefined && edit.cleanup.length === 0) {
@@ -219,6 +228,9 @@ export async function updateClipEdit(clipId: string, input: UpdateClipInput): Pr
     }
     if (edit.outro !== undefined && isEmptyClipOutro(edit.outro)) {
       delete next.outro;
+    }
+    if (edit.creator !== undefined && isEmptyCreatorPlan(edit.creator)) {
+      delete next.creator;
     }
     assertWindowValid(clip, next);
     if (Object.keys(next).length > 0) $set.edit = next;
@@ -288,6 +300,7 @@ function sanitizeEdit(raw: ClipEdit): ClipEdit {
   if (raw.cleanup !== undefined) {
     edit.cleanup = sanitizeCleanup(raw.cleanup);
   }
+  if (raw.creator !== undefined) edit.creator = sanitizeCreatorPlan(raw.creator);
   return edit;
 }
 
@@ -464,6 +477,10 @@ function sanitizeOverrides(raw: CaptionOverrides): CaptionOverrides {
     out.fontFamily = resolveCaptionFont(raw.fontFamily);
   }
   if (raw.uppercase !== undefined) out.uppercase = Boolean(raw.uppercase);
+  if (raw.highlight !== undefined) {
+    if (raw.highlight !== "none" && raw.highlight !== "word") throw new Error("Unknown caption highlight");
+    out.highlight = raw.highlight;
+  }
   return out;
 }
 
@@ -709,6 +726,12 @@ export async function deleteClip(clipId: string): Promise<DeleteClipResult> {
   for (const path of candidates) {
     freedBytes += await getFileSize(path).catch(() => 0);
     await deleteFile(path).catch(() => undefined);
+  }
+
+  // ---- the person matte cache, if creator mode built one ----
+  if (clip.matte?.path) {
+    freedBytes += await getFileSize(clip.matte.path).catch(() => 0);
+    await deleteFile(clip.matte.path).catch(() => undefined);
   }
 
   await Clip.findByIdAndDelete(clipId);

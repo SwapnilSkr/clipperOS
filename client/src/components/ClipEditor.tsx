@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import {
   ArrowLeft,
@@ -18,11 +18,13 @@ import {
   Trash2,
   Redo2,
   Undo2,
+  Wand2,
   X,
 } from "lucide-react";
 import {
   api,
   clipDownloadUrl,
+  clipMatteUrl,
   MAX_CLEANUP_REGIONS,
   pickProjectOutro,
   projectOutroPreviewUrl,
@@ -32,6 +34,9 @@ import {
   type CaptionTextOverride,
   type CaptionWordOverride,
   type CleanupRegion,
+  type CreatorPlan,
+  type DirectorLane,
+  type AudioAsset,
   type ClipEdit,
   type ClipPayload,
   type ClipSegment,
@@ -41,7 +46,9 @@ import {
   type Soundtrack,
   type VideoEffects,
 } from "@/api";
+import { BeatTimeline, type BeatSelection } from "./BeatTimeline";
 import { CaptionOverlay } from "./CaptionOverlay";
+import { CreatorDesk } from "./CreatorDesk";
 import { CleanupLayer } from "./CleanupLayer";
 import { CutCheckPanel } from "./CutCheckPanel";
 import { MixPanel, MixTimeline, soundtrackPayload } from "./MixPanel";
@@ -56,16 +63,31 @@ import {
   compileGroupEditsToWords,
   effectiveCaptionStyle,
   expandWordTimings,
+  sceneStyleFor,
+  spokenWordIndex,
   type WordTiming,
 } from "@/lib/captions";
 import { checkSceneCuts, sceneCutsInWindow } from "@/lib/cut-check";
-import { cropTransformFor, holdCropUntilCuts, paintCropPreview, sourceTimeOnTrack } from "@/lib/reframe";
 import {
-  DEFAULT_VIDEO_EFFECTS,
-  SHORT_FORM_TEMPLATES,
-  resolveVideoEffects,
-} from "@/lib/edit-templates";
+  cameraStateAt,
+  followSigma,
+  followTightness,
+  followTightnessX,
+  headTravel,
+  nextKeptTime,
+  outputDuration,
+  outputToSource,
+  smoothedTrack,
+  sourceToOutput,
+  windowsFor,
+} from "@/lib/creator-timeline";
+import { useLiveSoundtrack } from "@/lib/live-soundtrack";
+import { addBeat, enablePlan, removeBeat, type BeatLane } from "@/lib/beat-plan";
+import { rememberSfx } from "./SfxPicker";
+import { cropTransformFor, holdCropUntilCuts, paintCropPreview, sourceTimeOnTrack } from "@/lib/reframe";
+import { DEFAULT_VIDEO_EFFECTS, SHORT_FORM_TEMPLATES, resolveVideoEffects } from "@/lib/edit-templates";
 import { cn, formatBytes, timecode } from "@/lib/utils";
+import { CaptionSectionField, ColorControl, Panel, SegmentedButton, Slider, TimestampInput } from "./editor-controls";
 
 /** What the editor hands back when the user saves or renders. */
 export interface ClipEditDraft {
@@ -132,9 +154,10 @@ export function ClipEditor({
 }: ClipEditorProps) {
   const isMerge = clip.kind === "merge";
   const [searchParams, setSearchParams] = useSearchParams();
-  const desk = searchParams.get("desk") === "mix" ? "mix" : "cut";
-  function setDesk(next: "cut" | "mix") {
-    setSearchParams(next === "mix" ? { desk: "mix" } : {}, { replace: true });
+  const deskParam = searchParams.get("desk");
+  const desk: "cut" | "mix" | "create" = deskParam === "mix" ? "mix" : deskParam === "create" ? "create" : "cut";
+  function setDesk(next: "cut" | "mix" | "create") {
+    setSearchParams(next === "cut" ? {} : { desk: next }, { replace: true });
   }
 
   // ---- draft state (seeded once; App keys this component by clip id) ----
@@ -147,7 +170,7 @@ export function ClipEditor({
   );
   const [captionWordOverrides, setCaptionWordOverrides] = useState<CaptionWordOverride[]>(
     clip.edit?.captionWordOverrides ?? []
-  );;
+  );
   const [editTemplateId, setEditTemplateId] = useState(clip.edit?.editTemplateId ?? "custom");
   const [videoEffects, setVideoEffects] = useState<VideoEffects>(clip.edit?.videoEffects ?? {});
   const [soundtrack, setSoundtrack] = useState<Soundtrack>(clip.edit?.soundtrack ?? {});
@@ -156,9 +179,19 @@ export function ClipEditor({
     transitionId: clip.edit?.outro?.transitionId ?? "smash",
     outroId: clip.edit?.outro?.outroId,
   });
-  const [reframeMode, setReframeMode] = useState<"center" | "smart">(
-    clip.edit?.reframeMode ?? "smart"
-  );
+  const [reframeMode, setReframeMode] = useState<"center" | "smart">(clip.edit?.reframeMode ?? "smart");
+  const [creator, setCreator] = useState<CreatorPlan>(clip.edit?.creator ?? { enabled: false, version: 1 });
+  /** The person matte the preview composites behind-titles with. */
+  const [matte, setMatte] = useState<{
+    key: string;
+    originSec: number;
+    width: number;
+    height: number;
+  } | null>(null);
+  const [matteNote, setMatteNote] = useState<string | null>(null);
+  const matteRef = useRef<HTMLVideoElement>(null);
+  const [beatSelection, setBeatSelection] = useState<BeatSelection | null>(null);
+  const [audioLibrary, setAudioLibrary] = useState<AudioAsset[]>([]);
   const [trimStart, setTrimStart] = useState(clip.edit?.trimStartSec ?? clip.startSec);
   const [trimEnd, setTrimEnd] = useState(clip.edit?.trimEndSec ?? clip.endSec);
   const [segments, setSegments] = useState<ClipSegment[]>(
@@ -177,9 +210,7 @@ export function ClipEditor({
   const [frameHeight, setFrameHeight] = useState(0);
   // Default to the source (trim handles need its clock). When it is not on disk
   // yet, fall back to the last render so the page still shows something.
-  const [mode, setMode] = useState<"source" | "output">(
-    !project.mediaReady && clip.outputUrl ? "output" : "source"
-  );
+  const [mode, setMode] = useState<"source" | "output">(!project.mediaReady && clip.outputUrl ? "output" : "source");
   const [preparingSource, setPreparingSource] = useState(false);
   const [previewTrack, setPreviewTrack] = useState<ReframeTrack | undefined>(
     clip.reframeTrack ? holdCropUntilCuts(clip.reframeTrack) : undefined
@@ -239,10 +270,23 @@ export function ClipEditor({
     return [{ startSec: trimStart, endSec: trimEnd }];
   }, [isMerge, segments, trimStart, trimEnd]);
 
+  // Creator mode: the kept windows once pause cuts are removed. Playback skips
+  // the gaps so the preview runs on the output clock's content.
+  const creatorWindows = useMemo(
+    () =>
+      creator.enabled && !isMerge
+        ? windowsFor(trimStart, trimEnd, creator.cuts)
+        : [{ startSec: trimStart, endSec: trimEnd }],
+    [creator.enabled, creator.cuts, isMerge, trimStart, trimEnd]
+  );
+  const creatorOutputSec = outputDuration(creatorWindows);
+
   const safeIndex = Math.min(activeIndex, Math.max(0, previewSegments.length - 1));
-  const active = previewSegments[safeIndex] ?? { startSec: trimStart, endSec: trimEnd };
-  const sourceDuration =
-    project.durationSec ?? Math.max(trimEnd, active.endSec, clip.endSec, 0.1);
+  const active = previewSegments[safeIndex] ?? {
+    startSec: trimStart,
+    endSec: trimEnd,
+  };
+  const sourceDuration = project.durationSec ?? Math.max(trimEnd, active.endSec, clip.endSec, 0.1);
   const projectOutros = project.outros ?? (project.outro ? [project.outro] : []);
   const selectedOutro = pickProjectOutro(projectOutros, clipOutro.outroId, project.defaultOutroId);
   const outroPlaythrough =
@@ -251,8 +295,10 @@ export function ClipEditor({
     outroPlaythrough && selectedOutro
       ? projectOutroPreviewUrl(project.id, selectedOutro.id, selectedOutro.updatedAt)
       : undefined;
-  const clipWindowDur = Math.max(0.1, active.endSec - active.startSec);
-  const outroDur = outroDuration > 0.05 ? outroDuration : selectedOutro?.durationSec ?? 2.4;
+  // The clip's length on the OUTPUT clock — creator cuts shorten it. The mix
+  // (bed, hits, the sting hand-off) lives on this clock.
+  const clipWindowDur = Math.max(0.1, isMerge ? active.endSec - active.startSec : outputDuration(creatorWindows));
+  const outroDur = outroDuration > 0.05 ? outroDuration : (selectedOutro?.durationSec ?? 2.4);
   const playthroughDur = outroPlaythrough ? clipWindowDur + outroDur : clipWindowDur;
   previewStageRef.current = previewStage;
   outroPlaythroughRef.current = outroPlaythrough;
@@ -262,6 +308,19 @@ export function ClipEditor({
   const style = effectiveCaptionStyle(preset, overrides);
   const fontChoices = fonts.length > 0 ? fonts : FALLBACK_FONTS;
   const catalogFont = fontChoices.find((font) => font.family === style.fontFamily);
+
+  // Creator mode: each caption scene resolves to its own look, and the grouper
+  // never lets a caption cross a scene boundary.
+  const sceneLooks = useMemo(
+    () =>
+      creator.enabled && !isMerge
+        ? (creator.captionScenes ?? []).map((scene) => ({
+            scene,
+            style: sceneStyleFor(styles, style, scene),
+          }))
+        : [],
+    [creator.enabled, creator.captionScenes, isMerge, styles, style]
+  );
 
   const captions = useMemo(() => {
     if (!words || !captionsOn) return [];
@@ -275,7 +334,13 @@ export function ClipEditor({
       style.chunkWords,
       captionTextOverrides,
       overrides.peakEmphasis !== false,
-      captionWordOverrides
+      captionWordOverrides,
+      sceneLooks.map(({ scene, style: look }) => ({
+        id: scene.id,
+        startSec: scene.startSec,
+        endSec: scene.endSec,
+        chunkWords: look.chunkWords,
+      }))
     );
   }, [
     words,
@@ -288,9 +353,14 @@ export function ClipEditor({
     captionTextOverrides,
     captionWordOverrides,
     overrides.peakEmphasis,
+    sceneLooks,
   ]);
 
   const activeCaption = mode === "source" ? captionAt(captions, time - active.startSec) : null;
+  const activeCaptionStyle =
+    (activeCaption?.sceneId && sceneLooks.find(({ scene }) => scene.id === activeCaption.sceneId)?.style) || style;
+  const activeCaptionFont = fontChoices.find((font) => font.family === activeCaptionStyle.fontFamily);
+  const spokenIndex = activeCaption ? spokenWordIndex(activeCaption, time) : -1;
   const boundTranscript = useMemo(() => {
     if (!words) return "";
     return applyCaptionWords(words, captionWordOverrides, captionTextOverrides)
@@ -303,9 +373,7 @@ export function ClipEditor({
   const removedCaptionSections = captionTextOverrides.filter((item) => item.hidden);
   const removedWordSpans = useMemo(() => {
     if (!words) return [];
-    const hidden = new Set(
-      captionWordOverrides.filter((item) => item.hidden).map((item) => Math.round(item.t * 1000))
-    );
+    const hidden = new Set(captionWordOverrides.filter((item) => item.hidden).map((item) => Math.round(item.t * 1000)));
     const spans: { key: string; text: string; ts: number[] }[] = [];
     let current: WordTiming[] = [];
     const flush = () => {
@@ -422,7 +490,7 @@ export function ClipEditor({
     const clipped = Math.max(0, Math.min(playthroughDur, local));
     if (!outroPlaythrough || clipped < clipWindowDur - 0.02) {
       leaveOutroStage();
-      seekTo(active.startSec + Math.min(clipWindowDur, clipped));
+      seekTo(isMerge ? active.startSec + Math.min(clipWindowDur, clipped) : outputToSource(creatorWindows, clipped));
       return;
     }
     videoRef.current?.pause();
@@ -494,9 +562,7 @@ export function ClipEditor({
   }
 
   function markIn() {
-    const next = isMerge
-      ? Math.min(time, active.endSec - 0.2)
-      : Math.max(0, Math.min(time, trimEnd - 0.2));
+    const next = isMerge ? Math.min(time, active.endSec - 0.2) : Math.max(0, Math.min(time, trimEnd - 0.2));
     if (Math.abs(next - active.startSec) < 0.001) return;
     rememberTrimAction("Mark in");
     if (isMerge) updateSegment(safeIndex, { startSec: Math.min(time, active.endSec - 0.2) }, true);
@@ -520,9 +586,7 @@ export function ClipEditor({
     setSegments(snapshot.segments.map((segment) => ({ ...segment })));
     const nextIndex = Math.min(snapshot.activeIndex, Math.max(0, snapshot.segments.length - 1));
     setActiveIndex(nextIndex);
-    const nextStart = isMerge
-      ? snapshot.segments[nextIndex]?.startSec ?? snapshot.trimStart
-      : snapshot.trimStart;
+    const nextStart = isMerge ? (snapshot.segments[nextIndex]?.startSec ?? snapshot.trimStart) : snapshot.trimStart;
     seekTo(nextStart);
   }
 
@@ -587,10 +651,12 @@ export function ClipEditor({
       videoEffects,
       soundtrack,
       clipOutro,
+      creator,
     });
   }
   const [saved, setSaved] = useState(snapshot);
-  const dirty = snapshot() !== saved;
+  const snap = snapshot();
+  const dirty = snap !== saved;
 
   function buildDraft(): ClipEditDraft {
     const edit: ClipEdit = {
@@ -608,10 +674,12 @@ export function ClipEditor({
       outro: {
         enabled: clipOutro.enabled !== false,
         transitionId: clipOutro.transitionId ?? "smash",
-        outroId: clipOutro.outroId,
+        outroId: clipOutro.outroId ?? selectedOutro?.id,
       },
       // Same rule: an empty array is an explicit reset of the cleanup regions.
       cleanup,
+      // Always sent; the server drops a disabled, empty plan.
+      creator,
     };
     // A merge's window comes from its segments; per-clip trims are meaningless.
     if (!isMerge) {
@@ -702,7 +770,140 @@ export function ClipEditor({
       })();
     }, 700);
     return () => window.clearTimeout(timer);
-  }, [dirty]);
+  }, [dirty, snap]);
+
+  useEffect(() => {
+    if (desk !== "create" || audioLibrary.length > 0) return;
+    void refreshAudioLibrary();
+  }, [desk, project.id, audioLibrary.length]);
+
+  function refreshAudioLibrary(): Promise<void> {
+    return api
+      .listAudioLibrary(project.id)
+      .then((result) => setAudioLibrary([...result.builtin, ...result.custom]))
+      .catch(() => undefined);
+  }
+
+  async function uploadAudio(file: File, kind: "music" | "sfx"): Promise<void> {
+    await api.uploadProjectAudio(project.id, file, kind);
+    await refreshAudioLibrary();
+  }
+
+  // Behind-titles need the person matte. Ask the server for it (cached per
+  // window + spans) whenever the behind spans change, debounced so a drag
+  // does not start a matting job per pixel.
+  const behindKey = useMemo(() => {
+    if (!creator.enabled || isMerge) return "";
+    const spans = (creator.titles ?? [])
+      .filter((title) => title.depth === "behind")
+      .map((title) => `${Math.round(title.startSec * 10)}-${Math.round(title.endSec * 10)}`)
+      .sort();
+    return spans.length > 0 ? `${Math.round(trimStart * 1000)}:${Math.round(trimEnd * 1000)}:${spans.join(",")}` : "";
+  }, [creator.enabled, creator.titles, isMerge, trimStart, trimEnd]);
+
+  useEffect(() => {
+    if (!behindKey || !project.mediaReady) {
+      setMatte(null);
+      setMatteNote(null);
+      return;
+    }
+    if (matte?.key === behindKey) return;
+    let cancelled = false;
+    setMatteNote("building the cutout…");
+    const timer = window.setTimeout(() => {
+      api
+        .buildClipMatte(clip.id)
+        .then((info) => {
+          if (cancelled) return;
+          if (info.ready && info.originSec != null && info.width && info.height) {
+            setMatte({
+              key: behindKey,
+              originSec: info.originSec,
+              width: info.width,
+              height: info.height,
+            });
+            setMatteNote(null);
+          } else {
+            setMatte(null);
+            setMatteNote(info.reason ?? "no cutout yet — the title previews in front");
+          }
+        })
+        .catch((error: unknown) => {
+          if (!cancelled) setMatteNote(messageOf(error));
+        });
+    }, 900);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [behindKey, project.mediaReady, clip.id, matte?.key]);
+
+  function updateBeatSpan(lane: BeatLane, id: string, span: { startSec: number; endSec: number }) {
+    if (lane === "sfx") {
+      setSoundtrack((prev) => ({
+        ...prev,
+        sfx: (prev.sfx ?? []).map((hit) => (hit.id === id ? { ...hit, atSec: span.startSec } : hit)),
+      }));
+      return;
+    }
+    setCreator((prev) => {
+      const patchSpan = <T extends { id: string; startSec: number; endSec: number }>(items: T[] | undefined) =>
+        (items ?? []).map((item) => (item.id === id ? { ...item, ...span } : item));
+      if (lane === "cuts") return { ...prev, cuts: patchSpan(prev.cuts) };
+      if (lane === "camera")
+        return {
+          ...prev,
+          camera: { ...prev.camera, moves: patchSpan(prev.camera?.moves) },
+        };
+      if (lane === "captions") return { ...prev, captionScenes: patchSpan(prev.captionScenes) };
+      return { ...prev, titles: patchSpan(prev.titles) };
+    });
+  }
+
+  /** A lane's "+": the default beat at the playhead, selected for editing. Turns the plan on. */
+  function addBeatAtPlayhead(lane: BeatLane, sfx?: string) {
+    const plan = enablePlan(creator, resolvedEffects, trimStart, trimEnd, clip.peakSec);
+    const next = addBeat(
+      lane,
+      { plan, sfx: soundtrack.sfx ?? [] },
+      { at: time, trimStart, trimEnd, windows: creatorWindows, sfx }
+    );
+    if (!next) return;
+    if (next.plan !== creator) setCreator(next.plan);
+    if (lane === "sfx") {
+      setSoundtrack((prev) => ({ ...prev, sfx: next.sfx }));
+      if (sfx) rememberSfx(sfx);
+    }
+    setBeatSelection({ lane, id: next.id });
+  }
+
+  function removeBeatById(lane: BeatLane, id: string) {
+    const next = removeBeat(lane, id, {
+      plan: creator,
+      sfx: soundtrack.sfx ?? [],
+    });
+    if (lane === "sfx") setSoundtrack((prev) => ({ ...prev, sfx: next.sfx }));
+    else setCreator(next.plan);
+    setBeatSelection((prev) => (prev?.id === id ? null : prev));
+  }
+
+  /**
+   * The Director writes the plan on the server from the STORED edit, so the
+   * draft is flushed first; its answer then replaces the local plan and hits.
+   */
+  async function directClip(input: { notes?: string; keep: DirectorLane[] }): Promise<void> {
+    await onSave(buildDraft());
+    setSaved(snapshot());
+    const result = await api.directClip(clip.id, input);
+    const next = result.clip.edit?.creator;
+    if (next) setCreator(next);
+    setSoundtrack((prev) => ({
+      ...prev,
+      sfx: result.clip.edit?.soundtrack?.sfx ?? [],
+    }));
+    setBeatSelection(null);
+    onClipUpdated?.(result.clip);
+  }
 
   async function prepareSource(): Promise<void> {
     setPreparingSource(true);
@@ -780,7 +981,10 @@ export function ClipEditor({
 
   const renderProgress = Math.round(clip.renderProgress ?? 0);
   const rendered = clip.status === "rendered" && Boolean(clip.outputUrl);
-  const videoSource = mode === "output" && clip.outputUrl ? clip.outputUrl : projectMediaUrl(project.id);
+  const videoSource =
+    mode === "output" && clip.outputUrl
+      ? clipDownloadUrl(clip.id, { bust: clip.renderedAt })
+      : projectMediaUrl(project.id);
   const mediaStatus = project.mediaStatus ?? (project.mediaReady ? "ready" : "absent");
   const sourceReady = project.mediaReady;
   const sourceFetching = mediaStatus === "fetching" || preparingSource;
@@ -843,19 +1047,18 @@ export function ClipEditor({
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [
-    isMerge,
-    sourceReady,
-    reframeMode,
-    trackCoversTrim,
-    trimStart,
-    trimEnd,
-    clip.id,
-    clip.startSec,
-    clip.endSec,
-  ]);
+  }, [isMerge, sourceReady, reframeMode, trackCoversTrim, trimStart, trimEnd, clip.id, clip.startSec, clip.endSec]);
 
-  const track = reframeMode === "smart" ? previewTrack : undefined;
+  const rawTrack = reframeMode === "smart" ? previewTrack : undefined;
+  const tightness = isMerge ? 0 : followTightnessX(creator);
+  // A following camera rides the smoothed face path, as the burn does — by the plan's response.
+  const following = !isMerge && followTightness(creator) > 0;
+  const sigma = followSigma(creator);
+  const track = useMemo(
+    () => (rawTrack && following ? smoothedTrack(rawTrack, sigma) : rawTrack),
+    [rawTrack, following, sigma]
+  );
+  const travel = useMemo(() => headTravel(rawTrack), [rawTrack]);
   // Crop times are on the analysis origin, not the saved trim. Using the saved
   // in-point here is what brought the cut-flash back after Save.
   const cropOrigin = track?.originSec ?? trimStart;
@@ -865,7 +1068,8 @@ export function ClipEditor({
     sourceSize.w,
     sourceSize.h,
     frameWidth,
-    frameHeight
+    frameHeight,
+    tightness
   );
   // WYSIWYG only when the crop is showing: in "fit" the whole source is visible,
   // so a caption at the burned-in position would sit in the wrong place.
@@ -876,37 +1080,90 @@ export function ClipEditor({
     [reframeMode, track, trimStart, trimEnd]
   );
   const cutChecks = useMemo(
-    () =>
-      reframeMode === "smart"
-        ? checkSceneCuts(track, trimStart, trimEnd, sourceSize.w, sourceSize.h)
-        : [],
+    () => (reframeMode === "smart" ? checkSceneCuts(track, trimStart, trimEnd, sourceSize.w, sourceSize.h) : []),
     [reframeMode, track, trimStart, trimEnd, sourceSize.w, sourceSize.h]
   );
   const cutFlashes = cutChecks.filter((item) => item.status === "flash").length;
   const resolvedEffects = resolveVideoEffects(videoEffects);
-  const localPreviewTime = Math.max(0, time - active.startSec);
+  const sfxLabelMap = useMemo(() => new Map(audioLibrary.map((asset) => [asset.id, asset.label])), [audioLibrary]);
+  const sfxAssets = useMemo(() => audioLibrary.filter((asset) => asset.kind === "sfx"), [audioLibrary]);
+  // On the output clock: with creator cuts active, the seconds after a cut
+  // are earlier than `time − trimStart` says (hits and the bed live there).
+  const localPreviewTime = Math.max(0, isMerge ? time - active.startSec : sourceToOutput(creatorWindows, time));
   const playheadLocal = previewStage === "outro" ? clipWindowDur + outroTime : localPreviewTime;
+  // Hear the mix on any desk that shows the source; the Sound desk's controls
+  // and creator mode's SFX lane both edit the same soundtrack.
+  useLiveSoundtrack({
+    enabled: (desk === "mix" || desk === "create") && mode === "source",
+    playing,
+    localTime: playheadLocal,
+    clipEndSec: clipWindowDur,
+    outroSec: outroPlaythrough ? outroDur : 0,
+    soundtrack,
+    videoRef,
+  });
   const peakAt = clip.peakSec - active.startSec;
-  const previewZoom = motionZoom(resolvedEffects, localPreviewTime, peakAt);
+  // Creator mode's camera replaces the clip-wide motion, in the preview as in
+  // the render. The transform origin IS the anchor, so a face punch zooms
+  // toward the face here exactly as the burn does.
+  // Creator mode's camera is painted into the canvas (crop → zoom, exactly the
+  // burn's order, so titles are not zoomed with the picture); the clip-wide
+  // motion keeps its CSS scale.
+  const creatorCamera = creator.enabled && !isMerge;
+  const previewZoom = creatorCamera ? 1 : motionZoom(resolvedEffects, localPreviewTime, peakAt);
   const picturePreviewStyle = {
     filter: previewFilter(resolvedEffects),
     transform: `scale(${previewZoom})`,
     transformOrigin: "center",
   };
 
-  const paintPreview = useCallback((mediaTime?: number) => {
-    const video = videoRef.current;
-    const canvas = previewCanvasRef.current;
-    if (!cropPreview || !video || !canvas) return;
-    paintCropPreview(
-      video,
-      canvas,
-      track,
-      sourceTimeOnTrack(track, mediaTime ?? video.currentTime, cropOrigin),
-      sourceSize.w,
-      sourceSize.h
-    );
-  }, [cropPreview, track, cropOrigin, sourceSize.w, sourceSize.h]);
+  const creatorPaint = creator.enabled && !isMerge;
+  const paintPreview = useCallback(
+    (mediaTime?: number) => {
+      const video = videoRef.current;
+      const canvas = previewCanvasRef.current;
+      if (!cropPreview || !video || !canvas) return;
+      const sourceSec = mediaTime ?? video.currentTime;
+      const matteVideo = matteRef.current;
+      // Keep the matte's clock on the source's; two elements drift, and the
+      // cutout only has to be right inside the title spans.
+      if (matteVideo && matte && matteVideo.readyState >= 1) {
+        const want = sourceSec - matte.originSec;
+        if (Math.abs(matteVideo.currentTime - want) > 0.08 && !matteVideo.seeking) matteVideo.currentTime = want;
+      }
+      paintCropPreview(
+        video,
+        canvas,
+        track,
+        sourceTimeOnTrack(track, sourceSec, cropOrigin),
+        sourceSize.w,
+        sourceSize.h,
+        tightness,
+        creatorPaint
+          ? {
+              camera: cameraStateAt(creator, track, sourceSec),
+              titles: creator.titles,
+              sourceSec,
+              matte:
+                matteVideo && matte
+                  ? {
+                      video: matteVideo,
+                      width: matte.width,
+                      height: matte.height,
+                    }
+                  : null,
+              fontFor: (family) => {
+                const font = fontChoices.find((item) => item.family === family);
+                return font
+                  ? { stack: font.stack, weight: font.weight }
+                  : { stack: `"${family}", Impact, sans-serif`, weight: 400 };
+              },
+            }
+          : {}
+      );
+    },
+    [cropPreview, track, cropOrigin, sourceSize.w, sourceSize.h, tightness, creatorPaint, creator, matte, fontChoices]
+  );
 
   // Paint only when the browser has presented a decoded video frame. An rAF can
   // observe an advanced currentTime while drawImage still sees the previous
@@ -958,6 +1215,26 @@ export function ClipEditor({
     };
   }, [playing, active.endSec, isMerge, safeIndex, previewSegments.length, paintPreview]);
 
+  // Pause cuts: while playing, jump the decoder over each removed span. This
+  // runs on a timer rather than the frame callback (a heavy 4K source presents
+  // frames sparsely at the start of playback) or rAF (frozen in a background
+  // tab): the skip has to land on the clock, not on the next painted picture.
+  useEffect(() => {
+    if (!playing || creatorWindows.length <= 1) return;
+    const video = videoRef.current;
+    if (!video) return;
+    const tick = () => {
+      if (video.paused || video.seeking) return;
+      const now = video.currentTime;
+      const kept = nextKeptTime(creatorWindows, now);
+      if (kept > now + 0.02 && kept < active.endSec - 0.03) {
+        video.currentTime = kept;
+      }
+    };
+    const timer = window.setInterval(tick, 33);
+    return () => window.clearInterval(timer);
+  }, [playing, creatorWindows, active.endSec]);
+
   useEffect(() => {
     if (playing) return;
     const video = videoRef.current;
@@ -996,9 +1273,7 @@ export function ClipEditor({
 
   function dropGeneratedGroupEdit(startSec: number) {
     setCaptionTextOverrides((prev) =>
-      prev.filter(
-        (item) => item.custom || Math.round(item.startSec * 1000) !== Math.round(startSec * 1000)
-      )
+      prev.filter((item) => item.custom || Math.round(item.startSec * 1000) !== Math.round(startSec * 1000))
     );
   }
 
@@ -1016,8 +1291,7 @@ export function ClipEditor({
       return;
     }
     setCaptionTextOverrides((prev) => {
-      const matches = (item: CaptionTextOverride) =>
-        Boolean(item.custom && `custom:${item.id}` === caption.editId);
+      const matches = (item: CaptionTextOverride) => Boolean(item.custom && `custom:${item.id}` === caption.editId);
       const existing = prev.find(matches);
       const base: CaptionTextOverride = {
         id: caption.editId.replace(/^custom:/, ""),
@@ -1028,9 +1302,7 @@ export function ClipEditor({
       };
       const next = prev.filter((item) => !matches(item));
       next.push({ ...base, ...existing, ...patch });
-      return next.sort(
-        (a, b) => (a.displayStartSec ?? a.startSec) - (b.displayStartSec ?? b.startSec)
-      );
+      return next.sort((a, b) => (a.displayStartSec ?? a.startSec) - (b.displayStartSec ?? b.startSec));
     });
   }
 
@@ -1041,9 +1313,7 @@ export function ClipEditor({
       dropGeneratedGroupEdit(caption.sourceStartSec);
       return;
     }
-    setCaptionTextOverrides((prev) =>
-      prev.filter((item) => `custom:${item.id}` !== caption.editId)
-    );
+    setCaptionTextOverrides((prev) => prev.filter((item) => `custom:${item.id}` !== caption.editId));
   }
 
   function commitTranscript() {
@@ -1104,9 +1374,7 @@ export function ClipEditor({
   }
 
   function restoreRemovedSection(edit: CaptionTextOverride) {
-    setCaptionTextOverrides((prev) =>
-      prev.map((item) => (item === edit ? { ...item, hidden: false } : item))
-    );
+    setCaptionTextOverrides((prev) => prev.map((item) => (item === edit ? { ...item, hidden: false } : item)));
   }
 
   function applyEditTemplate(id: string) {
@@ -1173,6 +1441,20 @@ export function ClipEditor({
             >
               Edit
             </button>
+            {!isMerge ? (
+              <button
+                type="button"
+                aria-pressed={desk === "create"}
+                onClick={() => setDesk("create")}
+                className={cn(
+                  "press text-ui inline-flex h-9 items-center gap-1 rounded-md px-3 font-medium sm:h-7",
+                  desk === "create" ? "bg-panel-2 text-fg" : "text-muted hover:text-fg"
+                )}
+              >
+                <Wand2 className="size-3" aria-hidden="true" />
+                Create
+              </button>
+            ) : null}
             <button
               type="button"
               aria-pressed={desk === "mix"}
@@ -1192,7 +1474,13 @@ export function ClipEditor({
       </header>
 
       {/* ---- body ---- */}
-      <div className="studio-scroll grid min-h-0 flex-1 gap-4 overflow-y-auto p-3 lg:grid-cols-[minmax(0,1fr)_380px] lg:grid-rows-[minmax(0,1fr)] lg:overflow-hidden lg:p-5">
+      <div
+        className={cn(
+          "studio-scroll grid min-h-0 flex-1 gap-4 overflow-y-auto p-3 lg:grid-cols-[minmax(0,1fr)_380px] lg:overflow-hidden lg:p-5",
+          // The create desk adds a full-width timeline row under player and rail.
+          desk === "create" ? "lg:grid-rows-[minmax(0,1fr)_auto]" : "lg:grid-rows-[minmax(0,1fr)]"
+        )}
+      >
         {/* player + transport stay on screen; only the right rail scrolls */}
         <section className="flex h-full min-h-0 min-w-0 flex-col items-center gap-2 overflow-hidden">
           {!sourceReady ? (
@@ -1200,8 +1488,7 @@ export function ClipEditor({
               {sourceFetching ? (
                 <>
                   <p className="text-meta text-warn">
-                    Downloading the source onto this machine so you can trim against
-                    the real video.
+                    Downloading the source onto this machine so you can trim against the real video.
                   </p>
                   <div
                     className="mt-3 h-1.5 overflow-hidden rounded-full bg-black/30"
@@ -1213,7 +1500,9 @@ export function ClipEditor({
                   >
                     <div
                       className="h-full origin-left rounded-full bg-warn transition-transform duration-500 ease-out-quart"
-                      style={{ transform: `scaleX(${Math.max(0.03, fetchPercent / 100)})` }}
+                      style={{
+                        transform: `scaleX(${Math.max(0.03, fetchPercent / 100)})`,
+                      }}
                     />
                   </div>
                   <p className="num mt-2 text-meta font-semibold text-warn">
@@ -1241,373 +1530,457 @@ export function ClipEditor({
             </div>
           ) : null}
           <div className="preview-stage min-h-0 w-full max-lg:h-[min(52dvh,28rem)] lg:flex-1">
-          <div
-            ref={frameRef}
-            className="preview-frame overflow-hidden rounded-xl border border-border bg-black"
-          >
-            <video
-              ref={videoRef}
-              src={videoSource}
-              playsInline
-              preload="metadata"
-              tabIndex={-1}
-              onLoadedMetadata={(event) => {
-                const video = event.currentTarget;
-                if (video.videoWidth && video.videoHeight) {
-                  setSourceSize({ w: video.videoWidth, h: video.videoHeight });
-                }
-                if (mode === "source") seekTo(active.startSec);
-                else setTime(0);
-              }}
-              onSeeked={(event) => {
-                // `seeked` guarantees drawImage sees the requested decoded
-                // frame. Keep this explicit path as well as the frame callback:
-                // some engines throttle callbacks while a paused video is
-                // covered by a canvas.
-                paintPreview(event.currentTarget.currentTime);
-              }}
-              onTimeUpdate={handleTimeUpdate}
-              onPlay={() => setPlaying(true)}
-              onPause={() => {
-                if (handingToOutroRef.current) {
-                  handingToOutroRef.current = false;
-                  return;
-                }
-                if (previewStageRef.current === "outro") return;
-                setPlaying(false);
-              }}
-              className="absolute"
-              style={
-                cropPreview
-                  ? {
-                      // Decoder sits behind the opaque canvas. Keeping it
-                      // paintable (instead of opacity: 0) ensures Chromium
-                      // continues delivering requestVideoFrameCallback events.
-                      inset: 0,
-                      width: "100%",
-                      height: "100%",
-                      pointerEvents: "none",
-                    }
-                  : { inset: 0, width: "100%", height: "100%", objectFit: "contain" }
-              }
-            />
-            {outroPreviewUrl ? (
+            <div ref={frameRef} className="preview-frame overflow-hidden rounded-xl border border-border bg-black">
               <video
-                ref={outroVideoRef}
-                key={outroPreviewUrl}
-                src={outroPreviewUrl}
+                ref={videoRef}
+                src={videoSource}
                 playsInline
-                preload="auto"
-                className={cn(
-                  "absolute inset-0 z-[2] h-full w-full object-cover",
-                  previewStage === "outro" ? "opacity-100" : "pointer-events-none opacity-0",
-                  joinFlash === "fade" && "transition-opacity duration-300"
-                )}
+                preload="metadata"
+                tabIndex={-1}
                 onLoadedMetadata={(event) => {
-                  const duration = event.currentTarget.duration;
-                  if (duration && Number.isFinite(duration)) setOutroDuration(duration);
+                  const video = event.currentTarget;
+                  if (video.videoWidth && video.videoHeight) {
+                    setSourceSize({
+                      w: video.videoWidth,
+                      h: video.videoHeight,
+                    });
+                  }
+                  if (mode === "source") seekTo(active.startSec);
+                  else setTime(0);
                 }}
-                onTimeUpdate={(event) => {
-                  if (previewStageRef.current === "outro") setOutroTime(event.currentTarget.currentTime);
+                onSeeked={(event) => {
+                  // `seeked` guarantees drawImage sees the requested decoded
+                  // frame. Keep this explicit path as well as the frame callback:
+                  // some engines throttle callbacks while a paused video is
+                  // covered by a canvas.
+                  paintPreview(event.currentTarget.currentTime);
                 }}
-                onPlay={() => setPlaying(true)}
+                onTimeUpdate={handleTimeUpdate}
+                onPlay={() => {
+                  setPlaying(true);
+                  void matteRef.current?.play().catch(() => undefined);
+                }}
                 onPause={() => {
-                  if (previewStageRef.current === "outro") setPlaying(false);
-                }}
-                onEnded={() => {
+                  matteRef.current?.pause();
+                  if (handingToOutroRef.current) {
+                    handingToOutroRef.current = false;
+                    return;
+                  }
+                  if (previewStageRef.current === "outro") return;
                   setPlaying(false);
-                  const duration = outroVideoRef.current?.duration;
-                  if (duration && Number.isFinite(duration)) setOutroTime(duration);
                 }}
-              />
-            ) : null}
-            {joinFlash === "white" || joinFlash === "black" ? (
-              <div
-                aria-hidden="true"
-                className="pointer-events-none absolute inset-0 z-[3]"
-                style={{ background: joinFlash === "white" ? "#fff" : "#000" }}
-              />
-            ) : null}
-            {cropPreview ? (
-              <canvas
-                ref={previewCanvasRef}
-                width={Math.max(2, Math.round(frameWidth * (typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1)))}
-                height={Math.max(2, Math.round(frameHeight * (typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1)))}
-                className="absolute inset-0 h-full w-full bg-black will-change-transform"
-                style={picturePreviewStyle}
-              />
-            ) : null}
-            {cropPreview && resolvedEffects.vignette ? (
-              <div
-                aria-hidden="true"
-                className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_center,transparent_52%,rgba(0,0,0,0.32)_100%)]"
-              />
-            ) : null}
-            {positioningCaptions ? (
-              <div
-                aria-hidden="true"
-                className="pointer-events-none absolute border border-dashed border-accent/60"
-                style={{ inset: "8% 14% 18% 8%" }}
-              >
-                <span className="text-micro absolute left-1 top-1 rounded bg-black/70 px-1 text-accent">
-                  platform safe zone
-                </span>
-              </div>
-            ) : null}
-            {showCaptionsInFrame ? (
-              <CaptionOverlay
-                caption={activeCaption}
-                style={style}
-                fontStack={catalogFont?.stack ?? style.fontFamily}
-                fontWeight={catalogFont?.weight ?? 900}
-                frameHeight={frameHeight}
-                frameWidth={frameWidth}
-                positioning={positioningCaptions}
-                onPositionChange={(horizontalFrac, verticalFrac) =>
-                  setOverrides((prev) => ({ ...prev, horizontalFrac, verticalFrac }))
+                className="absolute"
+                style={
+                  cropPreview
+                    ? {
+                        // Decoder sits behind the opaque canvas. Keeping it
+                        // paintable (instead of opacity: 0) ensures Chromium
+                        // continues delivering requestVideoFrameCallback events.
+                        inset: 0,
+                        width: "100%",
+                        height: "100%",
+                        pointerEvents: "none",
+                      }
+                    : {
+                        inset: 0,
+                        width: "100%",
+                        height: "100%",
+                        objectFit: "contain",
+                      }
                 }
               />
-            ) : null}
-            {showCleanup && desk === "cut" && frameWidth > 0 ? (
-              <CleanupLayer
-                regions={cleanup}
-                transform={transform}
-                frameWidth={frameWidth}
-                frameHeight={frameHeight}
-                editable={mode === "source" && fitMode === "crop"}
-                onAdd={addCleanupRegion}
-                onChange={updateCleanupRegion}
-                onRemove={(id) => setCleanup((prev) => prev.filter((r) => r.id !== id))}
-              />
-            ) : null}
-            {cropPreview && cutFlashes > 0 ? (
-              <span className="eyebrow absolute end-2 top-2 rounded-md border border-warn/50 bg-black/70 px-1.5 py-0.5 text-warn">
-                {cutFlashes} cut flash{cutFlashes === 1 ? "" : "es"}
-              </span>
-            ) : cropPreview && track && track.confidence < 0.4 ? (
-              <span className="eyebrow absolute end-2 top-2 rounded-md border border-warn/50 bg-black/70 px-1.5 py-0.5 text-warn">
-                Check framing
-              </span>
-            ) : null}
-            {fitMode === "fit" && mode === "source" ? (
-              // The crop window, drawn on top of the whole source.
-              <div
-                className="pointer-events-none absolute border-2 border-accent-2/80"
-                style={{
-                  left: transform.box.x * transform.scale,
-                  top: transform.box.y * transform.scale,
-                  width: transform.box.width * transform.scale,
-                  height: transform.box.height * transform.scale,
-                }}
-              />
-            ) : null}
-            {mode === "output" && !rendered ? (
-              <div className="absolute inset-0 flex items-center justify-center p-6 text-center">
-                <p className="text-meta text-muted">This clip has not been rendered yet.</p>
-              </div>
-            ) : null}
-            {sourceFetching ? (
-              <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black/75 p-6 text-center">
-                <Loader2 className="size-6 animate-spin text-warn" aria-hidden="true" />
-                <p className="text-meta text-warn">
-                  {fetchPercent > 0 ? `Downloading source · ${fetchPercent}%` : "Starting download…"}
-                </p>
-                <div
-                  className="h-1.5 w-full max-w-[180px] overflow-hidden rounded-full bg-white/10"
-                  role="progressbar"
-                  aria-valuenow={fetchPercent}
-                  aria-valuemin={0}
-                  aria-valuemax={100}
+              {outroPreviewUrl ? (
+                <video
+                  ref={outroVideoRef}
+                  key={outroPreviewUrl}
+                  src={outroPreviewUrl}
+                  playsInline
+                  preload="auto"
+                  className={cn(
+                    "absolute inset-0 z-[2] h-full w-full object-cover",
+                    previewStage === "outro" ? "opacity-100" : "pointer-events-none opacity-0",
+                    joinFlash === "fade" && "transition-opacity duration-300"
+                  )}
+                  onLoadedMetadata={(event) => {
+                    const duration = event.currentTarget.duration;
+                    if (duration && Number.isFinite(duration)) setOutroDuration(duration);
+                  }}
+                  onTimeUpdate={(event) => {
+                    if (previewStageRef.current === "outro") setOutroTime(event.currentTarget.currentTime);
+                  }}
+                  onPlay={() => setPlaying(true)}
+                  onPause={() => {
+                    if (previewStageRef.current === "outro") setPlaying(false);
+                  }}
+                  onEnded={() => {
+                    setPlaying(false);
+                    const duration = outroVideoRef.current?.duration;
+                    if (duration && Number.isFinite(duration)) setOutroTime(duration);
+                  }}
+                />
+              ) : null}
+              {matte ? (
+                <video
+                  ref={matteRef}
+                  key={matte.key}
+                  src={clipMatteUrl(clip.id, matte.key)}
+                  muted
+                  playsInline
+                  preload="auto"
+                  tabIndex={-1}
                   aria-hidden="true"
+                  // A paint that moved the matte's clock drew the previous frame;
+                  // repaint once the sought frame is actually decoded.
+                  onSeeked={() => paintPreview()}
+                  onLoadedData={() => paintPreview()}
+                  className="pointer-events-none absolute h-px w-px opacity-0"
+                />
+              ) : null}
+              {joinFlash === "white" || joinFlash === "black" ? (
+                <div
+                  aria-hidden="true"
+                  className="pointer-events-none absolute inset-0 z-[3]"
+                  style={{
+                    background: joinFlash === "white" ? "#fff" : "#000",
+                  }}
+                />
+              ) : null}
+              {cropPreview ? (
+                <canvas
+                  ref={previewCanvasRef}
+                  width={Math.max(
+                    2,
+                    Math.round(frameWidth * (typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1))
+                  )}
+                  height={Math.max(
+                    2,
+                    Math.round(frameHeight * (typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1))
+                  )}
+                  className="absolute inset-0 h-full w-full bg-black will-change-transform"
+                  style={picturePreviewStyle}
+                />
+              ) : null}
+              {cropPreview && resolvedEffects.vignette ? (
+                <div
+                  aria-hidden="true"
+                  className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_center,transparent_52%,rgba(0,0,0,0.32)_100%)]"
+                />
+              ) : null}
+              {positioningCaptions ? (
+                <div
+                  aria-hidden="true"
+                  className="pointer-events-none absolute border border-dashed border-accent/60"
+                  style={{ inset: "8% 14% 18% 8%" }}
                 >
-                  <div
-                    className="h-full origin-left rounded-full bg-warn transition-transform duration-500 ease-out-quart"
-                    style={{ transform: `scaleX(${Math.max(0.03, fetchPercent / 100)})` }}
-                  />
+                  <span className="text-micro absolute left-1 top-1 rounded bg-black/70 px-1 text-accent">
+                    platform safe zone
+                  </span>
                 </div>
-              </div>
-            ) : null}
-            {analysingFrame && mode === "source" && !sourceFetching ? (
-              <div className="absolute inset-x-0 bottom-0 bg-black/70 px-3 py-2">
-                <p className="text-micro flex items-center justify-center gap-1.5 text-muted">
-                  <Loader2 className="size-3 animate-spin" aria-hidden="true" />
-                  Finding the speaker…
-                </p>
-              </div>
-            ) : null}
-          </div>
+              ) : null}
+              {showCaptionsInFrame ? (
+                <CaptionOverlay
+                  caption={activeCaption}
+                  style={activeCaptionStyle}
+                  fontStack={activeCaptionFont?.stack ?? activeCaptionStyle.fontFamily}
+                  fontWeight={activeCaptionFont?.weight ?? 900}
+                  frameHeight={frameHeight}
+                  frameWidth={frameWidth}
+                  spokenIndex={spokenIndex}
+                  positioning={positioningCaptions}
+                  onPositionChange={(horizontalFrac, verticalFrac) => {
+                    // Dragging a caption inside a scene places that scene's look.
+                    const sceneId = activeCaption?.sceneId;
+                    if (sceneId && creator.enabled) {
+                      setCreator((prev) => ({
+                        ...prev,
+                        captionScenes: (prev.captionScenes ?? []).map((scene) =>
+                          scene.id === sceneId
+                            ? {
+                                ...scene,
+                                overrides: {
+                                  ...scene.overrides,
+                                  horizontalFrac,
+                                  verticalFrac,
+                                },
+                              }
+                            : scene
+                        ),
+                      }));
+                      return;
+                    }
+                    setOverrides((prev) => ({
+                      ...prev,
+                      horizontalFrac,
+                      verticalFrac,
+                    }));
+                  }}
+                />
+              ) : null}
+              {showCleanup && desk === "cut" && frameWidth > 0 ? (
+                <CleanupLayer
+                  regions={cleanup}
+                  transform={transform}
+                  frameWidth={frameWidth}
+                  frameHeight={frameHeight}
+                  editable={mode === "source" && fitMode === "crop"}
+                  onAdd={addCleanupRegion}
+                  onChange={updateCleanupRegion}
+                  onRemove={(id) => setCleanup((prev) => prev.filter((r) => r.id !== id))}
+                />
+              ) : null}
+              {cropPreview && cutFlashes > 0 ? (
+                <span className="eyebrow absolute end-2 top-2 rounded-md border border-warn/50 bg-black/70 px-1.5 py-0.5 text-warn">
+                  {cutFlashes} cut flash{cutFlashes === 1 ? "" : "es"}
+                </span>
+              ) : cropPreview && track && track.confidence < 0.4 ? (
+                <span className="eyebrow absolute end-2 top-2 rounded-md border border-warn/50 bg-black/70 px-1.5 py-0.5 text-warn">
+                  Check framing
+                </span>
+              ) : null}
+              {fitMode === "fit" && mode === "source" ? (
+                // The crop window, drawn on top of the whole source.
+                <div
+                  className="pointer-events-none absolute border-2 border-accent-2/80"
+                  style={{
+                    left: transform.box.x * transform.scale,
+                    top: transform.box.y * transform.scale,
+                    width: transform.box.width * transform.scale,
+                    height: transform.box.height * transform.scale,
+                  }}
+                />
+              ) : null}
+              {mode === "output" && !rendered ? (
+                <div className="absolute inset-0 flex items-center justify-center p-6 text-center">
+                  <p className="text-meta text-muted">This clip has not been rendered yet.</p>
+                </div>
+              ) : null}
+              {sourceFetching ? (
+                <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black/75 p-6 text-center">
+                  <Loader2 className="size-6 animate-spin text-warn" aria-hidden="true" />
+                  <p className="text-meta text-warn">
+                    {fetchPercent > 0 ? `Downloading source · ${fetchPercent}%` : "Starting download…"}
+                  </p>
+                  <div
+                    className="h-1.5 w-full max-w-[180px] overflow-hidden rounded-full bg-white/10"
+                    role="progressbar"
+                    aria-valuenow={fetchPercent}
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-hidden="true"
+                  >
+                    <div
+                      className="h-full origin-left rounded-full bg-warn transition-transform duration-500 ease-out-quart"
+                      style={{
+                        transform: `scaleX(${Math.max(0.03, fetchPercent / 100)})`,
+                      }}
+                    />
+                  </div>
+                </div>
+              ) : null}
+              {matteNote && desk === "create" && mode === "source" ? (
+                <div className="absolute inset-x-0 top-0 bg-black/60 px-3 py-1.5">
+                  <p className="text-micro text-center text-muted">{matteNote}</p>
+                </div>
+              ) : null}
+              {analysingFrame && mode === "source" && !sourceFetching ? (
+                <div className="absolute inset-x-0 bottom-0 bg-black/70 px-3 py-2">
+                  <p className="text-micro flex items-center justify-center gap-1.5 text-muted">
+                    <Loader2 className="size-3 animate-spin" aria-hidden="true" />
+                    Finding the speaker…
+                  </p>
+                </div>
+              ) : null}
+            </div>
           </div>
 
           {/* Framing: the crop is what renders, "fit" reveals what it cuts off. */}
           <div className="flex w-full max-w-[340px] shrink-0 flex-col items-center gap-2">
-          {mode === "source" ? (
-            <div className="flex w-full gap-2">
-              <SegmentedButton
-                active={fitMode === "crop"}
-                onClick={() => setFitMode("crop")}
-                label="9:16 crop"
-              />
-              <SegmentedButton
-                active={fitMode === "fit"}
-                onClick={() => setFitMode("fit")}
-                label="Fit source"
-              />
-            </div>
-          ) : null}
-
-          {/* transport */}
-          <div className="flex w-full max-w-[340px] items-center justify-center gap-2">
-            {isMerge ? (
-              <button
-                type="button"
-                disabled={safeIndex === 0}
-                onClick={() => selectSegment(safeIndex - 1)}
-                className="press inline-flex size-11 items-center justify-center rounded-lg border border-control text-muted hover:border-accent disabled:opacity-40"
-                aria-label="Previous segment"
-              >
-                <ArrowLeft className="size-4" aria-hidden="true" />
-              </button>
-            ) : null}
-            <button
-              type="button"
-              onClick={togglePlay}
-              className="press inline-flex size-12 items-center justify-center rounded-full bg-accent text-accent-fg hover:opacity-90"
-              aria-label={playing ? "Pause preview" : outroPlaythrough ? "Play clip and sting" : "Play window"}
-            >
-              {playing ? (
-                <Pause className="size-5" aria-hidden="true" />
-              ) : (
-                <Play className="size-5" aria-hidden="true" />
-              )}
-            </button>
-            {isMerge ? (
-              <button
-                type="button"
-                disabled={safeIndex >= previewSegments.length - 1}
-                onClick={() => selectSegment(safeIndex + 1)}
-                className="press inline-flex size-11 items-center justify-center rounded-lg border border-control text-muted hover:border-accent disabled:opacity-40"
-                aria-label="Next segment"
-              >
-                <ArrowRight className="size-4" aria-hidden="true" />
-              </button>
-            ) : null}
-            {desk === "cut" ? (
-              <>
-            <button
-              type="button"
-              onClick={markIn}
-              className="press text-ui h-9 rounded-lg border border-control px-3 font-medium hover:border-accent"
-            >
-              Mark in
-            </button>
-            <button
-              type="button"
-              onClick={markOut}
-              className="press text-ui h-9 rounded-lg border border-control px-3 font-medium hover:border-accent"
-            >
-              Mark out
-            </button>
-              </>
-            ) : null}
-          </div>
-
-          {desk === "cut" ? (
-          <div className="grid w-full max-w-[340px] grid-cols-2 gap-2">
-            <button
-              type="button"
-              disabled={trimPast.length === 0}
-              onClick={undoTrimAction}
-              className="press text-ui inline-flex h-10 items-center justify-center gap-1.5 rounded-lg border border-control px-2 font-medium text-muted hover:border-accent disabled:opacity-35"
-              aria-label={trimPast.length > 0 ? `Undo ${trimPast[trimPast.length - 1]?.label}` : "Undo trim mark"}
-            >
-              <Undo2 className="size-3.5" aria-hidden="true" />
-              {trimPast.length > 0 ? `Undo ${trimPast[trimPast.length - 1]?.label}` : "Undo mark"}
-            </button>
-            <button
-              type="button"
-              disabled={trimFuture.length === 0}
-              onClick={redoTrimAction}
-              className="press text-ui inline-flex h-10 items-center justify-center gap-1.5 rounded-lg border border-control px-2 font-medium text-muted hover:border-accent disabled:opacity-35"
-              aria-label={trimFuture.length > 0 ? `Redo ${trimFuture[trimFuture.length - 1]?.label}` : "Redo trim mark"}
-            >
-              <Redo2 className="size-3.5" aria-hidden="true" />
-              {trimFuture.length > 0 ? `Redo ${trimFuture[trimFuture.length - 1]?.label}` : "Redo mark"}
-            </button>
-          </div>
-          ) : null}
-
-          <p className="num text-meta text-muted">
-            {previewStage === "outro"
-              ? `sting ${timecode(outroTime)} · ${outroDur.toFixed(1)}s after the window`
-              : `source ${timecode(time)} · window ${timecode(active.startSec)}–${timecode(active.endSec)} · ${(active.endSec - active.startSec).toFixed(1)}s`}
-            {isMerge && previewStage !== "outro" ? ` · part ${safeIndex + 1}/${previewSegments.length}` : ""}
-          </p>
-
-          {/* playhead: clip window, or clip + sting on the mix desk */}
-          <input
-            type="range"
-            min={outroPlaythrough ? 0 : active.startSec}
-            max={outroPlaythrough ? playthroughDur : Math.max(active.startSec + 0.1, active.endSec)}
-            step={0.05}
-            value={
-              outroPlaythrough
-                ? Math.min(playthroughDur, Math.max(0, playheadLocal))
-                : Math.min(Math.max(time, active.startSec), active.endSec)
-            }
-            onChange={(event) => {
-              const next = Number(event.target.value);
-              if (outroPlaythrough) seekPlaythrough(next);
-              else seekTo(next);
-            }}
-            aria-label={outroPlaythrough ? "Playhead through clip and sting" : "Playhead"}
-            className="accent-accent h-8 w-full"
-          />
-          {desk === "mix" ? (
-            <MixTimeline
-              soundtrack={soundtrack}
-              localTime={playheadLocal}
-              durationSec={clipWindowDur}
-              outroSec={outroPlaythrough ? outroDur : 0}
-              onSeekLocal={seekPlaythrough}
-            />
-          ) : null}
-
-          {wordsError ? (
-            <p className="text-meta text-warn">
-              Caption preview unavailable ({wordsError}). Rendering still uses the stored timings.
-            </p>
-          ) : null}
-
-          {/* render status */}
-          {clip.status === "rendering" ? (
-            <div className="w-full max-w-[340px] rounded-lg border border-border bg-panel p-2">
-              <p className="text-meta flex items-center gap-2 text-muted">
-                <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />
-                Rendering {renderProgress}%
-              </p>
-              <div className="mt-1 h-1 overflow-hidden rounded-full bg-panel-2">
-                <div className="score-fill h-full" style={{ width: `${renderProgress}%` }} />
+            {mode === "source" ? (
+              <div className="flex w-full gap-2">
+                <SegmentedButton active={fitMode === "crop"} onClick={() => setFitMode("crop")} label="9:16 crop" />
+                <SegmentedButton active={fitMode === "fit"} onClick={() => setFitMode("fit")} label="Fit source" />
               </div>
+            ) : null}
+
+            {/* transport */}
+            <div className="flex w-full max-w-[340px] items-center justify-center gap-2">
+              {isMerge ? (
+                <button
+                  type="button"
+                  disabled={safeIndex === 0}
+                  onClick={() => selectSegment(safeIndex - 1)}
+                  className="press inline-flex size-11 items-center justify-center rounded-lg border border-control text-muted hover:border-accent disabled:opacity-40"
+                  aria-label="Previous segment"
+                >
+                  <ArrowLeft className="size-4" aria-hidden="true" />
+                </button>
+              ) : null}
+              <button
+                type="button"
+                onClick={togglePlay}
+                className="press inline-flex size-12 items-center justify-center rounded-full bg-accent text-accent-fg hover:opacity-90"
+                aria-label={playing ? "Pause preview" : outroPlaythrough ? "Play clip and sting" : "Play window"}
+              >
+                {playing ? (
+                  <Pause className="size-5" aria-hidden="true" />
+                ) : (
+                  <Play className="size-5" aria-hidden="true" />
+                )}
+              </button>
+              {isMerge ? (
+                <button
+                  type="button"
+                  disabled={safeIndex >= previewSegments.length - 1}
+                  onClick={() => selectSegment(safeIndex + 1)}
+                  className="press inline-flex size-11 items-center justify-center rounded-lg border border-control text-muted hover:border-accent disabled:opacity-40"
+                  aria-label="Next segment"
+                >
+                  <ArrowRight className="size-4" aria-hidden="true" />
+                </button>
+              ) : null}
+              {desk === "cut" ? (
+                <>
+                  <button
+                    type="button"
+                    onClick={markIn}
+                    className="press text-ui h-9 rounded-lg border border-control px-3 font-medium hover:border-accent"
+                  >
+                    Mark in
+                  </button>
+                  <button
+                    type="button"
+                    onClick={markOut}
+                    className="press text-ui h-9 rounded-lg border border-control px-3 font-medium hover:border-accent"
+                  >
+                    Mark out
+                  </button>
+                </>
+              ) : null}
             </div>
-          ) : null}
-          {clip.renderError ? (
-            <p className="text-meta w-full rounded-md bg-bad/10 px-2 py-1 text-bad">
-              {clip.renderError}
+
+            {desk === "cut" ? (
+              <div className="grid w-full max-w-[340px] grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  disabled={trimPast.length === 0}
+                  onClick={undoTrimAction}
+                  className="press text-ui inline-flex h-10 items-center justify-center gap-1.5 rounded-lg border border-control px-2 font-medium text-muted hover:border-accent disabled:opacity-35"
+                  aria-label={trimPast.length > 0 ? `Undo ${trimPast[trimPast.length - 1]?.label}` : "Undo trim mark"}
+                >
+                  <Undo2 className="size-3.5" aria-hidden="true" />
+                  {trimPast.length > 0 ? `Undo ${trimPast[trimPast.length - 1]?.label}` : "Undo mark"}
+                </button>
+                <button
+                  type="button"
+                  disabled={trimFuture.length === 0}
+                  onClick={redoTrimAction}
+                  className="press text-ui inline-flex h-10 items-center justify-center gap-1.5 rounded-lg border border-control px-2 font-medium text-muted hover:border-accent disabled:opacity-35"
+                  aria-label={
+                    trimFuture.length > 0 ? `Redo ${trimFuture[trimFuture.length - 1]?.label}` : "Redo trim mark"
+                  }
+                >
+                  <Redo2 className="size-3.5" aria-hidden="true" />
+                  {trimFuture.length > 0 ? `Redo ${trimFuture[trimFuture.length - 1]?.label}` : "Redo mark"}
+                </button>
+              </div>
+            ) : null}
+
+            <p className="num text-meta text-muted">
+              {previewStage === "outro"
+                ? `sting ${timecode(outroTime)} · ${outroDur.toFixed(1)}s after the window`
+                : `source ${timecode(time)} · window ${timecode(active.startSec)}–${timecode(active.endSec)} · ${(active.endSec - active.startSec).toFixed(1)}s${
+                    creator.enabled && creatorWindows.length > 1 ? ` → ${creatorOutputSec.toFixed(1)}s cut` : ""
+                  }`}
+              {isMerge && previewStage !== "outro" ? ` · part ${safeIndex + 1}/${previewSegments.length}` : ""}
             </p>
-          ) : null}
+
+            {/* playhead: clip window, or clip + sting on the mix desk */}
+            <input
+              type="range"
+              min={outroPlaythrough ? 0 : active.startSec}
+              max={outroPlaythrough ? playthroughDur : Math.max(active.startSec + 0.1, active.endSec)}
+              step={0.05}
+              value={
+                outroPlaythrough
+                  ? Math.min(playthroughDur, Math.max(0, playheadLocal))
+                  : Math.min(Math.max(time, active.startSec), active.endSec)
+              }
+              onChange={(event) => {
+                const next = Number(event.target.value);
+                if (outroPlaythrough) seekPlaythrough(next);
+                else seekTo(next);
+              }}
+              aria-label={outroPlaythrough ? "Playhead through clip and sting" : "Playhead"}
+              className="accent-accent h-8 w-full"
+            />
+            {desk === "mix" ? (
+              <MixTimeline
+                soundtrack={soundtrack}
+                localTime={playheadLocal}
+                durationSec={clipWindowDur}
+                outroSec={outroPlaythrough ? outroDur : 0}
+                onSeekLocal={seekPlaythrough}
+              />
+            ) : null}
+            {wordsError ? (
+              <p className="text-meta text-warn">
+                Caption preview unavailable ({wordsError}). Rendering still uses the stored timings.
+              </p>
+            ) : null}
+
+            {/* render status */}
+            {clip.status === "rendering" ? (
+              <div className="w-full max-w-[340px] rounded-lg border border-border bg-panel p-2">
+                <p className="text-meta flex items-center gap-2 text-muted">
+                  <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />
+                  Rendering {renderProgress}%
+                </p>
+                <div className="mt-1 h-1 overflow-hidden rounded-full bg-panel-2">
+                  <div className="score-fill h-full" style={{ width: `${renderProgress}%` }} />
+                </div>
+              </div>
+            ) : null}
+            {clip.renderError ? (
+              <p className="text-meta w-full rounded-md bg-bad/10 px-2 py-1 text-bad">{clip.renderError}</p>
+            ) : null}
           </div>
         </section>
+
+        {/* the beat timeline: a full-width row under player and rail on desktop */}
+        {desk === "create" ? (
+          <div className="min-w-0 lg:order-last lg:col-span-2">
+            <BeatTimeline
+              trimStart={trimStart}
+              trimEnd={trimEnd}
+              plan={creator}
+              windows={creatorWindows}
+              sfx={soundtrack.sfx ?? []}
+              sfxLabels={sfxLabelMap}
+              sfxAssets={sfxAssets}
+              sceneCuts={sceneCuts}
+              peakSec={clip.peakSec}
+              playhead={time}
+              selected={beatSelection}
+              onSelect={setBeatSelection}
+              onSeek={(sourceSec) => {
+                videoRef.current?.pause();
+                seekTo(sourceSec);
+              }}
+              onSpanChange={updateBeatSpan}
+              onAdd={(lane) => addBeatAtPlayhead(lane)}
+              onAddSfx={(assetId) => addBeatAtPlayhead("sfx", assetId)}
+              onRemove={removeBeatById}
+              dimmed={!creator.enabled}
+            />
+          </div>
+        ) : null}
 
         {/* controls — the only pane the right scrollbar should move */}
         <section className="studio-scroll flex min-w-0 flex-col gap-4 lg:min-h-0 lg:overflow-y-auto lg:overscroll-contain">
           {/* source / output */}
           <Panel title="Preview" icon={SlidersHorizontal}>
             <div className="flex gap-2">
-              <SegmentedButton
-                active={mode === "source"}
-                onClick={() => setMode("source")}
-                label="Source"
-              />
+              <SegmentedButton active={mode === "source"} onClick={() => setMode("source")} label="Source" />
               <SegmentedButton
                 active={mode === "output"}
                 onClick={() => setMode("output")}
@@ -1623,7 +1996,30 @@ export function ClipEditor({
             ) : null}
           </Panel>
 
-          {desk === "mix" ? (
+          {desk === "create" ? (
+            <CreatorDesk
+              clipId={clip.id}
+              plan={creator}
+              onChange={setCreator}
+              soundtrack={soundtrack}
+              onSoundtrackChange={setSoundtrack}
+              trimStart={trimStart}
+              trimEnd={trimEnd}
+              windows={creatorWindows}
+              peakSec={clip.peakSec}
+              sourceReady={sourceReady}
+              styles={styles}
+              fonts={fontChoices}
+              videoEffects={resolvedEffects}
+              selected={beatSelection}
+              onSelect={setBeatSelection}
+              hasFaceTrack={Boolean(track?.keyframes.some((keyframe) => keyframe.fx != null))}
+              headTravel={travel}
+              audioLibrary={audioLibrary}
+              onUploadAudio={uploadAudio}
+              onDirect={directClip}
+            />
+          ) : desk === "mix" ? (
             <>
               <MixPanel
                 projectId={project.id}
@@ -1632,9 +2028,7 @@ export function ClipEditor({
                 localTime={playheadLocal}
                 durationSec={outroPlaythrough ? playthroughDur : clipWindowDur}
                 outroSec={outroPlaythrough ? outroDur : 0}
-                playing={playing}
                 live={mode === "source"}
-                videoRef={videoRef}
               />
               <OutroAttachCard
                 items={projectOutros}
@@ -1646,657 +2040,695 @@ export function ClipEditor({
             </>
           ) : (
             <>
-          {/* window */}
-          <Panel title={isMerge ? "Segments" : "Trim"} icon={Scissors}>
-            {isMerge ? (
-              <SegmentList
-                segments={segments}
-                activeIndex={safeIndex}
-                maxDuration={sourceDuration}
-                onSelect={selectSegment}
-                onChange={updateSegment}
-                onMove={moveSegment}
-                onRemove={removeSegment}
-              />
-            ) : (
-              <WindowSliders
-                sourceDuration={sourceDuration}
-                startSec={trimStart}
-                endSec={trimEnd}
-                markers={sceneCuts}
-                onStart={(value) => {
-                  clearTrimHistory();
-                  setTrimStart(Math.min(value, trimEnd - 0.2));
-                }}
-                onEnd={(value) => {
-                  clearTrimHistory();
-                  setTrimEnd(Math.max(value, trimStart + 0.2));
-                }}
-              />
-            )}
-          </Panel>
-
-          {/* framing */}
-          <Panel title="Viral edit" icon={Sparkles}>
-            <label className="block">
-              <span className="eyebrow text-muted">Overall video template</span>
-              <select
-                value={editTemplateId}
-                onChange={(event) => applyEditTemplate(event.target.value)}
-                className="text-ui mt-1 h-11 w-full rounded-lg border border-control bg-panel-2 px-2 outline-none focus:border-accent"
-              >
-                <option value="custom">Custom settings</option>
-                {SHORT_FORM_TEMPLATES.map((template) => (
-                  <option key={template.id} value={template.id}>
-                    {template.label} — {template.summary}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            {editTemplateId !== "custom" ? (
-              <div className="mt-2 flex flex-wrap gap-1.5">
-                {SHORT_FORM_TEMPLATES.find((item) => item.id === editTemplateId)?.techniques.map((technique) => (
-                  <span key={technique} className="text-micro rounded-full border border-border bg-panel-2 px-2 py-1 text-muted">
-                    {technique}
-                  </span>
-                ))}
-              </div>
-            ) : null}
-
-            <details className="mt-2 rounded-lg border border-border bg-panel-2/40">
-              <summary className="text-ui cursor-pointer px-3 py-2 font-semibold text-muted">
-                Fine-tune picture & sound
-              </summary>
-              <div className="border-t border-border px-3 pb-3">
-                <label className="mt-3 block">
-                  <span className="eyebrow text-muted">Colour treatment</span>
-                  <select
-                    value={resolvedEffects.grade}
-                    onChange={(event) => updateVideoEffects({ grade: event.target.value as VideoEffects["grade"] })}
-                    className="text-ui mt-1 h-10 w-full rounded-lg border border-control bg-panel px-2 outline-none focus:border-accent"
-                  >
-                    <option value="natural">Natural</option>
-                    <option value="vibrant">Vibrant</option>
-                    <option value="warm">Warm</option>
-                    <option value="cool">Cool / authority</option>
-                    <option value="cinematic">Cinematic</option>
-                  </select>
-                </label>
-                <label className="mt-3 block">
-                  <span className="eyebrow text-muted">Motion emphasis</span>
-                  <select
-                    value={resolvedEffects.motion}
-                    onChange={(event) => updateVideoEffects({ motion: event.target.value as VideoEffects["motion"] })}
-                    className="text-ui mt-1 h-10 w-full rounded-lg border border-control bg-panel px-2 outline-none focus:border-accent"
-                  >
-                    <option value="none">None</option>
-                    <option value="hook_push">Smooth opening push-in</option>
-                    <option value="peak_punch">Punch-in at strongest moment</option>
-                  </select>
-                </label>
-                <Slider
-                  label="Punch-in strength"
-                  value={resolvedEffects.zoom}
-                  min={1}
-                  max={1.12}
-                  step={0.005}
-                  format={(value) => `${Math.round((value - 1) * 100)}%`}
-                  onChange={(zoom) => updateVideoEffects({ zoom })}
-                />
-                <Slider
-                  label="Sharpness"
-                  value={resolvedEffects.sharpen}
-                  min={0}
-                  max={1}
-                  step={0.05}
-                  format={(value) => `${Math.round(value * 100)}%`}
-                  onChange={(sharpen) => updateVideoEffects({ sharpen })}
-                />
-                <label className="mt-3 flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    checked={resolvedEffects.vignette}
-                    onChange={(event) => updateVideoEffects({ vignette: event.target.checked })}
-                    className="size-4 accent-accent"
+              {/* window */}
+              <Panel title={isMerge ? "Segments" : "Trim"} icon={Scissors}>
+                {isMerge ? (
+                  <SegmentList
+                    segments={segments}
+                    activeIndex={safeIndex}
+                    maxDuration={sourceDuration}
+                    onSelect={selectSegment}
+                    onChange={updateSegment}
+                    onMove={moveSegment}
+                    onRemove={removeSegment}
                   />
-                  <span className="text-ui text-muted">Subtle edge focus</span>
-                </label>
-                <label className="mt-3 block">
-                  <span className="eyebrow text-muted">Audio treatment</span>
-                  <select
-                    value={resolvedEffects.audio}
-                    onChange={(event) => updateVideoEffects({ audio: event.target.value as VideoEffects["audio"] })}
-                    className="text-ui mt-1 h-10 w-full rounded-lg border border-control bg-panel px-2 outline-none focus:border-accent"
-                  >
-                    <option value="natural">Natural</option>
-                    <option value="voice">Voice clarity</option>
-                    <option value="loud">High-energy loudness</option>
-                  </select>
-                </label>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setEditTemplateId("custom");
-                    setVideoEffects({ ...DEFAULT_VIDEO_EFFECTS });
-                  }}
-                  className="press text-ui mt-3 rounded-lg border border-control px-2 py-1 font-medium text-muted hover:border-accent"
-                >
-                  Reset video treatment
-                </button>
-              </div>
-            </details>
-          </Panel>
-
-          {/* framing */}
-          <Panel title="Framing" icon={Sparkles}>
-            <div className="flex gap-2">
-              <SegmentedButton
-                active={reframeMode === "smart"}
-                onClick={() => {
-                  setReframeMode("smart");
-                  setEditTemplateId("custom");
-                }}
-                label="Smart reframe"
-              />
-              <SegmentedButton
-                active={reframeMode === "center"}
-                onClick={() => {
-                  setReframeMode("center");
-                  setEditTemplateId("custom");
-                }}
-                label="Centre crop"
-              />
-            </div>
-            {reframeMode === "smart" && !isMerge ? (
-              <CutCheckPanel
-                track={track}
-                trimStart={trimStart}
-                trimEnd={trimEnd}
-                sourceWidth={sourceSize.w}
-                sourceHeight={sourceSize.h}
-                analysing={analysingFrame}
-                onJump={(sourceSec) => {
-                  videoRef.current?.pause();
-                  seekTo(sourceSec);
-                }}
-              />
-            ) : null}
-          </Panel>
-
-          {/* captions */}
-          <Panel title="Subtitles" icon={SlidersHorizontal}>
-            <div className="flex flex-wrap items-center gap-2">
-              <SegmentedButton
-                active={captionsOn}
-                onClick={() => setCaptionsOn(true)}
-                label="On"
-              />
-              <SegmentedButton
-                active={!captionsOn}
-                onClick={() => setCaptionsOn(false)}
-                label="Off"
-              />
-            </div>
-
-            <p className="eyebrow mt-3 text-muted">Peak line</p>
-            <div className="mt-1 flex gap-2">
-              <SegmentedButton
-                active={overrides.peakEmphasis !== false}
-                onClick={() => setOverrides((prev) => ({ ...prev, peakEmphasis: true }))}
-                label="Highlight"
-              />
-              <SegmentedButton
-                active={overrides.peakEmphasis === false}
-                onClick={() => setOverrides((prev) => ({ ...prev, peakEmphasis: false }))}
-                label="Match others"
-              />
-            </div>
-
-            <label className="mt-3 block">
-              <span className="eyebrow text-muted">Caption style</span>
-              <select
-                value={styleId}
-                onChange={(event) => {
-                  setStyleId(event.target.value);
-                  setCaptionsOn(true);
-                  setEditTemplateId("custom");
-                  // A preset is a complete look, so picking one clears the
-                  // per-caption tweaks rather than mixing two caption designs.
-                  // Peak highlight is independent of the look, so it is kept.
-                  setOverrides((prev) =>
-                    prev.peakEmphasis === false ? { peakEmphasis: false } : {}
-                  );
-                }}
-                className="text-ui mt-1 h-11 w-full rounded-lg border border-control bg-panel-2 px-2 outline-none focus:border-accent"
-              >
-                {styles.map((option) => (
-                  <option key={option.id} value={option.id}>
-                    {option.label} — {option.summary}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            <button
-              type="button"
-              disabled={cleaningCaptions}
-              onClick={() => void cleanCaptions()}
-              className="press text-ui mt-2 inline-flex h-10 w-full items-center justify-center gap-1.5 rounded-lg border border-control px-2 font-semibold text-muted hover:border-accent disabled:opacity-50"
-            >
-              {cleaningCaptions ? (
-                <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />
-              ) : (
-                <Sparkles className="size-3.5" aria-hidden="true" />
-              )}
-              {cleaningCaptions ? "Cleaning captions…" : "Clean captions"}
-            </button>
-            {cleanNote ? <p className="text-meta mt-1 text-muted">{cleanNote}</p> : null}
-
-            <div className="mt-2 grid grid-cols-2 gap-2">
-              <button
-                type="button"
-                aria-pressed={positioningCaptions}
-                onClick={() => {
-                  setPositioningCaptions((value) => !value);
-                  setShowCleanup(false);
-                }}
-                className={cn(
-                  "press text-ui h-10 rounded-lg border px-2 font-semibold",
-                  positioningCaptions
-                    ? "border-accent bg-accent/10 text-accent"
-                    : "border-control text-muted hover:border-accent"
-                )}
-              >
-                {positioningCaptions ? "Drag subtitle now" : "Place on video"}
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setCaptionTextOverrides([]);
-                  setCaptionWordOverrides([]);
-                }}
-                disabled={captionTextOverrides.length === 0 && captionWordOverrides.length === 0}
-                className="press text-ui h-10 rounded-lg border border-control px-2 font-medium text-muted hover:border-accent disabled:opacity-40"
-              >
-                  Reset transcript ({captionTextOverrides.length + captionWordOverrides.length})
-              </button>
-            </div>
-
-            <details className="mt-2 rounded-lg border border-border bg-panel-2/40">
-              <summary className="text-ui cursor-pointer px-3 py-2 font-semibold text-muted">
-                Position & appearance
-              </summary>
-              <div className="border-t border-border px-3 pb-3">
-                <Slider
-                  label="Horizontal"
-                  value={style.horizontalFrac}
-                  min={0.05}
-                  max={0.95}
-                  step={0.005}
-                  format={(value) => `${Math.round(value * 100)}%`}
-                  onChange={(value) => setOverrides((prev) => ({ ...prev, horizontalFrac: value }))}
-                />
-                <Slider
-                  label="Vertical"
-                  value={style.verticalFrac}
-                  min={0.05}
-                  max={0.95}
-                  step={0.005}
-                  format={(value) => `${Math.round(value * 100)}% up`}
-                  onChange={(value) => setOverrides((prev) => ({ ...prev, verticalFrac: value }))}
-                />
-                <Slider
-                  label="Words per caption"
-                  value={style.chunkWords}
-                  min={1}
-                  max={8}
-                  step={1}
-                  format={(value) => String(value)}
-                  onChange={(value) => setOverrides((prev) => ({ ...prev, chunkWords: value }))}
-                />
-                <p className="text-meta mt-1 text-muted">Groups the transcript. Edits stay on the words.</p>
-                <Slider
-                  label="Size"
-                  value={style.sizeScale}
-                  min={0.6}
-                  max={2}
-                  step={0.05}
-                  format={(value) => `${Math.round(value * 100)}%`}
-                  onChange={(value) => setOverrides((prev) => ({ ...prev, sizeScale: value }))}
-                />
-                <label className="mt-3 block">
-                  <span className="eyebrow text-muted">Font</span>
-                  <select
-                    value={style.fontFamily}
-                    onChange={(event) => {
-                      setOverrides((prev) => ({ ...prev, fontFamily: event.target.value }));
-                      setEditTemplateId("custom");
+                ) : (
+                  <WindowSliders
+                    sourceDuration={sourceDuration}
+                    startSec={trimStart}
+                    endSec={trimEnd}
+                    markers={sceneCuts}
+                    onStart={(value) => {
+                      clearTrimHistory();
+                      setTrimStart(Math.min(value, trimEnd - 0.2));
                     }}
+                    onEnd={(value) => {
+                      clearTrimHistory();
+                      setTrimEnd(Math.max(value, trimStart + 0.2));
+                    }}
+                  />
+                )}
+              </Panel>
+
+              {/* framing */}
+              <Panel title="Viral edit" icon={Sparkles}>
+                <label className="block">
+                  <span className="eyebrow text-muted">Overall video template</span>
+                  <select
+                    value={editTemplateId}
+                    onChange={(event) => applyEditTemplate(event.target.value)}
                     className="text-ui mt-1 h-11 w-full rounded-lg border border-control bg-panel-2 px-2 outline-none focus:border-accent"
-                    style={{ fontFamily: catalogFont?.stack ?? style.fontFamily }}
                   >
-                    {fontChoices.map((font) => (
-                      <option key={font.id} value={font.family} style={{ fontFamily: font.stack }}>
-                        {font.label}
+                    <option value="custom">Custom settings</option>
+                    {SHORT_FORM_TEMPLATES.map((template) => (
+                      <option key={template.id} value={template.id}>
+                        {template.label} — {template.summary}
                       </option>
                     ))}
                   </select>
                 </label>
-                <div className="mt-3 flex flex-wrap items-center gap-3">
-                  <ColorControl
-                    label="Text"
-                    value={style.textColor}
-                    onChange={(textColor) => setOverrides((prev) => ({ ...prev, textColor }))}
+
+                {editTemplateId !== "custom" ? (
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    {SHORT_FORM_TEMPLATES.find((item) => item.id === editTemplateId)?.techniques.map((technique) => (
+                      <span
+                        key={technique}
+                        className="text-micro rounded-full border border-border bg-panel-2 px-2 py-1 text-muted"
+                      >
+                        {technique}
+                      </span>
+                    ))}
+                  </div>
+                ) : null}
+
+                <details className="mt-2 rounded-lg border border-border bg-panel-2/40">
+                  <summary className="text-ui cursor-pointer px-3 py-2 font-semibold text-muted">
+                    Fine-tune picture & sound
+                  </summary>
+                  <div className="border-t border-border px-3 pb-3">
+                    <label className="mt-3 block">
+                      <span className="eyebrow text-muted">Colour treatment</span>
+                      <select
+                        value={resolvedEffects.grade}
+                        onChange={(event) =>
+                          updateVideoEffects({
+                            grade: event.target.value as VideoEffects["grade"],
+                          })
+                        }
+                        className="text-ui mt-1 h-10 w-full rounded-lg border border-control bg-panel px-2 outline-none focus:border-accent"
+                      >
+                        <option value="natural">Natural</option>
+                        <option value="vibrant">Vibrant</option>
+                        <option value="warm">Warm</option>
+                        <option value="cool">Cool / authority</option>
+                        <option value="cinematic">Cinematic</option>
+                      </select>
+                    </label>
+                    <label className="mt-3 block">
+                      <span className="eyebrow text-muted">Motion emphasis</span>
+                      <select
+                        value={resolvedEffects.motion}
+                        onChange={(event) =>
+                          updateVideoEffects({
+                            motion: event.target.value as VideoEffects["motion"],
+                          })
+                        }
+                        className="text-ui mt-1 h-10 w-full rounded-lg border border-control bg-panel px-2 outline-none focus:border-accent"
+                      >
+                        <option value="none">None</option>
+                        <option value="hook_push">Smooth opening push-in</option>
+                        <option value="peak_punch">Punch-in at strongest moment</option>
+                      </select>
+                    </label>
+                    <Slider
+                      label="Punch-in strength"
+                      value={resolvedEffects.zoom}
+                      min={1}
+                      max={1.12}
+                      step={0.005}
+                      format={(value) => `${Math.round((value - 1) * 100)}%`}
+                      onChange={(zoom) => updateVideoEffects({ zoom })}
+                    />
+                    <Slider
+                      label="Sharpness"
+                      value={resolvedEffects.sharpen}
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      format={(value) => `${Math.round(value * 100)}%`}
+                      onChange={(sharpen) => updateVideoEffects({ sharpen })}
+                    />
+                    <label className="mt-3 flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={resolvedEffects.vignette}
+                        onChange={(event) => updateVideoEffects({ vignette: event.target.checked })}
+                        className="size-4 accent-accent"
+                      />
+                      <span className="text-ui text-muted">Subtle edge focus</span>
+                    </label>
+                    <label className="mt-3 block">
+                      <span className="eyebrow text-muted">Audio treatment</span>
+                      <select
+                        value={resolvedEffects.audio}
+                        onChange={(event) =>
+                          updateVideoEffects({
+                            audio: event.target.value as VideoEffects["audio"],
+                          })
+                        }
+                        className="text-ui mt-1 h-10 w-full rounded-lg border border-control bg-panel px-2 outline-none focus:border-accent"
+                      >
+                        <option value="natural">Natural</option>
+                        <option value="voice">Voice clarity</option>
+                        <option value="loud">High-energy loudness</option>
+                      </select>
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setEditTemplateId("custom");
+                        setVideoEffects({ ...DEFAULT_VIDEO_EFFECTS });
+                      }}
+                      className="press text-ui mt-3 rounded-lg border border-control px-2 py-1 font-medium text-muted hover:border-accent"
+                    >
+                      Reset video treatment
+                    </button>
+                  </div>
+                </details>
+              </Panel>
+
+              {/* framing */}
+              <Panel title="Framing" icon={Sparkles}>
+                <div className="flex gap-2">
+                  <SegmentedButton
+                    active={reframeMode === "smart"}
+                    onClick={() => {
+                      setReframeMode("smart");
+                      setEditTemplateId("custom");
+                    }}
+                    label="Smart reframe"
                   />
-                  {overrides.peakEmphasis !== false ? (
-                    <ColorControl
-                      label="Peak"
-                      value={style.peakColor}
-                      onChange={(peakColor) => setOverrides((prev) => ({ ...prev, peakColor }))}
-                    />
-                  ) : null}
-                  <label className="flex items-center gap-2">
-                    <input
-                      type="checkbox"
-                      checked={style.background === "box"}
-                      onChange={(event) =>
-                        setOverrides((prev) => ({ ...prev, background: event.target.checked ? "box" : "none" }))
-                      }
-                      className="size-4 accent-accent"
-                    />
-                    <span className="text-ui text-muted">Box</span>
-                  </label>
-                  <label className="flex items-center gap-2">
-                    <input
-                      type="checkbox"
-                      checked={style.uppercase}
-                      onChange={(event) =>
-                        setOverrides((prev) => ({ ...prev, uppercase: event.target.checked }))
-                      }
-                      className="size-4 accent-accent"
-                    />
-                    <span className="text-ui text-muted">Uppercase</span>
-                  </label>
+                  <SegmentedButton
+                    active={reframeMode === "center"}
+                    onClick={() => {
+                      setReframeMode("center");
+                      setEditTemplateId("custom");
+                    }}
+                    label="Centre crop"
+                  />
                 </div>
+                {reframeMode === "smart" && !isMerge ? (
+                  <CutCheckPanel
+                    track={track}
+                    trimStart={trimStart}
+                    trimEnd={trimEnd}
+                    sourceWidth={sourceSize.w}
+                    sourceHeight={sourceSize.h}
+                    analysing={analysingFrame}
+                    onJump={(sourceSec) => {
+                      videoRef.current?.pause();
+                      seekTo(sourceSec);
+                    }}
+                  />
+                ) : null}
+              </Panel>
+
+              {/* captions */}
+              <Panel title="Subtitles" icon={SlidersHorizontal}>
+                <div className="flex flex-wrap items-center gap-2">
+                  <SegmentedButton active={captionsOn} onClick={() => setCaptionsOn(true)} label="On" />
+                  <SegmentedButton active={!captionsOn} onClick={() => setCaptionsOn(false)} label="Off" />
+                </div>
+
+                <p className="eyebrow mt-3 text-muted">Peak line</p>
+                <div className="mt-1 flex gap-2">
+                  <SegmentedButton
+                    active={overrides.peakEmphasis !== false}
+                    onClick={() => setOverrides((prev) => ({ ...prev, peakEmphasis: true }))}
+                    label="Highlight"
+                  />
+                  <SegmentedButton
+                    active={overrides.peakEmphasis === false}
+                    onClick={() => setOverrides((prev) => ({ ...prev, peakEmphasis: false }))}
+                    label="Match others"
+                  />
+                </div>
+
                 <label className="mt-3 block">
-                  <span className="eyebrow text-muted">Entrance</span>
+                  <span className="eyebrow text-muted">Caption style</span>
                   <select
-                    value={style.animation}
-                    onChange={(event) =>
-                      setOverrides((prev) => ({ ...prev, animation: event.target.value as CaptionOverrides["animation"] }))
-                    }
-                    className="text-ui mt-1 h-10 w-full rounded-lg border border-control bg-panel-2 px-2 outline-none focus:border-accent"
+                    value={styleId}
+                    onChange={(event) => {
+                      setStyleId(event.target.value);
+                      setCaptionsOn(true);
+                      setEditTemplateId("custom");
+                      // A preset is a complete look, so picking one clears the
+                      // per-caption tweaks rather than mixing two caption designs.
+                      // Peak highlight is independent of the look, so it is kept.
+                      setOverrides((prev) => (prev.peakEmphasis === false ? { peakEmphasis: false } : {}));
+                    }}
+                    className="text-ui mt-1 h-11 w-full rounded-lg border border-control bg-panel-2 px-2 outline-none focus:border-accent"
                   >
-                    <option value="none">None</option>
-                    <option value="fade">Quick fade</option>
-                    <option value="pop">Punch pop</option>
+                    {styles.map((option) => (
+                      <option key={option.id} value={option.id}>
+                        {option.label} — {option.summary}
+                      </option>
+                    ))}
                   </select>
                 </label>
+
                 <button
                   type="button"
-                  onClick={() =>
-                    setOverrides((prev) =>
-                      prev.peakEmphasis === false ? { peakEmphasis: false } : {}
-                    )
-                  }
-                  className="press text-ui mt-3 rounded-lg border border-control px-2 py-1 font-medium text-muted hover:border-accent"
+                  disabled={cleaningCaptions}
+                  onClick={() => void cleanCaptions()}
+                  className="press text-ui mt-2 inline-flex h-10 w-full items-center justify-center gap-1.5 rounded-lg border border-control px-2 font-semibold text-muted hover:border-accent disabled:opacity-50"
                 >
-                  Reset appearance
+                  {cleaningCaptions ? (
+                    <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />
+                  ) : (
+                    <Sparkles className="size-3.5" aria-hidden="true" />
+                  )}
+                  {cleaningCaptions ? "Cleaning captions…" : "Clean captions"}
                 </button>
-              </div>
-            </details>
+                {cleanNote ? <p className="text-meta mt-1 text-muted">{cleanNote}</p> : null}
 
-            <details open className="mt-2 rounded-lg border border-border bg-panel-2/40">
-              <summary className="text-ui cursor-pointer px-3 py-2 font-semibold text-muted">
-                Transcript
-              </summary>
-              <div className="border-t border-border p-2">
-                <p className="text-meta mb-2 text-muted">
-                  Edit the words. Words per caption only groups them on the video.
-                </p>
-                <textarea
-                  value={transcriptDraft}
-                  rows={8}
-                  spellCheck
-                  onFocus={() => setTranscriptFocused(true)}
-                  onBlur={() => {
-                    setTranscriptFocused(false);
-                    commitTranscript();
-                  }}
-                  onChange={(event) => setTranscriptDraft(event.target.value)}
-                  className="text-ui min-h-36 w-full resize-y rounded-md border border-control bg-panel px-2 py-2 outline-none focus:border-accent"
-                />
-                <button
-                  type="button"
-                  onClick={commitTranscript}
-                  className="press text-ui mt-2 h-9 w-full rounded-lg border border-control font-semibold text-muted hover:border-accent"
-                >
-                  Bind to video
-                </button>
-              </div>
-            </details>
-
-            <details className="mt-2 rounded-lg border border-border bg-panel-2/40">
-              <summary className="text-ui cursor-pointer px-3 py-2 font-semibold text-muted">
-                Edit subtitle sections
-              </summary>
-              <div className="border-t border-border p-2">
-                <div className="mb-2 flex items-center justify-between gap-2">
-                  <span className="text-meta text-muted">
-                    {captions.length} active · {removedCaptionSections.length + removedWordSpans.length} removed
-                  </span>
+                <div className="mt-2 grid grid-cols-2 gap-2">
                   <button
                     type="button"
-                    onClick={addCaptionSection}
-                    className="press text-ui inline-flex h-9 items-center gap-1.5 rounded-lg border border-accent/60 px-2.5 font-semibold text-accent hover:bg-accent/10"
+                    aria-pressed={positioningCaptions}
+                    onClick={() => {
+                      setPositioningCaptions((value) => !value);
+                      setShowCleanup(false);
+                    }}
+                    className={cn(
+                      "press text-ui h-10 rounded-lg border px-2 font-semibold",
+                      positioningCaptions
+                        ? "border-accent bg-accent/10 text-accent"
+                        : "border-control text-muted hover:border-accent"
+                    )}
                   >
-                    <Plus className="size-3.5" aria-hidden="true" />
-                    Add at playhead
+                    {positioningCaptions ? "Drag subtitle now" : "Place on video"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCaptionTextOverrides([]);
+                      setCaptionWordOverrides([]);
+                    }}
+                    disabled={captionTextOverrides.length === 0 && captionWordOverrides.length === 0}
+                    className="press text-ui h-10 rounded-lg border border-control px-2 font-medium text-muted hover:border-accent disabled:opacity-40"
+                  >
+                    Reset transcript ({captionTextOverrides.length + captionWordOverrides.length})
                   </button>
                 </div>
-                <div className="max-h-96 space-y-2 overflow-y-auto pr-1">
-                {captions.length === 0 ? (
-                  <p className="text-meta rounded-lg border border-dashed border-border p-3 text-muted">
-                    No active subtitle sections. Add one at the current playhead or restore a removed section.
-                  </p>
-                ) : (
-                  captions.map((caption) => {
-                    const edited = caption.custom
-                      ? captionTextOverrides.some(
-                          (item) => item.custom && `custom:${item.id}` === caption.editId
-                        )
-                      : caption.words.some((word) =>
-                          captionWordOverrides.some(
-                            (item) => Math.round(item.t * 1000) === Math.round(word.t * 1000)
-                          )
-                        );
-                    return (
-                      <div key={caption.editId} className="rounded-lg border border-border bg-panel p-2">
-                        <div className="mb-2 flex items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={() => seekTo(caption.start + active.startSec)}
-                            className="num text-micro flex-1 text-left text-muted hover:text-foreground"
-                          >
-                            {timecode(caption.start + active.startSec)}–{timecode(caption.sourceEndSec)}
-                            {caption.custom ? " · added" : edited ? " · edited" : ""}
-                          </button>
-                          {edited && !caption.custom ? (
-                            <button
-                              type="button"
-                              onClick={() => resetCaptionSection(caption)}
-                              className="text-micro font-semibold text-accent"
-                            >
-                              Restore
-                            </button>
-                          ) : null}
-                          <button
-                            type="button"
-                            onClick={() =>
-                              updateCaptionSection(caption, {
-                                hidden: true,
-                                endSec: caption.sourceEndSec,
-                              })
-                            }
-                            aria-label={`Remove subtitle at ${timecode(caption.sourceStartSec)}`}
-                            className="press inline-flex size-8 items-center justify-center rounded-md text-muted hover:bg-bad/15 hover:text-bad"
-                          >
-                            <Trash2 className="size-3.5" aria-hidden="true" />
-                          </button>
-                        </div>
-                        <CaptionSectionField
-                          value={caption.text}
-                          onFocusSeek={() => seekTo(caption.start + active.startSec)}
-                          onCommit={(text) => updateCaptionSection(caption, { text })}
+
+                <details className="mt-2 rounded-lg border border-border bg-panel-2/40">
+                  <summary className="text-ui cursor-pointer px-3 py-2 font-semibold text-muted">
+                    Position & appearance
+                  </summary>
+                  <div className="border-t border-border px-3 pb-3">
+                    <Slider
+                      label="Horizontal"
+                      value={style.horizontalFrac}
+                      min={0.05}
+                      max={0.95}
+                      step={0.005}
+                      format={(value) => `${Math.round(value * 100)}%`}
+                      onChange={(value) =>
+                        setOverrides((prev) => ({
+                          ...prev,
+                          horizontalFrac: value,
+                        }))
+                      }
+                    />
+                    <Slider
+                      label="Vertical"
+                      value={style.verticalFrac}
+                      min={0.05}
+                      max={0.95}
+                      step={0.005}
+                      format={(value) => `${Math.round(value * 100)}% up`}
+                      onChange={(value) =>
+                        setOverrides((prev) => ({
+                          ...prev,
+                          verticalFrac: value,
+                        }))
+                      }
+                    />
+                    <Slider
+                      label="Words per caption"
+                      value={style.chunkWords}
+                      min={1}
+                      max={8}
+                      step={1}
+                      format={(value) => String(value)}
+                      onChange={(value) => setOverrides((prev) => ({ ...prev, chunkWords: value }))}
+                    />
+                    <p className="text-meta mt-1 text-muted">Groups the transcript. Edits stay on the words.</p>
+                    <Slider
+                      label="Size"
+                      value={style.sizeScale}
+                      min={0.6}
+                      max={2}
+                      step={0.05}
+                      format={(value) => `${Math.round(value * 100)}%`}
+                      onChange={(value) => setOverrides((prev) => ({ ...prev, sizeScale: value }))}
+                    />
+                    <label className="mt-3 block">
+                      <span className="eyebrow text-muted">Font</span>
+                      <select
+                        value={style.fontFamily}
+                        onChange={(event) => {
+                          setOverrides((prev) => ({
+                            ...prev,
+                            fontFamily: event.target.value,
+                          }));
+                          setEditTemplateId("custom");
+                        }}
+                        className="text-ui mt-1 h-11 w-full rounded-lg border border-control bg-panel-2 px-2 outline-none focus:border-accent"
+                        style={{
+                          fontFamily: catalogFont?.stack ?? style.fontFamily,
+                        }}
+                      >
+                        {fontChoices.map((font) => (
+                          <option key={font.id} value={font.family} style={{ fontFamily: font.stack }}>
+                            {font.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <div className="mt-3 flex flex-wrap items-center gap-3">
+                      <ColorControl
+                        label="Text"
+                        value={style.textColor}
+                        onChange={(textColor) => setOverrides((prev) => ({ ...prev, textColor }))}
+                      />
+                      {overrides.peakEmphasis !== false ? (
+                        <ColorControl
+                          label="Peak"
+                          value={style.peakColor}
+                          onChange={(peakColor) => setOverrides((prev) => ({ ...prev, peakColor }))}
                         />
-                        {caption.custom ? (
-                        <div className="mt-2 grid grid-cols-2 gap-2">
-                          <TimestampInput
-                            label="Start"
-                            value={caption.sourceStartSec}
-                            min={active.startSec}
-                            max={caption.sourceEndSec - 0.05}
-                            onChange={(value) => updateCaptionSection(caption, { startSec: value })}
-                          />
-                          <TimestampInput
-                            label="End"
-                            value={caption.sourceEndSec}
-                            min={caption.sourceStartSec + 0.05}
-                            max={active.endSec}
-                            onChange={(endSec) => updateCaptionSection(caption, { endSec })}
-                          />
-                        </div>
-                        ) : null}
-                      </div>
-                    );
-                  })
-                )}
-                </div>
+                      ) : null}
+                      <label className="flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          checked={style.background === "box"}
+                          onChange={(event) =>
+                            setOverrides((prev) => ({
+                              ...prev,
+                              background: event.target.checked ? "box" : "none",
+                            }))
+                          }
+                          className="size-4 accent-accent"
+                        />
+                        <span className="text-ui text-muted">Box</span>
+                      </label>
+                      <label className="flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          checked={style.uppercase}
+                          onChange={(event) =>
+                            setOverrides((prev) => ({
+                              ...prev,
+                              uppercase: event.target.checked,
+                            }))
+                          }
+                          className="size-4 accent-accent"
+                        />
+                        <span className="text-ui text-muted">Uppercase</span>
+                      </label>
+                      <label className="flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          checked={style.highlight === "word"}
+                          onChange={(event) =>
+                            setOverrides((prev) => ({
+                              ...prev,
+                              highlight: event.target.checked ? "word" : "none",
+                            }))
+                          }
+                          className="size-4 accent-accent"
+                        />
+                        <span className="text-ui text-muted">Colour the spoken word</span>
+                      </label>
+                    </div>
+                    <label className="mt-3 block">
+                      <span className="eyebrow text-muted">Entrance</span>
+                      <select
+                        value={style.animation}
+                        onChange={(event) =>
+                          setOverrides((prev) => ({
+                            ...prev,
+                            animation: event.target.value as CaptionOverrides["animation"],
+                          }))
+                        }
+                        className="text-ui mt-1 h-10 w-full rounded-lg border border-control bg-panel-2 px-2 outline-none focus:border-accent"
+                      >
+                        <option value="none">None</option>
+                        <option value="fade">Quick fade</option>
+                        <option value="pop">Punch pop</option>
+                      </select>
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setOverrides((prev) => (prev.peakEmphasis === false ? { peakEmphasis: false } : {}))
+                      }
+                      className="press text-ui mt-3 rounded-lg border border-control px-2 py-1 font-medium text-muted hover:border-accent"
+                    >
+                      Reset appearance
+                    </button>
+                  </div>
+                </details>
 
-                {removedCaptionSections.length + removedWordSpans.length > 0 ? (
-                  <details className="mt-2 rounded-lg border border-border bg-panel-2/50">
-                    <summary className="text-meta cursor-pointer px-2.5 py-2 font-semibold text-muted">
-                      Removed sections ({removedCaptionSections.length + removedWordSpans.length})
-                    </summary>
-                    <ul className="space-y-1 border-t border-border p-2">
-                      {removedWordSpans.map((span) => (
-                        <li key={span.key} className="flex items-center gap-2 rounded-md bg-panel px-2 py-1.5">
-                          <span className="num text-micro flex-1 text-muted">
-                            {timecode(span.ts[0] ?? 0)} · {span.text || "Generated subtitle"}
-                          </span>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              const drop = new Set(span.ts.map((t) => Math.round(t * 1000)));
-                              setCaptionWordOverrides((prev) =>
-                                prev.filter((item) => !item.hidden || !drop.has(Math.round(item.t * 1000)))
-                              );
-                            }}
-                            className="text-micro font-semibold text-accent"
-                          >
-                            Restore
-                          </button>
-                        </li>
-                      ))}
-                      {removedCaptionSections.map((edit) => (
-                        <li key={edit.custom ? edit.id : edit.startSec} className="flex items-center gap-2 rounded-md bg-panel px-2 py-1.5">
-                          <span className="num text-micro flex-1 text-muted">
-                            {timecode(edit.displayStartSec ?? edit.startSec)} · {edit.text || "Generated subtitle"}
-                          </span>
-                          <button
-                            type="button"
-                            onClick={() => restoreRemovedSection(edit)}
-                            className="text-micro font-semibold text-accent"
-                          >
-                            Restore
-                          </button>
-                        </li>
-                      ))}
-                    </ul>
-                  </details>
-                ) : null}
-              </div>
-            </details>
-          </Panel>
+                <details open className="mt-2 rounded-lg border border-border bg-panel-2/40">
+                  <summary className="text-ui cursor-pointer px-3 py-2 font-semibold text-muted">Transcript</summary>
+                  <div className="border-t border-border p-2">
+                    <p className="text-meta mb-2 text-muted">
+                      Edit the words. Words per caption only groups them on the video.
+                    </p>
+                    <textarea
+                      value={transcriptDraft}
+                      rows={8}
+                      spellCheck
+                      onFocus={() => setTranscriptFocused(true)}
+                      onBlur={() => {
+                        setTranscriptFocused(false);
+                        commitTranscript();
+                      }}
+                      onChange={(event) => setTranscriptDraft(event.target.value)}
+                      className="text-ui min-h-36 w-full resize-y rounded-md border border-control bg-panel px-2 py-2 outline-none focus:border-accent"
+                    />
+                    <button
+                      type="button"
+                      onClick={commitTranscript}
+                      className="press text-ui mt-2 h-9 w-full rounded-lg border border-control font-semibold text-muted hover:border-accent"
+                    >
+                      Bind to video
+                    </button>
+                  </div>
+                </details>
 
-          {/* Burned-in text / watermark removal */}
-          <Panel title="Cleanup" icon={Eraser}>
-            <div className="flex flex-wrap items-center gap-2">
-              <SegmentedButton
-                active={showCleanup}
-                onClick={() => setShowCleanup(true)}
-                label="Edit regions"
-              />
-              <SegmentedButton
-                active={!showCleanup}
-                onClick={() => setShowCleanup(false)}
-                label="Hidden"
-              />
-            </div>
-            <p className="text-meta mt-2 text-muted">
-              {mode === "output"
-                ? "Switch the preview to Source to place regions."
-                : "Drag over a logo or burned-in caption in the player. The renderer reconstructs those pixels from what surrounds them."}
-            </p>
-
-            {cleanup.length === 0 ? (
-              <p className="text-meta mt-2 text-muted">No regions.</p>
-            ) : (
-              <ul className="mt-2 flex flex-col gap-2">
-                {cleanup.map((region, index) => (
-                  <li key={region.id} className="rounded-lg border border-border bg-panel-2/50 p-2">
-                    <div className="flex items-center gap-2">
-                      <span className="num text-meta flex-1 text-muted">
-                        #{index + 1} · {region.w}×{region.h} @ {region.x},{region.y}
+                <details className="mt-2 rounded-lg border border-border bg-panel-2/40">
+                  <summary className="text-ui cursor-pointer px-3 py-2 font-semibold text-muted">
+                    Edit subtitle sections
+                  </summary>
+                  <div className="border-t border-border p-2">
+                    <div className="mb-2 flex items-center justify-between gap-2">
+                      <span className="text-meta text-muted">
+                        {captions.length} active · {removedCaptionSections.length + removedWordSpans.length} removed
                       </span>
                       <button
                         type="button"
-                        onClick={() => setCleanup((prev) => prev.filter((r) => r.id !== region.id))}
-                        aria-label={`Remove cleanup region ${index + 1}`}
-                        className="press inline-flex size-8 items-center justify-center rounded-md text-muted hover:bg-bad/15 hover:text-bad"
+                        onClick={addCaptionSection}
+                        className="press text-ui inline-flex h-9 items-center gap-1.5 rounded-lg border border-accent/60 px-2.5 font-semibold text-accent hover:bg-accent/10"
                       >
-                        <X className="size-3.5" aria-hidden="true" />
+                        <Plus className="size-3.5" aria-hidden="true" />
+                        Add at playhead
                       </button>
                     </div>
-                    <div className="mt-1 flex items-center gap-2">
-                      <label className="text-meta flex flex-1 items-center gap-1">
-                        <span className="text-muted">from</span>
-                        <input
-                          type="number"
-                          step={0.1}
-                          min={0}
-                          value={region.start}
-                          onChange={(event) =>
-                            updateCleanupRegion(region.id, { start: Number(event.target.value) })
-                          }
-                          className="num h-9 w-full rounded-md border border-control bg-panel px-2"
-                        />
-                      </label>
-                      <label className="text-meta flex flex-1 items-center gap-1">
-                        <span className="text-muted">to</span>
-                        <input
-                          type="number"
-                          step={0.1}
-                          min={0}
-                          value={region.end}
-                          onChange={(event) =>
-                            updateCleanupRegion(region.id, { end: Number(event.target.value) })
-                          }
-                          className="num h-9 w-full rounded-md border border-control bg-panel px-2"
-                        />
-                      </label>
+                    <div className="max-h-96 space-y-2 overflow-y-auto pr-1">
+                      {captions.length === 0 ? (
+                        <p className="text-meta rounded-lg border border-dashed border-border p-3 text-muted">
+                          No active subtitle sections. Add one at the current playhead or restore a removed section.
+                        </p>
+                      ) : (
+                        captions.map((caption) => {
+                          const edited = caption.custom
+                            ? captionTextOverrides.some((item) => item.custom && `custom:${item.id}` === caption.editId)
+                            : caption.words.some((word) =>
+                                captionWordOverrides.some(
+                                  (item) => Math.round(item.t * 1000) === Math.round(word.t * 1000)
+                                )
+                              );
+                          return (
+                            <div key={caption.editId} className="rounded-lg border border-border bg-panel p-2">
+                              <div className="mb-2 flex items-center gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => seekTo(caption.start + active.startSec)}
+                                  className="num text-micro flex-1 text-left text-muted hover:text-foreground"
+                                >
+                                  {timecode(caption.start + active.startSec)}–{timecode(caption.sourceEndSec)}
+                                  {caption.custom ? " · added" : edited ? " · edited" : ""}
+                                </button>
+                                {edited && !caption.custom ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => resetCaptionSection(caption)}
+                                    className="text-micro font-semibold text-accent"
+                                  >
+                                    Restore
+                                  </button>
+                                ) : null}
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    updateCaptionSection(caption, {
+                                      hidden: true,
+                                      endSec: caption.sourceEndSec,
+                                    })
+                                  }
+                                  aria-label={`Remove subtitle at ${timecode(caption.sourceStartSec)}`}
+                                  className="press inline-flex size-8 items-center justify-center rounded-md text-muted hover:bg-bad/15 hover:text-bad"
+                                >
+                                  <Trash2 className="size-3.5" aria-hidden="true" />
+                                </button>
+                              </div>
+                              <CaptionSectionField
+                                value={caption.text}
+                                onFocusSeek={() => seekTo(caption.start + active.startSec)}
+                                onCommit={(text) => updateCaptionSection(caption, { text })}
+                              />
+                              {caption.custom ? (
+                                <div className="mt-2 grid grid-cols-2 gap-2">
+                                  <TimestampInput
+                                    label="Start"
+                                    value={caption.sourceStartSec}
+                                    min={active.startSec}
+                                    max={caption.sourceEndSec - 0.05}
+                                    onChange={(value) =>
+                                      updateCaptionSection(caption, {
+                                        startSec: value,
+                                      })
+                                    }
+                                  />
+                                  <TimestampInput
+                                    label="End"
+                                    value={caption.sourceEndSec}
+                                    min={caption.sourceStartSec + 0.05}
+                                    max={active.endSec}
+                                    onChange={(endSec) => updateCaptionSection(caption, { endSec })}
+                                  />
+                                </div>
+                              ) : null}
+                            </div>
+                          );
+                        })
+                      )}
                     </div>
-                  </li>
-                ))}
-              </ul>
-            )}
-            {cleanup.length >= MAX_CLEANUP_REGIONS ? (
-              <p className="text-meta mt-2 text-warn">
-                Limit of {MAX_CLEANUP_REGIONS} regions reached.
-              </p>
-            ) : null}
-          </Panel>
+
+                    {removedCaptionSections.length + removedWordSpans.length > 0 ? (
+                      <details className="mt-2 rounded-lg border border-border bg-panel-2/50">
+                        <summary className="text-meta cursor-pointer px-2.5 py-2 font-semibold text-muted">
+                          Removed sections ({removedCaptionSections.length + removedWordSpans.length})
+                        </summary>
+                        <ul className="space-y-1 border-t border-border p-2">
+                          {removedWordSpans.map((span) => (
+                            <li key={span.key} className="flex items-center gap-2 rounded-md bg-panel px-2 py-1.5">
+                              <span className="num text-micro flex-1 text-muted">
+                                {timecode(span.ts[0] ?? 0)} · {span.text || "Generated subtitle"}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const drop = new Set(span.ts.map((t) => Math.round(t * 1000)));
+                                  setCaptionWordOverrides((prev) =>
+                                    prev.filter((item) => !item.hidden || !drop.has(Math.round(item.t * 1000)))
+                                  );
+                                }}
+                                className="text-micro font-semibold text-accent"
+                              >
+                                Restore
+                              </button>
+                            </li>
+                          ))}
+                          {removedCaptionSections.map((edit) => (
+                            <li
+                              key={edit.custom ? edit.id : edit.startSec}
+                              className="flex items-center gap-2 rounded-md bg-panel px-2 py-1.5"
+                            >
+                              <span className="num text-micro flex-1 text-muted">
+                                {timecode(edit.displayStartSec ?? edit.startSec)} · {edit.text || "Generated subtitle"}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => restoreRemovedSection(edit)}
+                                className="text-micro font-semibold text-accent"
+                              >
+                                Restore
+                              </button>
+                            </li>
+                          ))}
+                        </ul>
+                      </details>
+                    ) : null}
+                  </div>
+                </details>
+              </Panel>
+
+              {/* Burned-in text / watermark removal */}
+              <Panel title="Cleanup" icon={Eraser}>
+                <div className="flex flex-wrap items-center gap-2">
+                  <SegmentedButton active={showCleanup} onClick={() => setShowCleanup(true)} label="Edit regions" />
+                  <SegmentedButton active={!showCleanup} onClick={() => setShowCleanup(false)} label="Hidden" />
+                </div>
+                <p className="text-meta mt-2 text-muted">
+                  {mode === "output"
+                    ? "Switch the preview to Source to place regions."
+                    : "Drag over a logo or burned-in caption in the player. The renderer reconstructs those pixels from what surrounds them."}
+                </p>
+
+                {cleanup.length === 0 ? (
+                  <p className="text-meta mt-2 text-muted">No regions.</p>
+                ) : (
+                  <ul className="mt-2 flex flex-col gap-2">
+                    {cleanup.map((region, index) => (
+                      <li key={region.id} className="rounded-lg border border-border bg-panel-2/50 p-2">
+                        <div className="flex items-center gap-2">
+                          <span className="num text-meta flex-1 text-muted">
+                            #{index + 1} · {region.w}×{region.h} @ {region.x},{region.y}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => setCleanup((prev) => prev.filter((r) => r.id !== region.id))}
+                            aria-label={`Remove cleanup region ${index + 1}`}
+                            className="press inline-flex size-8 items-center justify-center rounded-md text-muted hover:bg-bad/15 hover:text-bad"
+                          >
+                            <X className="size-3.5" aria-hidden="true" />
+                          </button>
+                        </div>
+                        <div className="mt-1 flex items-center gap-2">
+                          <label className="text-meta flex flex-1 items-center gap-1">
+                            <span className="text-muted">from</span>
+                            <input
+                              type="number"
+                              step={0.1}
+                              min={0}
+                              value={region.start}
+                              onChange={(event) =>
+                                updateCleanupRegion(region.id, {
+                                  start: Number(event.target.value),
+                                })
+                              }
+                              className="num h-9 w-full rounded-md border border-control bg-panel px-2"
+                            />
+                          </label>
+                          <label className="text-meta flex flex-1 items-center gap-1">
+                            <span className="text-muted">to</span>
+                            <input
+                              type="number"
+                              step={0.1}
+                              min={0}
+                              value={region.end}
+                              onChange={(event) =>
+                                updateCleanupRegion(region.id, {
+                                  end: Number(event.target.value),
+                                })
+                              }
+                              className="num h-9 w-full rounded-md border border-control bg-panel px-2"
+                            />
+                          </label>
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {cleanup.length >= MAX_CLEANUP_REGIONS ? (
+                  <p className="text-meta mt-2 text-warn">Limit of {MAX_CLEANUP_REGIONS} regions reached.</p>
+                ) : null}
+              </Panel>
             </>
           )}
         </section>
@@ -2315,7 +2747,10 @@ export function ClipEditor({
 
         {rendered ? (
           <a
-            href={`${clipDownloadUrl(clip.id)}?download=1`}
+            href={clipDownloadUrl(clip.id, {
+              download: true,
+              bust: clip.renderedAt,
+            })}
             download
             className="press text-ui inline-flex h-11 items-center gap-1.5 rounded-md border border-border px-2.5 font-medium hover:border-control sm:h-8"
           >
@@ -2428,11 +2863,7 @@ const FALLBACK_STYLE: CaptionStyleInfo = {
   uppercase: false,
 };
 
-function motionZoom(
-  effects: Required<VideoEffects>,
-  localTime: number,
-  peakAt: number
-): number {
+function motionZoom(effects: Required<VideoEffects>, localTime: number, peakAt: number): number {
   const amount = Math.max(0, effects.zoom - 1);
   if (effects.motion === "hook_push") {
     return 1 + amount * Math.max(0, 1 - localTime / 0.45);
@@ -2473,9 +2904,7 @@ function tracksLookEqual(a: ReframeTrack | undefined, b: ReframeTrack | undefine
   }
   return a.keyframes.every(
     (keyframe, i) =>
-      keyframe.t === b.keyframes[i]!.t &&
-      keyframe.cx === b.keyframes[i]!.cx &&
-      keyframe.width === b.keyframes[i]!.width
+      keyframe.t === b.keyframes[i]!.t && keyframe.cx === b.keyframes[i]!.cx && keyframe.width === b.keyframes[i]!.width
   );
 }
 
@@ -2503,222 +2932,13 @@ function preferCoveringTrack(
   else {
     const currentUntil = current?.untilSec ?? Number.NEGATIVE_INFINITY;
     const incomingUntil = incoming?.untilSec ?? Number.NEGATIVE_INFINITY;
-    chosen = currentUntil > incomingUntil + 0.05 ? current : incoming ?? current;
+    chosen = currentUntil > incomingUntil + 0.05 ? current : (incoming ?? current);
   }
   return chosen ? holdCropUntilCuts(chosen) : chosen;
 }
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function Panel({
-  title,
-  icon: Icon,
-  children,
-}: {
-  title: string;
-  icon: typeof Scissors;
-  children: ReactNode;
-}) {
-  return (
-    <section className="rounded-xl border border-border bg-panel p-3">
-      <h3 className="eyebrow mb-2 flex items-center gap-1.5 text-muted">
-        <Icon className="size-3" aria-hidden="true" />
-        {title}
-      </h3>
-      {children}
-    </section>
-  );
-}
-
-function SegmentedButton({
-  active,
-  disabled,
-  label,
-  onClick,
-}: {
-  active: boolean;
-  disabled?: boolean;
-  label: string;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      aria-pressed={active}
-      disabled={disabled}
-      onClick={onClick}
-      className={cn(
-        "press text-ui h-11 flex-1 rounded-md border px-3 font-medium sm:h-8",
-        active
-          ? "border-border bg-panel-2 text-fg"
-          : "border-border text-muted hover:border-control hover:text-fg",
-        disabled && "opacity-40"
-      )}
-    >
-      {label}
-    </button>
-  );
-}
-
-function ColorControl({
-  label,
-  value,
-  onChange,
-}: {
-  label: string;
-  value: string;
-  onChange: (value: string) => void;
-}) {
-  return (
-    <label className="flex items-center gap-2">
-      <span className="eyebrow text-muted">{label}</span>
-      <input
-        type="color"
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-        className="h-9 w-12 cursor-pointer rounded border border-control bg-panel-2"
-        aria-label={`${label} caption colour`}
-      />
-    </label>
-  );
-}
-
-function CaptionSectionField({
-  value,
-  onCommit,
-  onFocusSeek,
-}: {
-  value: string;
-  onCommit: (text: string) => void;
-  onFocusSeek: () => void;
-}) {
-  const [draft, setDraft] = useState(value);
-  const focused = useRef(false);
-
-  useEffect(() => {
-    if (!focused.current) setDraft(value);
-  }, [value]);
-
-  return (
-    <input
-      value={draft}
-      maxLength={160}
-      onFocus={() => {
-        focused.current = true;
-        onFocusSeek();
-      }}
-      onChange={(event) => setDraft(event.target.value)}
-      onBlur={() => {
-        focused.current = false;
-        onCommit(draft);
-      }}
-      onKeyDown={(event) => {
-        if (event.key === "Enter") event.currentTarget.blur();
-      }}
-      className="text-ui h-10 w-full rounded-md border border-control bg-panel-2 px-2 outline-none focus:border-accent"
-    />
-  );
-}
-
-function TimestampInput({
-  label,
-  value,
-  min,
-  max,
-  onChange,
-}: {
-  label: string;
-  value: number;
-  min: number;
-  max: number;
-  onChange: (value: number) => void;
-}) {
-  const [draft, setDraft] = useState(() => timecode(value));
-
-  useEffect(() => {
-    setDraft(timecode(value));
-  }, [value]);
-
-  function commit() {
-    const parsed = parseTimestamp(draft);
-    if (parsed === null) {
-      setDraft(timecode(value));
-      return;
-    }
-    const next = round3(Math.min(max, Math.max(min, parsed)));
-    setDraft(timecode(next));
-    onChange(next);
-  }
-
-  return (
-    <label className="block">
-      <span className="text-micro text-muted">{label}</span>
-      <input
-        value={draft}
-        inputMode="decimal"
-        onChange={(event) => setDraft(event.target.value)}
-        onBlur={commit}
-        onKeyDown={(event) => {
-          if (event.key === "Enter") event.currentTarget.blur();
-          if (event.key === "Escape") {
-            setDraft(timecode(value));
-            event.currentTarget.blur();
-          }
-        }}
-        aria-label={`${label} subtitle timestamp`}
-        className="num text-ui mt-1 h-9 w-full rounded-md border border-control bg-panel-2 px-2 outline-none focus:border-accent"
-      />
-    </label>
-  );
-}
-
-/** Accept seconds, MM:SS, or HH:MM:SS like a conventional subtitle editor. */
-function parseTimestamp(input: string): number | null {
-  const parts = input.trim().split(":");
-  if (parts.length < 1 || parts.length > 3 || parts.some((part) => part.trim() === "")) return null;
-  const values = parts.map(Number);
-  if (values.some((value) => !Number.isFinite(value) || value < 0)) return null;
-  if (values.length === 1) return values[0] ?? null;
-  if (values.length === 2) return (values[0] ?? 0) * 60 + (values[1] ?? 0);
-  return (values[0] ?? 0) * 3600 + (values[1] ?? 0) * 60 + (values[2] ?? 0);
-}
-
-function Slider({
-  label,
-  value,
-  min,
-  max,
-  step,
-  format,
-  onChange,
-}: {
-  label: string;
-  value: number;
-  min: number;
-  max: number;
-  step: number;
-  format: (value: number) => string;
-  onChange: (value: number) => void;
-}) {
-  return (
-    <label className="mt-3 block">
-      <span className="text-ui flex items-center justify-between">
-        <span className="text-muted">{label}</span>
-        <span className="num font-semibold">{format(value)}</span>
-      </span>
-      <input
-        type="range"
-        min={min}
-        max={max}
-        step={step}
-        value={value}
-        onChange={(event) => onChange(Number(event.target.value))}
-        className="accent-accent mt-1 h-11 w-full"
-      />
-    </label>
-  );
 }
 
 function WindowSliders({
@@ -2740,8 +2960,7 @@ function WindowSliders({
   return (
     <div>
       <p className="num text-meta text-muted">
-        {timecode(startSec)}–{timecode(endSec)} · {(endSec - startSec).toFixed(1)}s of{" "}
-        {timecode(sourceDuration)}
+        {timecode(startSec)}–{timecode(endSec)} · {(endSec - startSec).toFixed(1)}s of {timecode(sourceDuration)}
       </p>
       {markers.length > 0 ? (
         <div className="relative mt-2 h-2 overflow-hidden rounded-full bg-panel-2" aria-hidden="true">
@@ -2826,8 +3045,8 @@ function SegmentList({
               {index + 1}
             </button>
             <span className="num text-meta flex-1 text-muted">
-              {timecode(segment.startSec)}–{timecode(segment.endSec)} ·{" "}
-              {(segment.endSec - segment.startSec).toFixed(1)}s
+              {timecode(segment.startSec)}–{timecode(segment.endSec)} · {(segment.endSec - segment.startSec).toFixed(1)}
+              s
             </span>
             <button
               type="button"
@@ -2862,9 +3081,15 @@ function SegmentList({
             startSec={segment.startSec}
             endSec={segment.endSec}
             onStart={(value) =>
-              onChange(index, { startSec: Math.min(value, segment.endSec - 0.2) })
+              onChange(index, {
+                startSec: Math.min(value, segment.endSec - 0.2),
+              })
             }
-            onEnd={(value) => onChange(index, { endSec: Math.max(value, segment.startSec + 0.2) })}
+            onEnd={(value) =>
+              onChange(index, {
+                endSec: Math.max(value, segment.startSec + 0.2),
+              })
+            }
           />
         </li>
       ))}

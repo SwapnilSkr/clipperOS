@@ -1,5 +1,6 @@
 import type {
   CaptionOverrides,
+  CaptionScene,
   CaptionStyleInfo,
   CaptionTextOverride,
   CaptionWordOverride,
@@ -36,6 +37,8 @@ export interface PreviewCaption {
   custom: boolean;
   /** Absolute source onsets in this group. Empty for a custom cue. */
   words: WordTiming[];
+  /** Caption scene this line falls in (creator mode). Absent = the clip's look. */
+  sceneId?: string;
 }
 
 /**
@@ -275,6 +278,18 @@ function normalizeWords(text: string): string[] {
  * the peak text: chunks are a few words wide and start at arbitrary offsets, so
  * a prefix test against the peak's opening words almost never lines up.
  */
+/** Mirrors the server's CaptionSceneSpan: a span with its own words per caption. */
+export interface CaptionSceneSpan {
+  id: string;
+  startSec: number;
+  endSec: number;
+  chunkWords: number;
+}
+
+export function sceneAt(scenes: CaptionSceneSpan[] | undefined, sourceSec: number): CaptionSceneSpan | undefined {
+  return scenes?.find((scene) => sourceSec >= scene.startSec && sourceSec < scene.endSec);
+}
+
 export function buildTimelineCaptions(
   wordTimings: WordTiming[],
   clipStartSec: number,
@@ -284,7 +299,8 @@ export function buildTimelineCaptions(
   chunkSize = 3,
   textOverrides: CaptionTextOverride[] = [],
   peakEmphasis = true,
-  wordOverrides: CaptionWordOverride[] = []
+  wordOverrides: CaptionWordOverride[] = [],
+  scenes?: CaptionSceneSpan[]
 ): PreviewCaption[] {
   const prepared = applyCaptionWords(wordTimings, wordOverrides, textOverrides);
   const inClip = prepared
@@ -292,10 +308,17 @@ export function buildTimelineCaptions(
     .filter((w) => w.t >= -0.05 && w.t < duration - AFTER_WORD_PAD_SEC);
   const peakWindow = peakEmphasis ? resolvePeakWindow(inClip, duration, peakLine, peakSec) : null;
 
-  const size = Math.max(1, Math.round(chunkSize));
+  const baseSize = Math.max(1, Math.round(chunkSize));
   const out: PreviewCaption[] = [];
   for (let i = 0; i < inClip.length; ) {
-    const take = Math.min(size, inClip.length - i);
+    // A group never crosses a scene boundary, so each look starts on a fresh caption.
+    const scene = sceneAt(scenes, clipStartSec + inClip[i]!.t);
+    const size = scene ? Math.max(1, Math.round(scene.chunkWords)) : baseSize;
+    let take = 1;
+    while (take < size && i + take < inClip.length) {
+      if (sceneAt(scenes, clipStartSec + inClip[i + take]!.t)?.id !== scene?.id) break;
+      take++;
+    }
     const group = inClip.slice(i, i + take);
     const sourceStartSec = clipStartSec + Math.max(0, group[0]!.t);
     const start = Math.max(0, group[0]!.t);
@@ -318,6 +341,7 @@ export function buildTimelineCaptions(
       editId: `generated:${Math.round(sourceStartSec * 1000)}`,
       custom: false,
       words: group.map((item) => ({ t: clipStartSec + item.t, word: item.word })),
+      sceneId: scene?.id,
     });
   }
 
@@ -338,6 +362,7 @@ export function buildTimelineCaptions(
       editId: `custom:${edit.id ?? Math.round(edit.startSec * 1000)}`,
       custom: true,
       words: [],
+      sceneId: sceneAt(scenes, edit.startSec)?.id,
     });
   }
   return out.sort((a, b) => a.start - b.start || a.end - b.end);
@@ -403,6 +428,7 @@ export function effectiveCaptionStyle(
     peakColor: overrides.peakColor ?? style.peakColor,
     fontFamily: overrides.fontFamily ?? style.fontFamily,
     uppercase: overrides.uppercase ?? style.uppercase,
+    highlight: overrides.highlight ?? style.highlight,
   };
 }
 
@@ -412,4 +438,27 @@ export function captionAt(captions: PreviewCaption[], time: number): PreviewCapt
     if (time >= caption.start && time < caption.end) return caption;
   }
   return null;
+}
+
+/**
+ * A caption scene's look — the server's `styleForScene` rule: a scene that
+ * names a preset starts from it, otherwise from the clip's own look; the
+ * scene's overrides go on top.
+ */
+export function sceneStyleFor(
+  presets: CaptionStyleInfo[],
+  clipStyle: CaptionStyleInfo,
+  scene: CaptionScene
+): CaptionStyleInfo {
+  const base = (scene.styleId && presets.find((preset) => preset.id === scene.styleId)) || clipStyle;
+  return effectiveCaptionStyle(base, scene.overrides);
+}
+
+/** Index of the word being spoken at `sourceSec`, for the karaoke highlight. */
+export function spokenWordIndex(caption: PreviewCaption, sourceSec: number): number {
+  let index = -1;
+  caption.words.forEach((word, i) => {
+    if (word.t <= sourceSec + 0.001) index = i;
+  });
+  return index;
 }

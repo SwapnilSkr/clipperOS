@@ -9,6 +9,8 @@ export const routes = {
   root: "/",
   project: (projectId: string) => `/projects/${projectId}`,
   clip: (projectId: string, clipId: string) => `/projects/${projectId}/clips/${clipId}`,
+  /** Creator mode: the beat timeline (cuts, camera, caption scenes, titles, SFX). */
+  clipCreate: (projectId: string, clipId: string) => `/projects/${projectId}/clips/${clipId}?desk=create`,
   /** Picture is already cut; this desk is music / SFX before export. */
   clipMix: (projectId: string, clipId: string) => `/projects/${projectId}/clips/${clipId}?desk=mix`,
   /** Project-level logo sting library. `returnClip` sends you back to mix after. */

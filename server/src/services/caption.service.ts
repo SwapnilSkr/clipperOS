@@ -234,6 +234,22 @@ export function bindTranscriptToTimings(
  *
  * `peakLine` is optional — a moment peak may have no words at all.
  */
+/**
+ * A caption scene as the grouper sees it: a source span with its own words
+ * per caption. A word belongs to the scene its onset falls in; a group never
+ * crosses a scene boundary, so each scene's look starts on a fresh caption.
+ */
+export interface CaptionSceneSpan {
+  id: string;
+  startSec: number;
+  endSec: number;
+  chunkWords: number;
+}
+
+export function sceneAt(scenes: CaptionSceneSpan[] | undefined, sourceSec: number): CaptionSceneSpan | undefined {
+  return scenes?.find((scene) => sourceSec >= scene.startSec && sourceSec < scene.endSec);
+}
+
 export function buildTimelineCaptions(
   wordTimings: VttWordTiming[],
   clipStartSec: number,
@@ -243,7 +259,8 @@ export function buildTimelineCaptions(
   chunkSize = DEFAULT_CHUNK_SIZE,
   textOverrides: CaptionTextOverride[] = [],
   peakEmphasis = true,
-  wordOverrides: CaptionWordOverride[] = []
+  wordOverrides: CaptionWordOverride[] = [],
+  scenes?: CaptionSceneSpan[]
 ): TimelineCaption[] {
   const prepared = applyCaptionWords(wordTimings, wordOverrides, textOverrides);
   const inClip = prepared
@@ -253,10 +270,16 @@ export function buildTimelineCaptions(
     .filter((w) => w.t >= -0.05 && w.t < duration - AFTER_WORD_PAD_SEC);
   const peakWindow = peakEmphasis ? resolvePeakWindow(inClip, duration, peakLine, peakSec) : null;
 
-  const size = Math.max(1, Math.round(chunkSize));
+  const baseSize = Math.max(1, Math.round(chunkSize));
   const out: TimelineCaption[] = [];
   for (let i = 0; i < inClip.length; ) {
-    const take = Math.min(size, inClip.length - i);
+    const scene = sceneAt(scenes, clipStartSec + inClip[i]!.t);
+    const size = scene ? Math.max(1, Math.round(scene.chunkWords)) : baseSize;
+    let take = 1;
+    while (take < size && i + take < inClip.length) {
+      if (sceneAt(scenes, clipStartSec + inClip[i + take]!.t)?.id !== scene?.id) break;
+      take++;
+    }
     const group = inClip.slice(i, i + take);
     const start = Math.max(0, group[0]!.t);
     const next = inClip[i + take];
@@ -273,6 +296,8 @@ export function buildTimelineCaptions(
       end,
       text,
       emphasis: peakWindow !== null && end > peakWindow.start && start < peakWindow.end,
+      words: group.map((item) => ({ t: Math.max(0, item.t), word: item.word })),
+      ...(scene ? { sceneId: scene.id } : {}),
     });
   }
 
@@ -283,11 +308,14 @@ export function buildTimelineCaptions(
     const start = Math.max(0, edit.startSec - clipStartSec);
     const end = Math.min(duration - AFTER_WORD_PAD_SEC, absoluteEnd - clipStartSec);
     if (end <= start) continue;
+    const scene = sceneAt(scenes, edit.startSec);
     out.push({
       start,
       end,
       text: edit.text,
       emphasis: peakWindow !== null && end > peakWindow.start && start < peakWindow.end,
+      words: [],
+      ...(scene ? { sceneId: scene.id } : {}),
     });
   }
   return out.sort((a, b) => a.start - b.start || a.end - b.end);
@@ -394,6 +422,8 @@ export interface AssOptions {
   peakColor?: string;
   /** Render caption text in capitals. Applied to the text, not a font feature. */
   uppercase?: boolean;
+  /** Colour the word being spoken inside each caption (karaoke). */
+  highlight?: "none" | "word";
 }
 
 /** Project a CaptionStyle preset onto the ASS writer's options. */
@@ -408,16 +438,25 @@ export function assOptionsFromStyle(style: CaptionStyle): AssOptions {
     animation: style.animation,
     peakColor: style.peakColor,
     uppercase: style.uppercase,
+    highlight: style.highlight,
   };
 }
 
-/**
- * Serialize captions to an ASS subtitle file.
- *
- * Two styles: the default caption, and a larger accent-coloured peak style used
- * for the emotional peak.
- */
-export function renderAss(captions: TimelineCaption[], options: AssOptions = {}): string {
+/** One look, resolved to the numbers the ASS header and each line need. */
+interface ResolvedLook {
+  capStyle: string;
+  peakStyle: string;
+  styleRows: string;
+  positionX: number;
+  positionY: number;
+  motion: string;
+  textColor: string;
+  peakColor: string;
+  uppercase: boolean;
+  highlight: boolean;
+}
+
+function resolveLook(suffix: string, options: AssOptions): ResolvedLook {
   const font = resolveCaptionFont(options.fontFamily);
   const scale = options.sizeScale ?? 1;
   const verticalFrac = options.verticalFrac ?? CAPTION_VERTICAL_FRAC;
@@ -426,52 +465,118 @@ export function renderAss(captions: TimelineCaption[], options: AssOptions = {})
   const background = options.background ?? "none";
   const animation = options.animation ?? "none";
   const peakColor = options.peakColor ?? PEAK_COLOR;
-  const uppercase = options.uppercase ?? false;
 
   const captionSize = Math.round(CAPTION_BASE_FONT * scale * ASS_FONT_SIZE_MATCH);
   const peakSize = Math.round(PEAK_BASE_FONT * scale * ASS_FONT_SIZE_MATCH);
   const marginV = Math.round(verticalFrac * OUTPUT_HEIGHT);
-  const positionX = Math.round(Math.max(0.05, Math.min(0.95, horizontalFrac)) * OUTPUT_WIDTH);
-  const positionY = Math.round((1 - Math.max(0.05, Math.min(0.95, verticalFrac))) * OUTPUT_HEIGHT);
   const borderStyle = background === "box" ? 3 : 1;
   const outline = background === "box" ? 14 : 6;
   const shadow = background === "box" ? 0 : 3;
   const primary = assColor(textColor);
+  const capStyle = `Cap${suffix}`;
+  const peakStyle = `Peak${suffix}`;
+  return {
+    capStyle,
+    peakStyle,
+    styleRows:
+      `Style: ${capStyle},${font},${captionSize},${primary},${primary},&H00000000,&H9A000000,-1,0,0,0,100,100,0,0,${borderStyle},${outline},${shadow},2,80,80,${marginV},1\n` +
+      `Style: ${peakStyle},${font},${peakSize},${assColor(peakColor)},${assColor(peakColor)},&H00000000,&H9A000000,-1,0,0,0,100,100,0,0,${borderStyle},${background === "box" ? 16 : 7},${background === "box" ? 0 : 4},2,60,60,${marginV},1`,
+    positionX: Math.round(Math.max(0.05, Math.min(0.95, horizontalFrac)) * OUTPUT_WIDTH),
+    positionY: Math.round((1 - Math.max(0.05, Math.min(0.95, verticalFrac))) * OUTPUT_HEIGHT),
+    motion:
+      animation === "pop"
+        ? "\\fscx112\\fscy112\\t(0,140,\\fscx100\\fscy100)"
+        : animation === "fade"
+          ? "\\fad(100,70)"
+          : "",
+    textColor,
+    peakColor,
+    uppercase: options.uppercase ?? false,
+    highlight: options.highlight === "word",
+  };
+}
 
-  const header = `[Script Info]
+/** The `[Script Info]` block shared by every ASS this app writes. */
+export function assScriptHeader(): string {
+  return `[Script Info]
 ScriptType: v4.00+
 PlayResX: ${OUTPUT_WIDTH}
 PlayResY: ${OUTPUT_HEIGHT}
 WrapStyle: 2
 ScaledBorderAndShadow: yes
 YCbCr Matrix: TV.709
+`;
+}
 
+const STYLE_FORMAT =
+  "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding";
+const EVENT_FORMAT = "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text";
+
+/**
+ * Serialize captions to an ASS subtitle file.
+ *
+ * Two styles per look: the default caption, and a larger accent-coloured peak
+ * style used for the emotional peak. Creator mode adds one look per caption
+ * scene (`sceneOptions`, keyed by scene id); a caption uses its scene's look.
+ *
+ * `highlight: "word"` writes one Dialogue per spoken word, the active word in
+ * the accent colour — the karaoke look — timed on the real onsets.
+ */
+export function renderAss(
+  captions: TimelineCaption[],
+  options: AssOptions = {},
+  sceneOptions: Record<string, AssOptions> = {}
+): string {
+  const base = resolveLook("", options);
+  const looks = new Map<string, ResolvedLook>();
+  Object.entries(sceneOptions).forEach(([sceneId, sceneOption], index) => {
+    looks.set(sceneId, resolveLook(String(index + 1), sceneOption));
+  });
+
+  const header = `${assScriptHeader()}
 [V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Cap,${font},${captionSize},${primary},${primary},&H00000000,&H9A000000,-1,0,0,0,100,100,0,0,${borderStyle},${outline},${shadow},2,80,80,${marginV},1
-Style: Peak,${font},${peakSize},${assColor(peakColor)},${assColor(peakColor)},&H00000000,&H9A000000,-1,0,0,0,100,100,0,0,${borderStyle},${background === "box" ? 16 : 7},${background === "box" ? 0 : 4},2,60,60,${marginV},1
+${STYLE_FORMAT}
+${[base, ...looks.values()].map((look) => look.styleRows).join("\n")}
 
 [Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+${EVENT_FORMAT}
 `;
 
   const rows: string[] = [];
+  const dialogue = (start: number, end: number, style: string, tags: string, text: string) =>
+    `Dialogue: 0,${assTime(start)},${assTime(end)},${style},,0,0,0,,{${tags}}${text}`;
 
   for (const caption of captions) {
-    const style = caption.emphasis ? "Peak" : "Cap";
-    const text = uppercase ? caption.text.toUpperCase() : caption.text;
-    const motion =
-      animation === "pop"
-        ? "\\fscx112\\fscy112\\t(0,140,\\fscx100\\fscy100)"
-        : animation === "fade"
-          ? "\\fad(100,70)"
-          : "";
-    const overrides = `\\an5\\pos(${positionX},${positionY})${motion}`;
-    rows.push(
-      `Dialogue: 0,${assTime(caption.start)},${assTime(caption.end)},${style},,0,0,0,,{${overrides}}${escapeAssText(
-        text
-      )}`
-    );
+    const look = (caption.sceneId && looks.get(caption.sceneId)) || base;
+    const style = caption.emphasis ? look.peakStyle : look.capStyle;
+    const position = `\\an5\\pos(${look.positionX},${look.positionY})`;
+    const words = caption.words ?? [];
+    const casing = (text: string) => (look.uppercase ? text.toUpperCase() : text);
+
+    if (!look.highlight || words.length < 2) {
+      rows.push(dialogue(caption.start, caption.end, style, `${position}${look.motion}`, escapeAssText(casing(caption.text))));
+      continue;
+    }
+
+    // Karaoke: the line is re-emitted per word span with that word coloured.
+    // Only the first span carries the entrance motion; re-popping every word
+    // reads as jitter.
+    // Inline colour overrides take `&HBBGGRR&` (no alpha byte).
+    const inline = (hex: string) => `&H${assColor(hex).slice(4)}&`;
+    const quiet = inline(caption.emphasis ? look.peakColor : look.textColor);
+    const loud = inline(caption.emphasis ? look.textColor : look.peakColor);
+    for (let i = 0; i < words.length; i++) {
+      const spanStart = Math.max(caption.start, words[i]!.t);
+      const spanEnd = i + 1 < words.length ? Math.max(spanStart, words[i + 1]!.t) : caption.end;
+      if (spanEnd - spanStart < 0.02) continue;
+      const text = words
+        .map((word, index) => {
+          const token = escapeAssText(casing(word.word));
+          return index === i ? `{\\c${loud}}${token}{\\c${quiet}}` : token;
+        })
+        .join(" ");
+      rows.push(dialogue(spanStart, spanEnd, style, `${position}${i === 0 ? look.motion : ""}`, text));
+    }
   }
 
   return `${header}${rows.join("\n")}\n`;

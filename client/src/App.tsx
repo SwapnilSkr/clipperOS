@@ -439,6 +439,23 @@ export function Studio() {
     );
   }
 
+  async function returnToClipWithOutro(clipId: string) {
+    if (!selectedId) return;
+    if (outroId) {
+      try {
+        const updated = await api.updateClip(clipId, {
+          edit: { outro: { enabled: true, outroId } },
+        });
+        setDetail((prev) =>
+          prev ? { ...prev, clips: prev.clips.map((clip) => (clip.id === updated.id ? updated : clip)) } : prev
+        );
+      } catch (err) {
+        setError(messageOf(err));
+      }
+    }
+    navigate(routes.clipMix(selectedId, clipId));
+  }
+
   async function skipOutroAndReturn(clipId: string) {
     if (!selectedId) return;
     try {
@@ -650,7 +667,7 @@ export function Studio() {
       .forEach((clip, index) => {
         window.setTimeout(() => {
           const anchor = document.createElement("a");
-          anchor.href = `${clipDownloadUrl(clip.id)}?download=1`;
+          anchor.href = clipDownloadUrl(clip.id, { download: true, bust: clip.renderedAt });
           anchor.download = `clip_${clip.rank}.mp4`;
           document.body.appendChild(anchor);
           anchor.click();
@@ -801,7 +818,7 @@ export function Studio() {
                 }
                 onSelectOutro={(id) => navigate(routes.outro(selectedId, returnClipId, id))}
                 onBack={() => navigate(routes.project(selectedId))}
-                onReturnToClip={(id) => navigate(routes.clipMix(selectedId, id))}
+                onReturnToClip={(id) => void returnToClipWithOutro(id)}
                 onSkipExport={(id) => void skipOutroAndReturn(id)}
               />
             ) : (

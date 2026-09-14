@@ -39,6 +39,8 @@ export interface CaptionStyle {
   peakColor: string;
   fontFamily: string;
   uppercase: boolean;
+  /** `word` colours the spoken word inside each caption (karaoke). */
+  highlight?: "none" | "word";
 }
 
 const CLEAN: CaptionStyle = {
@@ -235,5 +237,6 @@ export function resolveEffectiveCaptionStyle(
     peakColor: overrides.peakColor ?? style.peakColor,
     fontFamily: resolveCaptionFont(overrides.fontFamily ?? style.fontFamily),
     uppercase: overrides.uppercase ?? style.uppercase,
+    highlight: overrides.highlight ?? style.highlight,
   };
 }

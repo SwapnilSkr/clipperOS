@@ -10,7 +10,9 @@ import {
   outroNeedsJoin,
   mergeOutroLibraries,
   overlaySharedOutroLibrary,
+  mergeClipOutro,
   pickProjectOutro,
+  resolveOutroJoinId,
   resolveLibraryDefault,
   resolveTransition,
   sanitizeClipOutro,
@@ -99,6 +101,19 @@ check(
     undefined,
     "bbbb"
   )?.id === "bbbb"
+);
+check(
+  "a clip pick wins the join over the library default",
+  resolveOutroJoinId({ outroId: "bbbb" }, { id: "aaaa", ready: true }) === "bbbb"
+);
+check(
+  "join falls back to the ready sting when the clip names none",
+  resolveOutroJoinId({ enabled: true }, { id: "aaaa", ready: true }) === "aaaa"
+);
+check(
+  "a later save that omits the sting id keeps the stored pick",
+  mergeClipOutro({ enabled: true, outroId: "bbbb", transitionId: "smash" }, { enabled: true, transitionId: "smash" })
+    .outroId === "bbbb"
 );
 check(
   "shared merge keeps stings from every project",

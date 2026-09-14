@@ -109,7 +109,7 @@ export function ClipRow({
       <div className="flex shrink-0 items-center gap-0.5">
         {rendered ? (
           <a
-            href={`${clipDownloadUrl(clip.id)}?download=1`}
+            href={clipDownloadUrl(clip.id, { download: true, bust: clip.renderedAt })}
             download
             className="press inline-flex size-11 items-center justify-center rounded-md text-muted hover:bg-panel-2 hover:text-fg sm:size-8"
             aria-label={`Download clip ${clip.rank}`}

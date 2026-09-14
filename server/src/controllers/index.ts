@@ -42,4 +42,8 @@ export {
   previewClipReframe,
   writeClipShareCopy,
   cleanClipCaptionsRoute,
+  getClipPauses,
+  buildClipMatte,
+  streamClipMatte,
+  directClipRoute,
 } from "./clip.controller";

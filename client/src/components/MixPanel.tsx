@@ -1,16 +1,10 @@
-import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Music, Trash2, Upload, Volume2 } from "lucide-react";
-import {
-  api,
-  builtinAudioUrl,
-  sharedAudioUrl,
-  type AudioAsset,
-  type Soundtrack,
-  type SoundtrackHit,
-} from "@/api";
+import { api, type AudioAsset, type Soundtrack, type SoundtrackHit } from "@/api";
+import { MAX_SOUNDTRACK_HITS } from "@/lib/beat-plan";
 import { cn, timecode } from "@/lib/utils";
 
-export const MAX_SOUNDTRACK_HITS = 16;
+export { MAX_SOUNDTRACK_HITS };
 
 export function soundtrackPayload(track: Soundtrack): Soundtrack {
   const hits = track.sfx ?? [];
@@ -92,9 +86,7 @@ export function MixPanel({
   localTime,
   durationSec,
   outroSec = 0,
-  playing,
   live,
-  videoRef,
 }: {
   projectId: string;
   soundtrack: Soundtrack;
@@ -103,9 +95,8 @@ export function MixPanel({
   /** Clip window, or clip + sting when a ready outro is attached. */
   durationSec: number;
   outroSec?: number;
-  playing: boolean;
+  /** Whether the editor is playing the mix live (source preview). Playback itself is the editor's. */
   live: boolean;
-  videoRef: RefObject<HTMLVideoElement | null>;
 }) {
   const [library, setLibrary] = useState<AudioAsset[]>([]);
   const [custom, setCustom] = useState<AudioAsset[]>([]);
@@ -113,8 +104,6 @@ export function MixPanel({
   const [error, setError] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const [uploadKind, setUploadKind] = useState<"music" | "sfx">("sfx");
-  const musicEl = useRef<HTMLAudioElement>(null);
-  const lastLocal = useRef(localTime);
 
   function refreshLibrary() {
     void api
@@ -145,47 +134,7 @@ export function MixPanel({
     return map;
   }, [library, custom]);
 
-  useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
-    video.volume = live ? Math.min(1, Math.max(0, soundtrack.voiceGain ?? 1)) : 1;
-    return () => {
-      video.volume = 1;
-    };
-  }, [live, soundtrack.voiceGain, videoRef]);
-
-  const musicSrc = soundtrack.music?.assetId ? audioSrc(soundtrack.music.assetId) : undefined;
-
   const clipEnd = Math.max(0.1, durationSec - Math.max(0, outroSec));
-  const musicThroughOutro = outroSec > 0 && soundtrack.music?.carryIntoOutro !== false;
-  const musicPlaying = playing && (localTime <= clipEnd + 0.05 || musicThroughOutro);
-
-  useEffect(() => {
-    const el = musicEl.current;
-    if (!el) return;
-    if (!live || !musicSrc) {
-      el.pause();
-      return;
-    }
-    el.volume = Math.min(1, soundtrack.music?.gain ?? 0.22);
-    const bed = Math.max(0.5, el.duration || 16);
-    const target = localTime % bed;
-    if (Math.abs(el.currentTime - target) > 0.4) el.currentTime = target;
-    if (musicPlaying) void el.play().catch(() => undefined);
-    else el.pause();
-  }, [live, musicSrc, musicPlaying, localTime, soundtrack.music?.gain]);
-
-  useEffect(() => {
-    if (!live || !playing) {
-      lastLocal.current = localTime;
-      return;
-    }
-    const prev = lastLocal.current;
-    lastLocal.current = localTime;
-    for (const hit of soundtrack.sfx ?? []) {
-      if (prev <= hit.atSec && localTime >= hit.atSec) playOneShot(hit);
-    }
-  }, [live, playing, localTime, soundtrack.sfx, projectId]);
 
   function setMusic(assetId: string | null) {
     if (!assetId) {
@@ -270,8 +219,6 @@ export function MixPanel({
           Switch the preview to Source to hear this mix.
         </p>
       ) : null}
-
-      <audio ref={musicEl} src={musicSrc} preload="auto" loop hidden />
 
       <label className="block">
         <span className="text-ui flex items-center justify-between">
@@ -500,20 +447,6 @@ function Chip({
       {label}
     </button>
   );
-}
-
-function audioSrc(assetId: string): string {
-  if (assetId.startsWith("custom:")) {
-    return sharedAudioUrl(assetId.slice("custom:".length));
-  }
-  return builtinAudioUrl(assetId);
-}
-
-function playOneShot(hit: SoundtrackHit): void {
-  const src = audioSrc(hit.assetId);
-  const audio = new Audio(src);
-  audio.volume = Math.min(1, hit.gain ?? 0.9);
-  void audio.play().catch(() => undefined);
 }
 
 function round3(value: number): number {

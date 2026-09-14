@@ -35,6 +35,13 @@ const BUILTIN: AudioAsset[] = [
   { id: "pop", kind: "sfx", label: "Pop", durationSec: 0.09 },
   { id: "rise", kind: "sfx", label: "Rise", durationSec: 1.1 },
   { id: "click", kind: "sfx", label: "Click", durationSec: 0.04 },
+  { id: "swoosh", kind: "sfx", label: "Swoosh (soft)", durationSec: 0.7 },
+  { id: "riser", kind: "sfx", label: "Riser", durationSec: 0.65 },
+  { id: "boom", kind: "sfx", label: "Boom (sub)", durationSec: 0.9 },
+  { id: "thud", kind: "sfx", label: "Thud", durationSec: 0.3 },
+  { id: "shutter", kind: "sfx", label: "Shutter", durationSec: 0.16 },
+  { id: "ding", kind: "sfx", label: "Ding", durationSec: 0.9 },
+  { id: "tick", kind: "sfx", label: "Tick", durationSec: 0.06 },
 ];
 
 const BUILTIN_IDS = new Set(BUILTIN.map((asset) => asset.id));
@@ -306,8 +313,12 @@ export function buildSoundtrackGraph(input: {
   if (mixParts.length === 1) {
     graph.push(`${mixParts[0]}anull[outa]`);
   } else {
+    // Hits are cut hot (−1 dBTP) so they read over a loud voice; the sum can
+    // exceed full scale, so a brick-wall limiter catches those transients.
+    // `level=false` keeps it from re-levelling a quiet mix.
+    const limit = input.hits.length > 0 ? ",alimiter=limit=0.95:attack=2:release=60:level=false" : "";
     graph.push(
-      `${mixParts.join("")}amix=inputs=${mixParts.length}:duration=first:dropout_transition=0:normalize=0[outa]`
+      `${mixParts.join("")}amix=inputs=${mixParts.length}:duration=first:dropout_transition=0:normalize=0${limit}[outa]`
     );
   }
   return graph.join(";");

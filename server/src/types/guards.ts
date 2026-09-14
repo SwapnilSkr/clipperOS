@@ -75,6 +75,80 @@ const CaptionOverridesBody = t.Object({
   peakEmphasis: t.Optional(t.Boolean()),
   fontFamily: t.Optional(t.String({ maxLength: 60 })),
   uppercase: t.Optional(t.Boolean()),
+  highlight: t.Optional(t.Union([t.Literal("none"), t.Literal("word")])),
+});
+
+// ---- creator mode ----
+const PauseCutBody = t.Object({
+  id: t.String({ minLength: 1, maxLength: 64 }),
+  startSec: t.Number(),
+  endSec: t.Number(),
+  enabled: t.Boolean(),
+  source: t.Union([t.Literal("director"), t.Literal("user")]),
+});
+
+const CameraMoveBody = t.Object({
+  id: t.String({ minLength: 1, maxLength: 64 }),
+  kind: t.Union([t.Literal("punch"), t.Literal("push"), t.Literal("pull")]),
+  startSec: t.Number(),
+  endSec: t.Number(),
+  zoom: t.Number(),
+  anchor: t.Union([t.Literal("face"), t.Literal("center"), t.Object({ x: t.Number(), y: t.Number() })]),
+  ease: t.Union([t.Literal("cut"), t.Literal("out"), t.Literal("in_out")]),
+});
+
+const CaptionSceneBody = t.Object({
+  id: t.String({ minLength: 1, maxLength: 64 }),
+  startSec: t.Number(),
+  endSec: t.Number(),
+  label: t.Optional(t.String({ maxLength: 40 })),
+  styleId: t.Optional(t.String({ maxLength: 40 })),
+  overrides: t.Optional(CaptionOverridesBody),
+});
+
+const BehindTitleBody = t.Object({
+  id: t.String({ minLength: 1, maxLength: 64 }),
+  text: t.String({ maxLength: 120 }),
+  startSec: t.Number(),
+  endSec: t.Number(),
+  x: t.Number(),
+  y: t.Number(),
+  sizeScale: t.Number(),
+  fontFamily: t.Optional(t.String({ maxLength: 60 })),
+  color: t.String({ maxLength: 9 }),
+  uppercase: t.Optional(t.Boolean()),
+  animation: t.Union([t.Literal("none"), t.Literal("pop"), t.Literal("fade"), t.Literal("rise")]),
+  depth: t.Union([t.Literal("behind"), t.Literal("front")]),
+});
+
+export const CreatorPlanBody = t.Object({
+  enabled: t.Boolean(),
+  version: t.Literal(1),
+  cuts: t.Optional(t.Array(PauseCutBody, { maxItems: 40 })),
+  camera: t.Optional(
+    t.Object({
+      follow: t.Optional(
+        t.Object({
+          enabled: t.Boolean(),
+          tightness: t.Number(),
+          zoom: t.Optional(t.Number()),
+          response: t.Optional(t.Union([t.Literal("snappy"), t.Literal("natural"), t.Literal("smooth")])),
+          axis: t.Optional(t.Union([t.Literal("both"), t.Literal("x"), t.Literal("y")])),
+        })
+      ),
+      moves: t.Array(CameraMoveBody, { maxItems: 24 }),
+    })
+  ),
+  captionScenes: t.Optional(t.Array(CaptionSceneBody, { maxItems: 12 })),
+  titles: t.Optional(t.Array(BehindTitleBody, { maxItems: 6 })),
+  director: t.Optional(
+    t.Object({
+      notes: t.Optional(t.String({ maxLength: 600 })),
+      summary: t.Optional(t.String({ maxLength: 1200 })),
+      generatedAt: t.Optional(t.String({ maxLength: 40 })),
+      model: t.Optional(t.String({ maxLength: 80 })),
+    })
+  ),
 });
 
 const CaptionTextOverrideBody = t.Object({
@@ -167,6 +241,31 @@ const ClipEditBody = t.Object({
     })
   ),
   cleanup: t.Optional(t.Array(CleanupRegionBody, { maxItems: 8 })),
+  creator: t.Optional(CreatorPlanBody),
+});
+
+/** GET /api/clips/:id/pauses — dead-air candidates inside a window. */
+export const PausesQuery = t.Object({
+  startSec: t.Optional(t.String()),
+  endSec: t.Optional(t.String()),
+});
+
+/** POST /api/clips/:id/direct — one Director pass. */
+export const DirectClipBody = t.Object({
+  notes: t.Optional(t.String({ maxLength: 600 })),
+  /** Lanes to leave exactly as they are. */
+  keep: t.Optional(
+    t.Array(
+      t.Union([
+        t.Literal("cuts"),
+        t.Literal("camera"),
+        t.Literal("captions"),
+        t.Literal("titles"),
+        t.Literal("sfx"),
+      ]),
+      { maxItems: 5 }
+    )
+  ),
 });
 
 export const AudioLibraryQuery = t.Object({

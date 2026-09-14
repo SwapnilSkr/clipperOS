@@ -5,6 +5,10 @@ import {
   downloadClip,
   getClip,
   getClipWords,
+  getClipPauses,
+  buildClipMatte,
+  streamClipMatte,
+  directClipRoute,
   mergeClips,
   previewClipReframe,
   renderClips,
@@ -16,6 +20,8 @@ import {
   CleanCaptionsBody,
   ClipParams,
   ClipWordsQuery,
+  PausesQuery,
+  DirectClipBody,
   MergeClipsBody,
   PreviewReframeBody,
   RenderClipsBody,
@@ -29,6 +35,10 @@ export const clipRoutes = new Elysia({ prefix: "/api/clips" })
   .post("/merge", mergeClips, { body: MergeClipsBody })
   .get("/:id", getClip, { params: ClipParams })
   .get("/:id/words", getClipWords, { params: ClipParams, query: ClipWordsQuery })
+  .get("/:id/pauses", getClipPauses, { params: ClipParams, query: PausesQuery })
+  .post("/:id/matte", buildClipMatte, { params: ClipParams })
+  .get("/:id/matte", streamClipMatte, { params: ClipParams })
+  .post("/:id/direct", directClipRoute, { params: ClipParams, body: DirectClipBody })
   .get("/:id/download", downloadClip, { params: ClipParams })
   .patch("/:id", updateClip, { params: ClipParams, body: UpdateClipBody })
   .delete("/:id", deleteClip, { params: ClipParams })

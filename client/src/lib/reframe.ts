@@ -1,4 +1,6 @@
-import type { CropKeyframe, ReframeTrack } from "@/api";
+import type { BehindTitle, CropKeyframe, ReframeTrack } from "@/api";
+import { followCx, type CameraState } from "@/lib/creator-timeline";
+import { activeTitles, titleEntranceAt, titleFontPx, wrapTitle, TITLE_DEFAULT_FONT } from "@/lib/titles";
 
 // ============================================================
 // CROP PREVIEW
@@ -53,7 +55,9 @@ export function cropAtTime(
   track: ReframeTrack | undefined,
   seconds: number,
   sourceWidth: number,
-  sourceHeight: number
+  sourceHeight: number,
+  /** Creator mode's follow: blend the seat crop toward the recorded face. */
+  tightness = 0
 ): CropKeyframe {
   const fallback = centreCrop(sourceWidth, sourceHeight);
   if (!track || track.keyframes.length === 0) return fallback;
@@ -63,16 +67,18 @@ export function cropAtTime(
     return { t: 0, cx: sourceWidth / 2, cy: sourceHeight / 2, width: sourceWidth };
   }
 
-  let previous = track.keyframes[0]!;
-  let upcoming: CropKeyframe | undefined;
+  let previousKey = track.keyframes[0]!;
+  let upcomingKey: CropKeyframe | undefined;
   for (const keyframe of track.keyframes) {
-    if (keyframe.t <= seconds + 0.001) previous = keyframe;
+    if (keyframe.t <= seconds + 0.001) previousKey = keyframe;
     else {
-      upcoming = keyframe;
+      upcomingKey = keyframe;
       break;
     }
   }
-  if (!upcoming) return previous;
+  const previous = { ...previousKey, cx: followCx(previousKey, tightness, sourceWidth) };
+  if (!upcomingKey) return previous;
+  const upcoming = { ...upcomingKey, cx: followCx(upcomingKey, tightness, sourceWidth) };
 
   // Across a camera cut the crop holds then snaps. Interpolating here is what
   // makes the next speaker's head slide in from the side of the 9:16 window.
@@ -139,10 +145,11 @@ export function cropTransformFor(
   sourceWidth: number,
   sourceHeight: number,
   frameWidth: number,
-  frameHeight: number
+  frameHeight: number,
+  tightness = 0
 ): CropTransform {
   return cropLayoutFor(
-    cropAtTime(track, seconds, sourceWidth, sourceHeight),
+    cropAtTime(track, seconds, sourceWidth, sourceHeight, tightness),
     sourceWidth,
     sourceHeight,
     frameWidth,
@@ -190,19 +197,164 @@ export function sourceTimeOnTrack(
  * from the left. Drawing the crop from this frame's currentTime keeps them
  * on the same paint.
  */
+/** What the creator desk layers onto a painted frame. */
+export interface PaintExtras {
+  /** Digital zoom + anchor, applied like the burn: after the crop. */
+  camera?: CameraState;
+  /** Titles on the plan; the ones active at `sourceSec` are drawn. */
+  titles?: BehindTitle[];
+  /** Absolute source time of the frame, for title timing. */
+  sourceSec?: number;
+  /** The person matte video (source space, small), kept in step with the source. */
+  matte?: { video: HTMLVideoElement; width: number; height: number } | null;
+  /** CSS font stack + weight for a title's family. */
+  fontFor?: (family: string) => { stack: string; weight: number };
+}
+
+/** The part of the crop box that survives a zoom converging on (ax, ay). */
+function zoomedBox(box: CropBox, camera: CameraState | undefined): CropBox {
+  if (!camera || camera.zoom <= 1.0001) return box;
+  const width = box.width / camera.zoom;
+  const height = box.height / camera.zoom;
+  return {
+    width,
+    height,
+    x: box.x + (box.width - width) * camera.ax,
+    y: box.y + (box.height - height) * camera.ay,
+  };
+}
+
+let scratchCanvas: HTMLCanvasElement | null = null;
+let maskCanvas: HTMLCanvasElement | null = null;
+
+/**
+ * The matte is a grayscale VIDEO: opaque everywhere, luma is the mask. Canvas
+ * compositing only reads alpha, so the luma is copied into the alpha channel
+ * here (limited-range 16..235 mapped to 0..255). One pass per painted frame,
+ * only while a behind-title is on screen.
+ */
+function lumaToAlphaMask(
+  matte: NonNullable<PaintExtras["matte"]>,
+  box: CropBox,
+  sourceWidth: number,
+  sourceHeight: number,
+  width: number,
+  height: number
+): HTMLCanvasElement | null {
+  maskCanvas ??= document.createElement("canvas");
+  if (maskCanvas.width !== width || maskCanvas.height !== height) {
+    maskCanvas.width = width;
+    maskCanvas.height = height;
+  }
+  const mctx = maskCanvas.getContext("2d", { willReadFrequently: true });
+  if (!mctx) return null;
+  const sx = matte.width / sourceWidth;
+  const sy = matte.height / sourceHeight;
+  mctx.globalCompositeOperation = "source-over";
+  mctx.drawImage(matte.video, box.x * sx, box.y * sy, box.width * sx, box.height * sy, 0, 0, width, height);
+  const image = mctx.getImageData(0, 0, width, height);
+  const data = image.data;
+  for (let i = 0; i < data.length; i += 4) {
+    const luma = data[i]!;
+    data[i + 3] = luma <= 16 ? 0 : luma >= 235 ? 255 : Math.round(((luma - 16) / 219) * 255);
+  }
+  mctx.putImageData(image, 0, 0);
+  return maskCanvas;
+}
+
+function drawTitle(
+  ctx: CanvasRenderingContext2D,
+  canvas: HTMLCanvasElement,
+  title: BehindTitle,
+  sourceSec: number,
+  fontFor?: PaintExtras["fontFor"]
+): void {
+  const entrance = titleEntranceAt(title, sourceSec);
+  if (entrance.alpha <= 0) return;
+  const scale = canvas.height / 1920;
+  const px = titleFontPx(title);
+  const font = fontFor?.(title.fontFamily ?? TITLE_DEFAULT_FONT);
+  const lines = wrapTitle(title.uppercase ? title.text.toUpperCase() : title.text, px);
+  const lineHeight = px * 1.12 * scale;
+  const cx = title.x * canvas.width;
+  const cy = title.y * canvas.height + entrance.dy * scale;
+  ctx.save();
+  ctx.globalAlpha = entrance.alpha;
+  ctx.translate(cx, cy);
+  ctx.scale(entrance.scale, entrance.scale);
+  ctx.font = `${font?.weight ?? 400} ${px * scale}px ${font?.stack ?? `${TITLE_DEFAULT_FONT}, Impact, sans-serif`}`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.lineJoin = "round";
+  ctx.lineWidth = Math.max(2, px * scale * 0.09);
+  ctx.strokeStyle = "rgba(0,0,0,0.9)";
+  ctx.fillStyle = title.color;
+  ctx.shadowColor = "rgba(0,0,0,0.6)";
+  ctx.shadowBlur = 6 * scale;
+  ctx.shadowOffsetY = 4 * scale;
+  lines.forEach((line, index) => {
+    const y = (index - (lines.length - 1) / 2) * lineHeight;
+    ctx.strokeText(line, 0, y);
+    ctx.fillText(line, 0, y);
+  });
+  ctx.restore();
+}
+
+/**
+ * Paint the current video frame through the 9:16 crop, then creator mode's
+ * layers in the burn's order: picture (crop + zoom) → behind-titles → the
+ * speaker's cutout → front-titles. Captions are a DOM overlay on top.
+ */
 export function paintCropPreview(
   video: HTMLVideoElement,
   canvas: HTMLCanvasElement,
   track: ReframeTrack | undefined,
   clipTime: number,
   sourceWidth: number,
-  sourceHeight: number
+  sourceHeight: number,
+  tightness = 0,
+  extras: PaintExtras = {}
 ): void {
   if (video.readyState < 2 || sourceWidth < 2 || sourceHeight < 2) return;
   const ctx = canvas.getContext("2d");
   if (!ctx || canvas.width < 2 || canvas.height < 2) return;
-  const box = cropBoxFor(cropAtTime(track, clipTime, sourceWidth, sourceHeight), sourceWidth, sourceHeight);
+  const crop = cropBoxFor(cropAtTime(track, clipTime, sourceWidth, sourceHeight, tightness), sourceWidth, sourceHeight);
+  const box = zoomedBox(crop, extras.camera);
   ctx.drawImage(video, box.x, box.y, box.width, box.height, 0, 0, canvas.width, canvas.height);
+
+  const sourceSec = extras.sourceSec;
+  const titles = sourceSec != null ? activeTitles(extras.titles, sourceSec) : [];
+  if (titles.length === 0 || sourceSec == null) return;
+
+  const behind = titles.filter((title) => title.depth === "behind");
+  const front = titles.filter((title) => title.depth === "front");
+  const matte = extras.matte;
+  const matteReady = Boolean(matte && matte.video.readyState >= 2);
+
+  if (behind.length > 0 && matteReady && matte) {
+    for (const title of behind) drawTitle(ctx, canvas, title, sourceSec, extras.fontFor);
+    // The cutout: the same frame region masked by the matte, composited back.
+    scratchCanvas ??= document.createElement("canvas");
+    if (scratchCanvas.width !== canvas.width || scratchCanvas.height !== canvas.height) {
+      scratchCanvas.width = canvas.width;
+      scratchCanvas.height = canvas.height;
+    }
+    const sctx = scratchCanvas.getContext("2d");
+    const mask = lumaToAlphaMask(matte, box, sourceWidth, sourceHeight, canvas.width, canvas.height);
+    if (sctx && mask) {
+      sctx.globalCompositeOperation = "source-over";
+      sctx.clearRect(0, 0, scratchCanvas.width, scratchCanvas.height);
+      sctx.drawImage(video, box.x, box.y, box.width, box.height, 0, 0, scratchCanvas.width, scratchCanvas.height);
+      sctx.globalCompositeOperation = "destination-in";
+      sctx.drawImage(mask, 0, 0);
+      sctx.globalCompositeOperation = "source-over";
+      ctx.drawImage(scratchCanvas, 0, 0);
+    }
+  } else {
+    // No matte yet: a behind-title shows in front rather than not at all.
+    for (const title of behind) drawTitle(ctx, canvas, title, sourceSec, extras.fontFor);
+  }
+  for (const title of front) drawTitle(ctx, canvas, title, sourceSec, extras.fontFor);
 }
 
 /** The inverse: a point in frame pixels -> SOURCE pixels. */

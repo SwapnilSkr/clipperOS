@@ -9,6 +9,7 @@ import { detectGenre } from "./genre-detect.service";
 import { mineMoments } from "./mining.service";
 import { holdCropUntilCuts } from "./speaker-reframe.service";
 import { overlaySharedOutroLibrary, pickProjectOutro } from "./outro.service";
+import { plainCreatorPlan } from "./creator-plan.service";
 import { generateProjectShareCopy } from "./share-copy.service";
 
 // ---------------------------------------------------------------------------
@@ -452,6 +453,7 @@ export function serializeClip(doc: IClip): ClipPayload {
                 peakEmphasis: doc.edit.captionOverrides.peakEmphasis,
                 fontFamily: doc.edit.captionOverrides.fontFamily,
                 uppercase: doc.edit.captionOverrides.uppercase,
+                highlight: doc.edit.captionOverrides.highlight,
               }
             : undefined,
           captionTextOverrides: doc.edit.captionTextOverrides?.map((item) => ({
@@ -477,6 +479,9 @@ export function serializeClip(doc: IClip): ClipPayload {
             start: region.start,
             end: region.end,
           })),
+          // The plan is re-read through its sanitiser: that yields a plain,
+          // typed copy and drops nothing the schema accepted.
+          creator: plainCreatorPlan(doc.edit.creator),
         }
       : undefined,
     segments: doc.segments?.map((segment) => ({

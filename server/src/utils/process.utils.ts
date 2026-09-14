@@ -64,10 +64,18 @@ export function runCommand(
     );
     proc.on("exit", (code) => {
       if (code === 0) resolve();
-      else
-        reject(
-          new Error(`${options.label ?? bin} exited ${code}: ${stderr.slice(-600) || stdout.slice(-600)}`)
-        );
+      else reject(new Error(`${options.label ?? bin} exited ${code}: ${errorTail(stderr || stdout)}`));
     });
   });
+}
+
+/**
+ * The useful part of a failed tool's output. FFmpeg prints the actual cause
+ * (a filter that failed to parse) first and pages of per-thread shutdown noise
+ * after it, so a tail alone reports "could not open encoder" for everything.
+ */
+function errorTail(output: string): string {
+  const text = output.trim();
+  if (text.length <= 1400) return text;
+  return `${text.slice(0, 700)}\n…\n${text.slice(-700)}`;
 }

@@ -106,8 +106,9 @@ failing the import. You can always override it — before mining, or afterwards 
 - **Redis** (`redis-server`)
 - **OpenRouter API key**
 - Optional: **AWS S3** credentials for CDN delivery, **whisper.cpp** for
-  caption-less sources, and the **local vision stack** (OpenCV + YuNet) for
-  speaker-aware reframing and watermark removal
+  caption-less sources, and the **local vision stack** (OpenCV + YuNet, plus
+  onnxruntime + RobustVideoMatting) for speaker-aware reframing, watermark
+  removal and creator mode's behind-subject titles
 
 ## Setup
 
@@ -273,6 +274,35 @@ renderer is the only thing that interprets it.
     but it interpolates the rect's border inward and leaves faint stripes on
     anything larger than a small logo.
 
+### Creator mode
+
+The third desk in the editor (**Edit · Create · Sound**, `?desk=create`). Where the
+Edit desk sets one look for the whole clip, Create carries a **beat plan** — the
+per-scene decisions a Shorts editor makes — on a lane timeline, and renders it
+WYSIWYG. It lives on `clip.edit.creator`; a clip without one (or with it switched
+off) renders exactly as before.
+
+| Lane | What it is | How it burns |
+|---|---|---|
+| **Cuts** | Dead air to remove. *Find dead air* intersects word-onset gaps with ffmpeg `silencedetect`; each candidate is a toggle. | The trim becomes N kept windows, concatenated in one graph (the merge path). The player skips the gaps. |
+| **Camera** | *Ride the speaker* (the crop follows the tracked face by a tightness; optional persistent punch-in) and **moves**: `punch` (jump in, hold, release), `push` (slow creep), `pull` (open tight, settle). Anchor on the face, the centre, or a point. | `scale … eval=frame` + `crop` with piecewise expressions of `t` — the same technique as the pan — so the preview's zoom is the burn's zoom. Zoom is capped at 1.5×; the UI warns past 1.35× on 1080p. |
+| **Captions** | Scenes with their own look: preset, font, size, colours, box, words-per-caption, and *colour the spoken word* (karaoke). A group never crosses a scene boundary. | One ASS style pair per scene; karaoke writes one line per word span with the active word in the accent. |
+| **Titles** | Free-placed hook text, *behind* the speaker or in front, with pop / fade / rise entrances. | A behind-title is composited between the background and the speaker's cutout from a **person matte** (RobustVideoMatting on onnxruntime, in the vision venv), built only over the title's span and cached per clip under `storage/media/<project>/matte/`. Without the matte the title burns in front and the render says so. |
+| **SFX** | The Sound desk's hits, on the output clock, drawn as pins. | `mixSoundtrackOntoClip`, unchanged. |
+
+**The AI Director** (`POST /api/clips/:id/direct`) writes the whole plan in one
+call from what the pipeline already knows — every word onset, the mined peak,
+shot changes, where the face sits, the dead air, the catalogue of looks and
+sounds — and saves it through the same sanitiser as the editor. It is on demand:
+*Direct this clip*, then *Redirect* with notes, locking any lane you want kept.
+A malformed answer leaves the stored plan untouched. `DIRECTOR_MODEL` picks the
+model (default `google/gemini-2.5-flash`).
+
+Timing is source seconds everywhere; `creator-timeline.ts` (server, and a verbatim
+client port) owns the source↔output clock and the numeric camera, and
+`bun run creator:validate` + `client/scripts/validate-creator-parity.ts` assert
+the burn's expressions, the preview's maths and the two ports agree.
+
 ### Preview is the output
 
 The player shows the **9:16 crop**, not the source. It applies the same step
@@ -393,6 +423,7 @@ syllable costs retention, a missing comma doesn't.
 
 ```bash
 bun run validate:mining <url> [genreId]   # mine a real video, assert the contract
+bun run creator:validate                  # beat plan sanitiser, clock mapping, camera expressions, Director post-processing
 bun run reframe:validate                  # speaker-tracking decision logic, no Python needed
 bun run vision:install                    # venv + OpenCV + YuNet (for tracking and cleanup)
 bun run typecheck
@@ -419,7 +450,14 @@ server/src/
   services/reframe.service.ts      the framing provider ladder
   services/speaker-reframe.service.ts  faces + mouth motion -> crop keyframes
   services/cleanup.service.ts      watermark removal (inpaint, then delogo)
-  services/caption.service.ts      caption chunks + ASS generation
+  services/caption.service.ts      caption chunks + ASS generation (per-scene looks, karaoke)
+  services/creator-timeline.ts     creator mode's clock mapping + numeric camera (ported to the client)
+  services/creator-plan.service.ts beat plan sanitiser
+  services/camera.service.ts       the camera as FFmpeg expressions
+  services/pause-detect.service.ts dead-air candidates (word gaps ∩ silencedetect)
+  services/matte.service.ts        the person matte behind titles (RVM via python/person_matte.py)
+  services/title.service.ts        title ASS layers
+  services/director.service.ts     the AI Director: brief → plan
   services/clip-render.service.ts  the single-pass render (and the concat paths)
   services/clip.service.ts         edit specs, merges, delete, storage accounting
   services/storage-custody.service.ts  orphan sweeps + S3 reconciliation
@@ -434,6 +472,9 @@ client/src/
   App.tsx                          routes, state hub, polling, actions
   routes.ts                        the URL map (/projects/:id, /projects/:id/clips/:id)
   components/ClipEditor.tsx        the editor page (trim, live captions, cleanup, merge parts)
+  components/BeatTimeline.tsx      creator mode's lane timeline
+  components/CreatorDesk.tsx       creator mode's right rail (Director, add-at-playhead, inspector)
+  lib/creator-timeline.ts          port of the server's creator timeline
   components/CleanupLayer.tsx      draw/move/resize watermark regions
   components/CaptionOverlay.tsx    captions drawn like the burn, at any player size
   lib/reframe.ts                   the crop preview's step function and transforms
@@ -442,8 +483,8 @@ client/src/
 
 ## Not in v1
 
-Music-drop alignment, b-roll cutaways, SFX, colour grading, loudness
-normalisation, publishing, auth/billing. Audio/visual peak detection (see Known
+Music-drop alignment, b-roll cutaways, loudness normalisation, publishing,
+auth/billing. Audio/visual peak detection (see Known
 limits). A generated headline hook-card is also deferred — `hookText` is shown on
 the board but not burned, since a duplicate of the opening captions is worse than
 none.

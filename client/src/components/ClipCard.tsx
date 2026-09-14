@@ -70,7 +70,7 @@ export function ClipCard({
         <div className="phone-frame relative w-full">
           {rendered ? (
             <video
-              src={clip.outputUrl}
+              src={clipDownloadUrl(clip.id, { bust: clip.renderedAt })}
               controls
               playsInline
               preload="metadata"
@@ -167,7 +167,7 @@ export function ClipCard({
 
           {rendered ? (
             <a
-              href={`${clipDownloadUrl(clip.id)}?download=1`}
+              href={clipDownloadUrl(clip.id, { download: true, bust: clip.renderedAt })}
               download
               className="press inline-flex size-9 items-center justify-center rounded-md text-muted hover:bg-panel-2 hover:text-fg"
               aria-label={`Download clip ${clip.rank}`}

@@ -45,3 +45,12 @@ export function resolveModels(tier: Tier = ENV_TIER): ModelSet {
     vision: config.visionModelOverride || base.vision,
   };
 }
+
+/**
+ * The creator-mode Director writes a whole beat plan in one call, so it gets a
+ * stronger model than the latency-driven mining default. `DIRECTOR_MODEL`
+ * overrides it independently of `LLM_MODEL`.
+ */
+export function directorModel(): string {
+  return process.env.DIRECTOR_MODEL?.trim() || REGISTRY.value.llm;
+}

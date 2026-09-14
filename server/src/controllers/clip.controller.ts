@@ -19,6 +19,9 @@ import { fail, ok } from "../utils/response.utils";
 import { previewClipReframe as runPreviewClipReframe } from "../services/clip-render.service";
 import { generateClipShareCopy } from "../services/share-copy.service";
 import { cleanClipCaptions } from "../services/caption-clean.service";
+import { detectClipPauses } from "../services/pause-detect.service";
+import { ensureClipMatte, matteAvailable } from "../services/matte.service";
+import { directClip, type DirectorLane } from "../services/director.service";
 
 type Ctx = ApiContext;
 
@@ -105,11 +108,11 @@ export async function downloadClip({ params, request, set }: Ctx) {
 
     // Returned as a `Bun.file`, not a Response, so the runtime applies the
     // client's Range and answers 206 — see utils/stream.utils.ts.
-    return serveLocalVideo(
-      set,
-      path,
-      wantsDownload ? { "content-disposition": `attachment; filename="${filename}"` } : {}
-    );
+    return serveLocalVideo(set, path, {
+      "cache-control": "private, no-cache",
+      ...(clip.renderedAt ? { etag: `"${new Date(clip.renderedAt).getTime()}"` } : {}),
+      ...(wantsDownload ? { "content-disposition": `attachment; filename="${filename}"` } : {}),
+    });
   } catch (error: unknown) {
     set.status = 500;
     return fail(getErrorMessage(error));
@@ -180,6 +183,82 @@ export async function getClipWords({ params, query, set }: Ctx) {
         endSec: Number.isFinite(endSec) ? endSec : undefined,
       })
     );
+  } catch (error: unknown) {
+    const message = getErrorMessage(error);
+    set.status = message === "Clip not found" ? 404 : 500;
+    return fail(message);
+  }
+}
+
+/** GET /api/clips/:id/pauses — dead-air candidates for creator mode's cut lane. */
+export async function getClipPauses({ params, query, set }: Ctx) {
+  try {
+    const raw = (query ?? {}) as { startSec?: string | number; endSec?: string | number };
+    const startSec = raw.startSec != null ? Number(raw.startSec) : undefined;
+    const endSec = raw.endSec != null ? Number(raw.endSec) : undefined;
+    return ok(
+      await detectClipPauses(params.id, {
+        startSec: Number.isFinite(startSec) ? startSec : undefined,
+        endSec: Number.isFinite(endSec) ? endSec : undefined,
+      })
+    );
+  } catch (error: unknown) {
+    const message = getErrorMessage(error);
+    set.status = message === "Clip not found" ? 404 : 500;
+    return fail(message);
+  }
+}
+
+/**
+ * POST /api/clips/:id/matte — build (or confirm) the person matte the editor
+ * needs to preview a behind-subject title. Idempotent; cached per window.
+ */
+export async function buildClipMatte({ params, set }: Ctx) {
+  try {
+    if (!matteAvailable()) {
+      return ok({ ready: false, reason: "The person matte needs the vision stack: run `bun run vision:install`." });
+    }
+    const matte = await ensureClipMatte(params.id);
+    if (!matte) return ok({ ready: false, reason: "No behind-subject title to matte, or the source is not local yet." });
+    return ok({
+      ready: true,
+      url: `/api/clips/${params.id}/matte`,
+      originSec: matte.originSec,
+      fps: matte.fps,
+      width: matte.width,
+      height: matte.height,
+    });
+  } catch (error: unknown) {
+    const message = getErrorMessage(error);
+    set.status = message === "Clip not found" ? 404 : 500;
+    return fail(message);
+  }
+}
+
+/** GET /api/clips/:id/matte — stream the cached mask video for the preview. */
+export async function streamClipMatte({ params, set }: Ctx) {
+  try {
+    const clip = await Clip.findById(params.id).select("matte").lean();
+    if (!clip?.matte?.path || !(await fileExists(clip.matte.path))) {
+      set.status = 404;
+      return fail("No matte for this clip");
+    }
+    return serveLocalVideo(set, clip.matte.path, {
+      "cache-control": "private, no-cache",
+      etag: `"${clip.matte.bytes ?? 0}-${clip.matte.for.spans ?? ""}"`,
+    });
+  } catch (error: unknown) {
+    set.status = 500;
+    return fail(getErrorMessage(error));
+  }
+}
+
+/** POST /api/clips/:id/direct — one Director pass; writes the plan and returns the clip. */
+export async function directClipRoute({ params, body, set }: Ctx) {
+  try {
+    const input = (body ?? {}) as { notes?: string; keep?: DirectorLane[] };
+    const result = await directClip(params.id, { notes: input.notes, keep: input.keep });
+    return ok({ clip: serializeClip(result.clip), summary: result.summary, model: result.model });
   } catch (error: unknown) {
     const message = getErrorMessage(error);
     set.status = message === "Clip not found" ? 404 : 500;

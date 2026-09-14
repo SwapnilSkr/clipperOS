@@ -25,6 +25,121 @@ export interface CaptionOverrides {
   peakEmphasis?: boolean;
   fontFamily?: string;
   uppercase?: boolean;
+  /** `word` colours the spoken word inside each caption (karaoke). */
+  highlight?: "none" | "word";
+}
+
+// ---- creator mode: the beat plan (mirrors server/src/types/clip.types.ts) ----
+
+export interface PauseCut {
+  id: string;
+  startSec: number;
+  endSec: number;
+  enabled: boolean;
+  source: "director" | "user";
+}
+
+export type CameraMoveKind = "punch" | "push" | "pull";
+export type CameraEase = "cut" | "out" | "in_out";
+export type CameraAnchor = "face" | "center" | { x: number; y: number };
+
+export interface CameraMove {
+  id: string;
+  kind: CameraMoveKind;
+  startSec: number;
+  endSec: number;
+  zoom: number;
+  anchor: CameraAnchor;
+  ease: CameraEase;
+}
+
+export type FollowResponse = "snappy" | "natural" | "smooth";
+export type FollowAxis = "both" | "x" | "y";
+
+export interface CameraFollow {
+  enabled: boolean;
+  tightness: number;
+  zoom?: number;
+  response?: FollowResponse;
+  axis?: FollowAxis;
+}
+
+export interface CameraPlan {
+  follow?: CameraFollow;
+  moves: CameraMove[];
+}
+
+export interface CaptionScene {
+  id: string;
+  startSec: number;
+  endSec: number;
+  label?: string;
+  styleId?: string;
+  overrides?: CaptionOverrides;
+}
+
+export type TitleAnimation = "none" | "pop" | "fade" | "rise";
+
+export interface BehindTitle {
+  id: string;
+  text: string;
+  startSec: number;
+  endSec: number;
+  x: number;
+  y: number;
+  sizeScale: number;
+  fontFamily?: string;
+  color: string;
+  uppercase?: boolean;
+  animation: TitleAnimation;
+  depth: "behind" | "front";
+}
+
+export interface DirectorNotes {
+  notes?: string;
+  summary?: string;
+  generatedAt?: string;
+  model?: string;
+}
+
+export interface CreatorPlan {
+  enabled: boolean;
+  version: 1;
+  cuts?: PauseCut[];
+  camera?: CameraPlan;
+  captionScenes?: CaptionScene[];
+  titles?: BehindTitle[];
+  director?: DirectorNotes;
+}
+
+export const MAX_PAUSE_CUTS = 40;
+export const MAX_CAMERA_MOVES = 24;
+export const MAX_CAPTION_SCENES = 12;
+export const MAX_TITLES = 6;
+export const MAX_CAMERA_ZOOM = 1.5;
+export const MAX_FOLLOW_ZOOM = 1.3;
+
+export type DirectorLane = "cuts" | "camera" | "captions" | "titles" | "sfx";
+
+export interface MatteInfo {
+  ready: boolean;
+  reason?: string;
+  url?: string;
+  originSec?: number;
+  fps?: number;
+  width?: number;
+  height?: number;
+}
+
+export interface PauseCandidate extends PauseCut {
+  savesSec: number;
+}
+
+export interface PauseDetectResult {
+  startSec: number;
+  endSec: number;
+  candidates: PauseCandidate[];
+  listened: boolean;
 }
 
 export interface CaptionTextOverride {
@@ -178,6 +293,10 @@ export interface CropKeyframe {
   cx: number;
   cy: number;
   width: number;
+  /** Tracked speaker face (centre + width, source px) when the analyser saw one. */
+  fx?: number;
+  fy?: number;
+  fw?: number;
 }
 
 /** The framing the renderer will use, so the preview can reproduce it exactly. */
@@ -236,6 +355,8 @@ export interface ClipEdit {
   outro?: ClipOutro;
   /** Burned-in text / watermark regions to remove. Empty array clears them. */
   cleanup?: CleanupRegion[];
+  /** Creator-mode beat plan. Absent or disabled leaves the render on the original path. */
+  creator?: CreatorPlan;
 }
 
 /** One ordered piece of a merge, in absolute source seconds. */
@@ -271,6 +392,7 @@ export interface CaptionStyleInfo {
   peakColor: string;
   fontFamily: string;
   uppercase: boolean;
+  highlight?: "none" | "word";
 }
 
 /** A clip's window plus the word onsets inside it, for local preview. */
@@ -529,6 +651,26 @@ export const api = {
     return request<ClipWords>(`/clips/${id}/words${query ? `?${query}` : ""}`);
   },
 
+  /** Dead-air candidates inside a window, for creator mode's cut lane. */
+  getClipPauses: (id: string, range?: { startSec?: number; endSec?: number }) => {
+    const params = new URLSearchParams();
+    if (range?.startSec != null) params.set("startSec", String(range.startSec));
+    if (range?.endSec != null) params.set("endSec", String(range.endSec));
+    const query = params.toString();
+    return request<PauseDetectResult>(`/clips/${id}/pauses${query ? `?${query}` : ""}`);
+  },
+
+  /** One Director pass: writes a beat plan (and SFX hits) for the clip. */
+  directClip: (id: string, input: { notes?: string; keep?: DirectorLane[] } = {}) =>
+    request<{ clip: ClipPayload; summary: string; model: string }>(`/clips/${id}/direct`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+
+  /** Build (or confirm) the person matte behind-subject titles need in the preview. */
+  buildClipMatte: (id: string) =>
+    request<MatteInfo>(`/clips/${id}/matte`, { method: "POST" }),
+
   /** The available caption looks. Served, not hardcoded. */
   listCaptionStyles: () => request<CaptionStyleInfo[]>("/caption-styles"),
 
@@ -607,8 +749,19 @@ export const api = {
     }),
 };
 
-export function clipDownloadUrl(clipId: string): string {
-  return `${BASE}/clips/${clipId}/download`;
+export function clipDownloadUrl(
+  clipId: string,
+  options: { bust?: string; download?: boolean } = {}
+): string {
+  const params = new URLSearchParams();
+  if (options.download) params.set("download", "1");
+  if (options.bust) params.set("v", options.bust);
+  const query = params.toString();
+  return `${BASE}/clips/${clipId}/download${query ? `?${query}` : ""}`;
+}
+
+export function clipMatteUrl(clipId: string, bust: string): string {
+  return `${BASE}/clips/${clipId}/matte?v=${encodeURIComponent(bust)}`;
 }
 
 export function builtinAudioUrl(id: string): string {

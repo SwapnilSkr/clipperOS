@@ -66,6 +66,16 @@ export interface IClip extends Document {
 
   /** The user's edit spec. Absent means "render the mined window as-is". */
   edit?: ClipEdit;
+  /**
+   * Cached person matte (a grayscale mask video in source space) for
+   * behind-subject titles. Built on demand, keyed to the analysed span, and
+   * removed with the clip.
+   */
+  matte?: {
+    path: string;
+    for: { startSec: number; endSec: number; v: number; spans?: string };
+    bytes?: number;
+  };
   /** Ordered pieces of a merge. Present only when `kind === "merge"`. */
   segments?: ClipSegment[];
   /** Which clips a merge was built from. Provenance only — sources are kept. */
@@ -100,6 +110,105 @@ const captionOverridesSchema = new Schema(
     peakEmphasis: { type: Boolean },
     fontFamily: { type: String, trim: true },
     uppercase: { type: Boolean },
+    highlight: { type: String, enum: ["none", "word"] },
+  },
+  { _id: false }
+);
+
+// ---- creator mode: the beat plan ----
+const pauseCutSchema = new Schema(
+  {
+    id: { type: String, required: true, trim: true, maxlength: 64 },
+    startSec: { type: Number, required: true, min: 0 },
+    endSec: { type: Number, required: true, min: 0 },
+    enabled: { type: Boolean, required: true },
+    source: { type: String, enum: ["director", "user"], required: true },
+  },
+  { _id: false }
+);
+
+const cameraMoveSchema = new Schema(
+  {
+    id: { type: String, required: true, trim: true, maxlength: 64 },
+    kind: { type: String, enum: ["punch", "push", "pull"], required: true },
+    startSec: { type: Number, required: true, min: 0 },
+    endSec: { type: Number, required: true, min: 0 },
+    zoom: { type: Number, required: true, min: 1, max: 1.5 },
+    // "face" | "center" | { x, y } — a union, so Mixed.
+    anchor: { type: Schema.Types.Mixed, required: true },
+    ease: { type: String, enum: ["cut", "out", "in_out"], required: true },
+  },
+  { _id: false }
+);
+
+const captionSceneSchema = new Schema(
+  {
+    id: { type: String, required: true, trim: true, maxlength: 64 },
+    startSec: { type: Number, required: true, min: 0 },
+    endSec: { type: Number, required: true, min: 0 },
+    label: { type: String, trim: true, maxlength: 40 },
+    styleId: { type: String, trim: true, maxlength: 40 },
+    overrides: { type: captionOverridesSchema },
+  },
+  { _id: false }
+);
+
+const behindTitleSchema = new Schema(
+  {
+    id: { type: String, required: true, trim: true, maxlength: 64 },
+    text: { type: String, required: true, maxlength: 120 },
+    startSec: { type: Number, required: true, min: 0 },
+    endSec: { type: Number, required: true, min: 0 },
+    x: { type: Number, required: true, min: 0, max: 1 },
+    y: { type: Number, required: true, min: 0, max: 1 },
+    sizeScale: { type: Number, required: true, min: 0.3, max: 4 },
+    fontFamily: { type: String, trim: true },
+    color: { type: String, required: true, trim: true },
+    uppercase: { type: Boolean },
+    animation: { type: String, enum: ["none", "pop", "fade", "rise"], required: true },
+    depth: { type: String, enum: ["behind", "front"], required: true },
+  },
+  { _id: false }
+);
+
+const creatorPlanSchema = new Schema(
+  {
+    enabled: { type: Boolean, required: true },
+    version: { type: Number, required: true },
+    cuts: { type: [pauseCutSchema], default: undefined },
+    camera: {
+      type: new Schema(
+        {
+          follow: {
+            type: new Schema(
+              {
+                enabled: { type: Boolean, required: true },
+                tightness: { type: Number, required: true, min: 0, max: 1 },
+                zoom: { type: Number, min: 1, max: 1.3 },
+                response: { type: String, enum: ["snappy", "natural", "smooth"] },
+                axis: { type: String, enum: ["both", "x", "y"] },
+              },
+              { _id: false }
+            ),
+          },
+          moves: { type: [cameraMoveSchema], default: [] },
+        },
+        { _id: false }
+      ),
+    },
+    captionScenes: { type: [captionSceneSchema], default: undefined },
+    titles: { type: [behindTitleSchema], default: undefined },
+    director: {
+      type: new Schema(
+        {
+          notes: { type: String, maxlength: 600 },
+          summary: { type: String, maxlength: 1200 },
+          generatedAt: { type: String },
+          model: { type: String, maxlength: 80 },
+        },
+        { _id: false }
+      ),
+    },
   },
   { _id: false }
 );
@@ -209,6 +318,7 @@ const clipEditSchema = new Schema(
     // Omitting this here silently drops every region on write — the whole feature
     // no-ops with no error anywhere.
     cleanup: { type: [cleanupRegionSchema], default: undefined },
+    creator: { type: creatorPlanSchema },
   },
   { _id: false }
 );
@@ -274,6 +384,27 @@ const clipSchema = new Schema<IClip>(
     reframeNote: { type: String, trim: true },
     // Free-form: a track is keyframe geometry, not a fixed shape.
     reframeTrack: { type: Schema.Types.Mixed },
+    matte: {
+      type: new Schema(
+        {
+          path: { type: String, required: true },
+          for: {
+            type: new Schema(
+              {
+                startSec: { type: Number, required: true },
+                endSec: { type: Number, required: true },
+                v: { type: Number, required: true },
+                spans: { type: String, maxlength: 400 },
+              },
+              { _id: false }
+            ),
+            required: true,
+          },
+          bytes: { type: Number, min: 0 },
+        },
+        { _id: false }
+      ),
+    },
 
     edit: { type: clipEditSchema },
     segments: { type: [clipSegmentSchema], default: undefined },

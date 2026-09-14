@@ -197,6 +197,10 @@ def main():
                         0.6 * best["mouth"][0] + 0.4 * mouth[0],
                         0.6 * best["mouth"][1] + 0.4 * mouth[1],
                     )
+                    # The unsmoothed box too: the smoothed one steadies the
+                    # crop, but a camera that follows the head needs the nod
+                    # the EMA halves (at 12 fps, 0.4 is a 0.2 s constant).
+                    best["raw"] = det[0]
                     best["misses"] = 0
                     unclaimed.remove(det)
             for det in unclaimed:
@@ -205,17 +209,19 @@ def main():
                     {
                         "id": next_track_id,
                         "box": (bx0, by0, bw, bh),
+                        "raw": (bx0, by0, bw, bh),
                         "mouth": mouth,
                         "misses": 0,
                     }
                 )
                 next_track_id += 1
             tracks = [t for t in tracks if t["misses"] <= TRACK_MAX_MISSES]
-            last_seen = {t["id"]: (t["box"], t["mouth"]) for t in tracks if t["misses"] == 0}
+            last_seen = {t["id"]: (t["box"], t["raw"], t["mouth"]) for t in tracks if t["misses"] == 0}
 
         faces = []
-        for track_id, (box, mouth) in last_seen.items():
+        for track_id, (box, raw, mouth) in last_seen.items():
             x, y, w, h = (int(round(v)) for v in box)
+            rx, ry, rw, rh = (int(round(v)) for v in raw)
             mx0, my0, mx1, my1 = mouth_region(box, mouth, width, height)
 
             energy = 0.0
@@ -231,6 +237,10 @@ def main():
                     "y": y,
                     "w": w,
                     "h": h,
+                    # This frame's detection, unsmoothed: the face path.
+                    "faceX": rx + rw // 2,
+                    "faceY": ry + rh // 2,
+                    "faceW": rw,
                     "mouthEnergy": energy,
                 }
             )

@@ -17,6 +17,8 @@ interface CaptionOverlayProps {
   frameWidth: number;
   positioning?: boolean;
   onPositionChange?: (horizontalFrac: number, verticalFrac: number) => void;
+  /** With `style.highlight === "word"`: which word is being spoken. */
+  spokenIndex?: number;
 }
 
 /**
@@ -40,13 +42,20 @@ export function CaptionOverlay({
   frameWidth,
   positioning = false,
   onPositionChange,
+  spokenIndex = -1,
 }: CaptionOverlayProps) {
   if (!caption || frameHeight <= 0) return null;
 
   const scale = frameHeight / OUTPUT_HEIGHT;
   const base = (caption.emphasis ? PEAK_BASE_FONT : CAPTION_BASE_FONT) * style.sizeScale;
   const fontSize = Math.max(8, base * scale);
-  const text = style.uppercase ? caption.text.toUpperCase() : caption.text;
+  const casing = (value: string) => (style.uppercase ? value.toUpperCase() : value);
+  const text = casing(caption.text);
+  const karaoke = style.highlight === "word" && caption.words.length > 1;
+  // The burn colours the spoken word with the accent (or, on an accent-coloured
+  // peak line, with the text colour) — mirror it exactly.
+  const quiet = caption.emphasis ? style.peakColor : style.textColor;
+  const loud = caption.emphasis ? style.textColor : style.peakColor;
 
   const move = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (!positioning || !onPositionChange) return;
@@ -96,7 +105,14 @@ export function CaptionOverlay({
           paintOrder: "stroke fill",
         }}
       >
-        {text}
+        {karaoke
+          ? caption.words.map((word, index) => (
+              <span key={`${word.t}-${index}`} style={{ color: index === spokenIndex ? loud : quiet }}>
+                {index > 0 ? " " : ""}
+                {casing(word.word)}
+              </span>
+            ))
+          : text}
       </span>
     </div>
   );

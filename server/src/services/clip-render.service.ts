@@ -11,6 +11,7 @@ import {
 } from "../config/caption-styles";
 import { Clip, ClipProject, type IClip, type IClipProject } from "../models";
 import type {
+  CaptionScene,
   CleanupRegion,
   CaptionTextOverride,
   CaptionWordOverride,
@@ -32,7 +33,13 @@ import {
   projectOutputDir,
   runCommand,
 } from "../utils";
-import { assOptionsFromStyle, buildTimelineCaptions, renderAss } from "./caption.service";
+import {
+  assOptionsFromStyle,
+  buildTimelineCaptions,
+  renderAss,
+  type AssOptions,
+  type CaptionSceneSpan,
+} from "./caption.service";
 import { activeCleanupRegions, cleanupDelogoChain, inpaintCleanupPrepass } from "./cleanup.service";
 import { getVideoMetadata, hasAudioStream } from "./ffmpeg.service";
 import { ensureProjectMedia } from "./ingest.service";
@@ -44,6 +51,18 @@ import { cdnUrlFor, deleteKey, isS3Configured, uploadFileAtKey } from "./s3.serv
 import { recomputeProjectStorage } from "./clip.service";
 import { mixSoundtrackOntoClip, soundtrackNeedsMix, soundtrackSpansOutro } from "./soundtrack.service";
 import { appendOutroToClip, loadSharedOutroLibrary, overlaySharedOutroLibrary, pickProjectOutro } from "./outro.service";
+import { creatorPlanActive } from "./creator-plan.service";
+import {
+  followCx,
+  followSigma,
+  followTightness,
+  followTightnessX,
+  smoothedTrack,
+  windowsFor,
+} from "./creator-timeline";
+import { cameraFilterChain } from "./camera.service";
+import { ensureClipMatte, matteSpansFor, type ClipMatte } from "./matte.service";
+import { renderTitlesAss } from "./title.service";
 
 // ============================================
 // CLIP RENDER
@@ -87,10 +106,10 @@ function cropGeometry(sourceWidth: number, sourceHeight: number): { w: number; h
 }
 
 /** Crop the frame around one keyframe's centre, then scale to the output size. */
-export function cropChainFor(keyframe: CropKeyframe, track: ReframeTrack): string {
+export function cropChainFor(keyframe: CropKeyframe, track: ReframeTrack, tightness = 0): string {
   const { sourceWidth, sourceHeight } = track;
   const { w, h } = cropGeometry(sourceWidth, sourceHeight);
-  const x = Math.max(0, Math.min(sourceWidth - w, Math.round(keyframe.cx - w / 2)));
+  const x = Math.max(0, Math.min(sourceWidth - w, Math.round(followCx(keyframe, tightness, sourceWidth) - w / 2)));
   const y = Math.max(0, Math.min(sourceHeight - h, Math.round(keyframe.cy - h / 2)));
   return `crop=${w}:${h}:${x}:${y},scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT},setsar=1`;
 }
@@ -119,10 +138,18 @@ export function shiftTrackToWindow(track: ReframeTrack, windowStartSec: number):
  * `windowStartSec` is the source time of filter t=0 (the encode seek). Defaults
  * to the track's analysis origin so a saved trim does not shift the snaps.
  */
-export function cropChainForTrack(track: ReframeTrack, windowStartSec?: number): string {
+export function cropChainForTrack(
+  track: ReframeTrack,
+  windowStartSec?: number,
+  tightness = 0,
+  windowEndSec?: number
+): string {
   const shifted = shiftTrackToWindow(track, windowStartSec ?? track.originSec ?? 0);
   if (shifted.mode === "resize") return reframeFilterChain(shifted);
-  const keyframes = coalesceKeyframes(collapseHoldKeyframes(shifted.keyframes), MAX_SEGMENTS_PER_WINDOW);
+  const keyframes = coalesceKeyframes(
+    collapseHoldKeyframes(keyframesForWindow(shifted.keyframes, windowEndSec, windowStartSec)),
+    MAX_SEGMENTS_PER_WINDOW
+  );
   if (keyframes.length <= 1) {
     return cropChainFor(
       keyframes[0] ?? {
@@ -131,37 +158,41 @@ export function cropChainForTrack(track: ReframeTrack, windowStartSec?: number):
         cy: shifted.sourceHeight / 2,
         width: shifted.sourceWidth,
       },
-      shifted
+      shifted,
+      tightness
     );
   }
 
   const { sourceWidth, sourceHeight } = shifted;
   const { w, h } = cropGeometry(sourceWidth, sourceHeight);
   const y = Math.max(0, Math.min(sourceHeight - h, Math.round((sourceHeight - h) / 2)));
+  // Follow blends the steady seat crop toward the recorded face per keyframe.
   const xOf = (keyframe: CropKeyframe) =>
-    Math.max(0, Math.min(sourceWidth - w, Math.round(keyframe.cx - w / 2)));
+    Math.max(0, Math.min(sourceWidth - w, Math.round(followCx(keyframe, tightness, sourceWidth) - w / 2)));
 
-  let xExpr = String(xOf(keyframes[keyframes.length - 1]!));
-  for (let i = keyframes.length - 2; i >= 0; i--) {
+  // The pan as a FLAT sum: the first crop, plus one clipped ramp (glide) or
+  // step (snap) per keyframe. Nested `if(lt(t,…),…,if(…))` pieces would read
+  // the same, but FFmpeg's expression parser allows ~100 levels of function
+  // nesting and a following camera records the head at up to 10 keyframes a
+  // second — a 30 s shot overflowed it ("Missing ')' or too many args").
+  let xExpr = String(xOf(keyframes[0]!));
+  for (let i = 0; i < keyframes.length - 1; i++) {
     const from = keyframes[i]!;
     const to = keyframes[i + 1]!;
-    const x0 = xOf(from);
-    const x1 = xOf(to);
+    const delta = xOf(to) - xOf(from);
+    if (delta === 0) continue;
     const span = to.t - from.t;
     const cutBetween = shifted.cuts?.some((cut) => cut > from.t + 1e-4 && cut <= to.t + 1e-4);
     const legacyJump =
       shifted.cuts === undefined &&
       (Math.abs(to.cx - from.cx) > 0.25 * from.width || span < 0.12);
-    const jump = cutBetween || legacyJump;
-    const piece =
-      jump || x0 === x1
-        ? String(x0)
-        : `${x0}+(t-${from.t.toFixed(4)})/${Math.max(span, 0.001).toFixed(4)}*${x1 - x0}`;
     // 1ms early on a SNAP so a frame whose PTS is 0.03ms under the rounded
     // scene time (1097.329567 vs 1097.3296) still gets the new crop. A glide
     // keeps the exact keyframe so interpolation does not jump a millisecond.
-    const edge = jump ? Math.max(from.t, to.t - 0.001) : to.t;
-    xExpr = `if(lt(t\\,${edge.toFixed(4)})\\,${piece}\\,${xExpr})`;
+    xExpr +=
+      cutBetween || legacyJump
+        ? `+${delta}*gte(t\\,${Math.max(from.t, to.t - 0.001).toFixed(4)})`
+        : `+${delta}*clip((t-${from.t.toFixed(4)})/${Math.max(span, 0.001).toFixed(4)}\\,0\\,1)`;
   }
 
   return `crop=w=${w}:h=${h}:x=${xExpr}:y=${y},scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT},setsar=1`;
@@ -210,6 +241,31 @@ function styleForClip(
   return resolveEffectiveCaptionStyle(base, clip.edit?.captionOverrides);
 }
 
+/**
+ * A caption scene's look. A scene that names a preset starts from that preset;
+ * one that does not starts from the clip's own look. Its overrides go on top.
+ * The client's `sceneStyleFor` follows the same rule.
+ */
+export function styleForScene(clipStyle: CaptionStyle, scene: CaptionScene): CaptionStyle {
+  const base = scene.styleId ? resolveCaptionStyle(scene.styleId) : clipStyle;
+  return resolveEffectiveCaptionStyle(base, scene.overrides);
+}
+
+/** The grouper's spans and the ASS writer's looks for a clip's caption scenes. */
+function sceneCaptionInputs(
+  clipStyle: CaptionStyle,
+  scenes: CaptionScene[] | undefined
+): { spans: CaptionSceneSpan[]; looks: Record<string, AssOptions> } {
+  const spans: CaptionSceneSpan[] = [];
+  const looks: Record<string, AssOptions> = {};
+  for (const scene of scenes ?? []) {
+    const style = styleForScene(clipStyle, scene);
+    spans.push({ id: scene.id, startSec: scene.startSec, endSec: scene.endSec, chunkWords: style.chunkWords });
+    looks[scene.id] = assOptionsFromStyle(style);
+  }
+  return { spans, looks };
+}
+
 /** Whether this render should burn captions. Explicit request > stored edit > genre. */
 function captionsOnFor(
   clip: IClip,
@@ -238,8 +294,10 @@ async function writeCaptions(
   style: CaptionStyle,
   textOverrides: CaptionTextOverride[] = [],
   peakEmphasis = true,
-  wordOverrides: CaptionWordOverride[] = []
+  wordOverrides: CaptionWordOverride[] = [],
+  scenes: CaptionScene[] = []
 ): Promise<string | undefined> {
+  const { spans, looks } = sceneCaptionInputs(style, scenes);
   const captions = buildTimelineCaptions(
     wordTimingsFor(project),
     startSec,
@@ -249,12 +307,13 @@ async function writeCaptions(
     style.chunkWords,
     textOverrides,
     peakEmphasis,
-    wordOverrides
+    wordOverrides,
+    spans
   );
   if (captions.length === 0) return undefined;
 
   const assPath = join(scratchDir, name);
-  await writeFile(assPath, renderAss(captions, assOptionsFromStyle(style)), "utf-8");
+  await writeFile(assPath, renderAss(captions, assOptionsFromStyle(style), looks), "utf-8");
   return assPath;
 }
 
@@ -262,7 +321,27 @@ async function writeCaptions(
 interface PreparedSegment {
   startSec: number;
   duration: number;
+  /** The complete per-frame chain: cleanup, crop, camera, effects, captions. */
   filterChain: string;
+  /**
+   * Creator-mode titles. `behind` needs the matte composite; `front` is one
+   * more `ass` burn under the captions. Absent on the original render path.
+   */
+  titles?: {
+    picture: string;
+    effects: string;
+    captions: string;
+    behindAss?: string;
+    /** White silhouette of the behind layer, for its alpha. */
+    behindMaskAss?: string;
+    frontAss?: string;
+    /** Source time of this window's start, for the matte's own clock. */
+    windowStartSec: number;
+    fps: number;
+    /** The matte is stored small; it is scaled back to source size before the crop. */
+    sourceWidth: number;
+    sourceHeight: number;
+  };
 }
 
 const DEFAULT_VIDEO_EFFECTS: Required<VideoEffects> = {
@@ -281,9 +360,12 @@ function effectiveVideoEffects(effects?: VideoEffects): Required<VideoEffects> {
 /** FFmpeg treatment for the picture only. Captions are added after this chain. */
 export function videoEffectFilterChain(
   effects: VideoEffects | undefined,
-  peakAtSec?: number
+  peakAtSec?: number,
+  options: { skipMotion?: boolean } = {}
 ): string {
   const value = effectiveVideoEffects(effects);
+  // Creator mode owns the camera: its plan replaces the clip-wide motion.
+  if (options.skipMotion) value.motion = "none";
   const filters: string[] = [];
   const grade = {
     natural: "",
@@ -306,9 +388,17 @@ export function videoEffectFilterChain(
     zoomExpression = `1+${amount.toFixed(4)}*max(0\\,1-abs(t-${peakAtSec.toFixed(4)})/0.38)`;
   }
   if (zoomExpression) {
+    // The crop's offsets restate the scaled size: `crop` keeps the iw/ih of
+    // its first frame across a mid-stream size change (see cameraFilterChain),
+    // so `(iw-W)/2` would pin a peak punch to the corner instead of the centre.
+    const scaledW = `trunc(${OUTPUT_WIDTH}*(${zoomExpression})/2)*2`;
+    const scaledH = `trunc(${OUTPUT_HEIGHT}*(${zoomExpression})/2)*2`;
     filters.push(
-      `scale=w='trunc(iw*(${zoomExpression})/2)*2':h='trunc(ih*(${zoomExpression})/2)*2':eval=frame`,
-      `crop=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:(iw-${OUTPUT_WIDTH})/2:(ih-${OUTPUT_HEIGHT})/2`
+      `scale=w='${scaledW}':h='${scaledH}':eval=frame`,
+      `crop=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT}:x='(${scaledW}-${OUTPUT_WIDTH})/2':y='(${scaledH}-${OUTPUT_HEIGHT})/2'`,
+      // The even-rounded scale leaves a hair of non-square SAR behind; a
+      // concat of such parts is refused, and a single file would carry it.
+      "setsar=1"
     );
   }
   return filters.join(",");
@@ -383,7 +473,9 @@ export async function renderClip(clipId: string, options: RenderClipOptions = {}
     const meta = await getVideoMetadata(mediaPath);
     await setProgress(clipId, revision, 15);
 
-    const scratchDir = await createScratchDir(`render-${clipId}`);
+    // One scratch directory per render — the one `finally` removes. A second
+    // `createScratchDir` here used to shadow it, so every render's real files
+    // sat in a directory nothing deleted until the 6-hour sweeper.
     let outputPath = join(scratchDir, "out.mp4");
     const mergeSegments = clip.kind === "merge" ? (clip.segments ?? []) : [];
 
@@ -408,10 +500,20 @@ export async function renderClip(clipId: string, options: RenderClipOptions = {}
       });
     } else {
       const trimmed = resolveWindow(clip, meta.durationSec);
-      windows.push({
-        startSec: trimmed.startSec,
-        endSec: trimmed.endSec,
-        mode: options.reframeMode ?? clip.edit?.reframeMode ?? "smart",
+      const mode = options.reframeMode ?? clip.edit?.reframeMode ?? "smart";
+      const plan = clip.edit?.creator;
+      // Creator mode: pause cuts split the trim into kept windows, which then
+      // render exactly like a merge's parts — one concat, no intermediates.
+      const kept = creatorPlanActive(plan)
+        ? windowsFor(trimmed.startSec, trimmed.endSec, plan.cuts)
+        : [{ startSec: trimmed.startSec, endSec: trimmed.endSec }];
+      kept.forEach((window, index) => {
+        windows.push({
+          startSec: window.startSec,
+          endSec: window.endSec,
+          mode,
+          label: kept.length > 1 ? `Part ${index + 1}` : undefined,
+        });
       });
     }
 
@@ -435,6 +537,20 @@ export async function renderClip(clipId: string, options: RenderClipOptions = {}
     const inputPath = cleanedPath ?? mediaPath;
     const inputTimeOffset = cleanedPath ? spanStart : 0;
 
+    // Behind-subject titles need the person matte. Best-effort: without it the
+    // title is burned in front and the render says so.
+    let matte: ClipMatte | null = null;
+    let matteNote: string | undefined;
+    if (
+      mergeSegments.length === 0 &&
+      creatorPlanActive(clip.edit?.creator) &&
+      matteSpansFor(clip.edit?.creator, windows[0]!.startSec, windows[windows.length - 1]!.endSec).length > 0
+    ) {
+      matte = await ensureClipMatte(clipId);
+      if (!matte) matteNote = "titles in front (no person matte)";
+      await setProgress(clipId, revision, 18);
+    }
+
     const prepared = await prepareSegments({
       clip,
       project,
@@ -442,6 +558,7 @@ export async function renderClip(clipId: string, options: RenderClipOptions = {}
       sourceWidth: meta.width,
       sourceHeight: meta.height,
       sourceDuration: meta.durationSec,
+      sourceFps: meta.frameRate,
       windows,
       options,
       defaultCaptionsOn: profile.captionsDefault,
@@ -451,28 +568,37 @@ export async function renderClip(clipId: string, options: RenderClipOptions = {}
       inputTimeOffset,
       // delogo is only needed when the inpaint pass did not run.
       delogoRegions: cleanedPath ? [] : cleanupRegions,
+      matte,
     });
     const duration = prepared.duration;
     const renderedMode = prepared.mode;
     const reframeNote =
-      prepared.note ??
-      (mergeSegments.length > 0
-        ? `Merged from ${mergeSegments.length} segment${mergeSegments.length === 1 ? "" : "s"}`
-        : undefined);
+      [
+        prepared.note ??
+          (mergeSegments.length > 0
+            ? `Merged from ${mergeSegments.length} segment${mergeSegments.length === 1 ? "" : "s"}`
+            : undefined),
+        matteNote,
+      ]
+        .filter(Boolean)
+        .join(" · ") || undefined;
 
     await Clip.findByIdAndUpdate(clipId, { $set: { reframeMode: renderedMode, reframeNote } });
 
     const audioFx = audioEffectFilterChain(clip.edit?.videoEffects);
-    const hasAudio = audioFx || prepared.segments.length > 1 ? await hasAudioStream(inputPath) : true;
-    if (prepared.segments.length === 1) {
+    const hasTitles = prepared.segments.some((segment) => segment.titles);
+    const hasAudio = audioFx || prepared.segments.length > 1 || hasTitles ? await hasAudioStream(inputPath) : true;
+    if (prepared.segments.length === 1 && !hasTitles) {
       // One segment keeps the original single-pass encode, byte-for-byte.
       const only = prepared.segments[0]!;
       await encode(inputPath, outputPath, only.startSec, only.duration, only.filterChain, hasAudio ? audioFx : "", (pct) =>
         reportProgress(clipId, revision, 20 + pct * 0.7)
       );
     } else {
+      // Titles need a filtergraph (a second layer, and the matte as an input),
+      // which the concat path already is — even for one segment.
       await encodeMerge(inputPath, outputPath, prepared.segments, hasAudio, duration, audioFx, (pct) =>
-        reportProgress(clipId, revision, 20 + pct * 0.7)
+        reportProgress(clipId, revision, 20 + pct * 0.7), matte ?? undefined
       );
     }
 
@@ -480,16 +606,19 @@ export async function renderClip(clipId: string, options: RenderClipOptions = {}
 
     await loadSharedOutroLibrary();
     const library = overlaySharedOutroLibrary(project);
-    const chosen = pickProjectOutro(library.items, clip.edit?.outro?.outroId, library.defaultOutroId);
-    const mixAfterJoin = soundtrackSpansOutro(clip.edit?.soundtrack, duration);
+    const freshEdit = await Clip.findById(clipId).select("edit.outro edit.soundtrack").lean();
+    const outroAttach = freshEdit?.edit?.outro ?? clip.edit?.outro;
+    const soundtrack = freshEdit?.edit?.soundtrack ?? clip.edit?.soundtrack;
+    const chosen = pickProjectOutro(library.items, outroAttach?.outroId, library.defaultOutroId);
+    const mixAfterJoin = soundtrackSpansOutro(soundtrack, duration);
 
-    if (soundtrackNeedsMix(clip.edit?.soundtrack) && !mixAfterJoin) {
+    if (soundtrackNeedsMix(soundtrack) && !mixAfterJoin) {
       reportProgress(clipId, revision, 90);
       outputPath = await mixSoundtrackOntoClip(
         String(project._id),
         outputPath,
         duration,
-        clip.edit?.soundtrack,
+        soundtrack,
         scratchDir
       );
       await validateArtifact(outputPath, duration);
@@ -500,27 +629,27 @@ export async function renderClip(clipId: string, options: RenderClipOptions = {}
       String(project._id),
       outputPath,
       duration,
-      clip.edit?.outro,
+      outroAttach,
       scratchDir,
       chosen
     );
     outputPath = joined.path;
     await validateArtifact(outputPath, joined.durationSec);
 
-    if (soundtrackNeedsMix(clip.edit?.soundtrack) && mixAfterJoin) {
+    if (soundtrackNeedsMix(soundtrack) && mixAfterJoin) {
       reportProgress(clipId, revision, 96);
       outputPath = await mixSoundtrackOntoClip(
         String(project._id),
         outputPath,
         joined.durationSec,
-        clip.edit?.soundtrack,
+        soundtrack,
         scratchDir,
         { voiceUntilSec: duration }
       );
       await validateArtifact(outputPath, joined.durationSec);
     }
 
-    const delivered = await deliverArtifact(clip, project, outputPath);
+    const delivered = await deliverArtifact(clip, project, outputPath, revision);
 
     await persistOutput(clipId, revision, delivered);
     await recomputeProjectStorage(String(project._id));
@@ -589,7 +718,25 @@ export interface SourceWindow {
 }
 
 /** Cap on segments from ONE window. A filtergraph is a literal argument list. */
-const MAX_SEGMENTS_PER_WINDOW = 120;
+const MAX_SEGMENTS_PER_WINDOW = 240;
+
+/**
+ * Only the keyframes a window can show: the one in force at its start, those
+ * inside it, and the first beyond its end (the pan interpolates into it). The
+ * track covers the whole clip; with pause cuts, each window would otherwise
+ * carry — and thin — every other window's keyframes too.
+ */
+function keyframesForWindow(
+  keyframes: CropKeyframe[],
+  windowEndSec: number | undefined,
+  windowStartSec: number | undefined
+): CropKeyframe[] {
+  if (windowEndSec === undefined || windowStartSec === undefined) return keyframes;
+  const windowLen = windowEndSec - windowStartSec;
+  const lastBefore = keyframes.filter((keyframe) => keyframe.t <= 1e-4).length - 1;
+  const firstAfter = keyframes.findIndex((keyframe) => keyframe.t >= windowLen - 1e-4);
+  return keyframes.slice(Math.max(0, lastBefore), firstAfter < 0 ? keyframes.length : firstAfter + 1);
+}
 
 /**
  * Reduce a keyframe list to at most `max` entries.
@@ -635,8 +782,13 @@ export function collapseHoldKeyframes(keyframes: CropKeyframe[]): CropKeyframe[]
     const previous = out[out.length - 1]!;
     const current = keyframes[i]!;
     const next = keyframes[i + 1];
+    // A keyframe that only records the face moving is not a duplicate: creator
+    // mode's follow pans on exactly that data.
+    const sameFace =
+      Math.abs((current.fx ?? 0) - (previous.fx ?? 0)) <= 4 &&
+      Math.abs((current.fy ?? 0) - (previous.fy ?? 0)) <= 4;
     const sameCrop =
-      Math.abs(current.cx - previous.cx) <= 4 && Math.abs(current.width - previous.width) <= 4;
+      sameFace && Math.abs(current.cx - previous.cx) <= 4 && Math.abs(current.width - previous.width) <= 4;
     const holdBeforeSnap =
       next !== undefined &&
       next.t - current.t <= 0.12 &&
@@ -680,7 +832,7 @@ export function windowSegments(
  * which have no single window to key a cache on.
  */
 /** Bump when framing maths changes so a cached shaky track is not reused. */
-const REFRAME_CACHE_VERSION = 11;
+const REFRAME_CACHE_VERSION = 15;
 
 type ReframeCacheKey = { startSec: number; endSec: number; mode: string; v?: number };
 
@@ -772,6 +924,8 @@ async function resolveTrack(input: {
   sourceWidth: number;
   sourceHeight: number;
   persist: boolean;
+  /** The whole span the clip will need, so one analysis covers every window. */
+  coverHint?: { startSec: number; endSec: number };
 }): Promise<ReframeTrack> {
   const requestedMode = input.window.mode;
   const hydrated = hydrateCachedTrack(input.clip.reframeTrack);
@@ -788,6 +942,7 @@ async function resolveTrack(input: {
     Math.min(
       input.window.startSec,
       input.clip.startSec,
+      input.coverHint?.startSec ?? input.window.startSec,
       hydrated?.track.originSec ?? input.window.startSec
     )
   );
@@ -795,6 +950,7 @@ async function resolveTrack(input: {
     Math.max(
       input.window.endSec,
       input.clip.endSec,
+      input.coverHint?.endSec ?? input.window.endSec,
       hydrated?.track.untilSec ?? input.window.endSec
     )
   );
@@ -951,6 +1107,7 @@ async function prepareSegments(input: {
   sourceWidth: number;
   sourceHeight: number;
   sourceDuration: number;
+  sourceFps: number;
   windows: SourceWindow[];
   options: RenderClipOptions;
   defaultCaptionsOn: boolean;
@@ -965,11 +1122,17 @@ async function prepareSegments(input: {
   inputTimeOffset: number;
   /** Regions to absorb with delogo, when the inpaint pass did not run. */
   delogoRegions: CleanupRegion[];
+  /** The person matte, when behind-titles have one. */
+  matte?: ClipMatte | null;
 }): Promise<{ segments: PreparedSegment[]; duration: number; mode: IClip["reframeMode"]; note?: string }> {
   const segments: PreparedSegment[] = [];
   let duration = 0;
   let mode: IClip["reframeMode"];
   let note: string | undefined;
+  // Pause cuts split one clip into several windows that share one analysis.
+  // `input.clip` was loaded before the first window persisted its track, so
+  // without this the second window would miss the cache and analyse again.
+  let lastTrack: { track: ReframeTrack; mode: string } | undefined;
 
   for (let w = 0; w < input.windows.length; w++) {
     const window = input.windows[w]!;
@@ -981,19 +1144,32 @@ async function prepareSegments(input: {
       );
     }
 
-    const track = await resolveTrack({
-      clip: input.clip,
-      mediaPath: input.mediaPath,
-      window,
-      sourceWidth: input.sourceWidth,
-      sourceHeight: input.sourceHeight,
-      persist: input.persistTrack,
-    });
+    const track =
+      lastTrack && lastTrack.mode === window.mode && trackCoversWindow(lastTrack.track, window)
+        ? lastTrack.track
+        : await resolveTrack({
+            clip: input.clip,
+            mediaPath: input.mediaPath,
+            window,
+            sourceWidth: input.sourceWidth,
+            sourceHeight: input.sourceHeight,
+            persist: input.persistTrack,
+            coverHint: input.persistTrack
+              ? {
+                  startSec: Math.min(...input.windows.map((item) => item.startSec)),
+                  endSec: Math.max(...input.windows.map((item) => item.endSec)),
+                }
+              : undefined,
+          });
+    if (input.persistTrack) lastTrack = { track, mode: window.mode };
     mode ??= track.mode;
     note ??= track.note;
 
     const pieceDuration = window.endSec - window.startSec;
     duration += pieceDuration;
+
+    const plan = input.clip.edit?.creator;
+    const creatorActive = creatorPlanActive(plan) && input.persistTrack;
 
     let assPath: string | undefined;
     if (input.options.captions ?? captionsOnFor(input.clip, input.defaultCaptionsOn, window)) {
@@ -1008,16 +1184,30 @@ async function prepareSegments(input: {
         styleForClip(input.clip, window),
         input.clip.edit?.captionTextOverrides,
         input.clip.edit?.captionOverrides?.peakEmphasis !== false,
-        input.clip.edit?.captionWordOverrides
+        input.clip.edit?.captionWordOverrides,
+        creatorActive ? plan.captionScenes : []
       );
     }
 
-    const base = cropChainForTrack(track, window.startSec);
+    // A following camera rides the smoothed face path, never the raw box; how
+    // smoothed is the plan's response.
+    const following = creatorActive && followTightness(plan) > 0;
+    const cameraTrack = following ? smoothedTrack(track, followSigma(plan)) : track;
+    const base = cropChainForTrack(
+      cameraTrack,
+      window.startSec,
+      creatorActive ? followTightnessX(plan) : 0,
+      window.endSec
+    );
+    const camera = creatorActive
+      ? cameraFilterChain({ plan, track: cameraTrack, windowStartSec: window.startSec, windowEndSec: window.endSec })
+      : "";
     const pictureEffects = videoEffectFilterChain(
       input.clip.edit?.videoEffects,
       input.clip.peakSec >= window.startSec && input.clip.peakSec <= window.endSec
         ? input.clip.peakSec - window.startSec
-        : undefined
+        : undefined,
+      { skipMotion: creatorActive }
     );
 
     const delogo = cleanupDelogoChain(
@@ -1028,11 +1218,52 @@ async function prepareSegments(input: {
       pieceDuration
     );
 
-    segments.push({
+    const captionsFilter = assPath ? `,${assVideoFilter(assPath)}` : "";
+    const segment: PreparedSegment = {
       startSec: window.startSec - input.inputTimeOffset,
       duration: pieceDuration,
-      filterChain: `${delogo ? `${delogo},` : ""}${base}${pictureEffects ? `,${pictureEffects}` : ""}${assPath ? `,${assVideoFilter(assPath)}` : ""},format=yuv420p`,
-    });
+      filterChain: `${delogo ? `${delogo},` : ""}${base}${camera ? `,${camera}` : ""}${pictureEffects ? `,${pictureEffects}` : ""}${captionsFilter},format=yuv420p`,
+    };
+
+    // Creator-mode titles: separate ASS files per layer, timed on this window.
+    // A behind-title only goes behind when the matte exists; otherwise it joins
+    // the front layer so the words are never lost.
+    if (creatorActive && plan.titles?.length) {
+      const titles = input.matte
+        ? plan.titles
+        : plan.titles.map((title) => (title.depth === "behind" ? { ...title, depth: "front" as const } : title));
+      const behind = renderTitlesAss(titles, window.startSec, window.endSec, "behind");
+      const behindMask = renderTitlesAss(titles, window.startSec, window.endSec, "behind", "mask");
+      const front = renderTitlesAss(titles, window.startSec, window.endSec, "front");
+      if (behind || front) {
+        let behindAss: string | undefined;
+        let behindMaskAss: string | undefined;
+        let frontAss: string | undefined;
+        if (behind && behindMask) {
+          behindAss = join(input.scratchDir, `titles_behind_${w}.ass`);
+          behindMaskAss = join(input.scratchDir, `titles_behind_mask_${w}.ass`);
+          await writeFile(behindAss, behind, "utf-8");
+          await writeFile(behindMaskAss, behindMask, "utf-8");
+        }
+        if (front) {
+          frontAss = join(input.scratchDir, `titles_front_${w}.ass`);
+          await writeFile(frontAss, front, "utf-8");
+        }
+        segment.titles = {
+          picture: `${base}${camera ? `,${camera}` : ""}`,
+          effects: `${delogo ? `${delogo},` : ""}${base}${camera ? `,${camera}` : ""}${pictureEffects ? `,${pictureEffects}` : ""}`,
+          captions: captionsFilter,
+          behindAss,
+          behindMaskAss,
+          frontAss,
+          windowStartSec: window.startSec,
+          fps: input.sourceFps,
+          sourceWidth: input.sourceWidth,
+          sourceHeight: input.sourceHeight,
+        };
+      }
+    }
+    segments.push(segment);
   }
 
   return { segments, duration, mode: mode ?? "center", note };
@@ -1064,21 +1295,32 @@ function alignPtsToTrim(startSec: number): string {
 async function deliverArtifact(
   clip: IClip,
   project: IClipProject,
-  scratchOutputPath: string
+  scratchOutputPath: string,
+  revision: number
 ): Promise<Delivered> {
   const bytes = await getFileSize(scratchOutputPath);
   const clipId = String(clip._id);
 
   if (project.storage === "s3" && isS3Configured() && project.s3Prefix) {
-    const key = `${project.s3Prefix}clips/${clipId}.mp4`;
+    // The key carries the render revision. A stable key was served through
+    // CloudFront, which ignores query strings by default, so every re-render
+    // played back — and downloaded — as the previous render until the edge
+    // cache expired. A new key per render is a new object at the edge.
+    const key = `${project.s3Prefix}clips/${clipId}.r${revision}.mp4`;
     const outputUrl = await uploadFileAtKey(scratchOutputPath, key, "video/mp4");
 
-    // Retire the old rank-keyed object for this clip. Safe only after the new
-    // key is verified above — until then the clip's only copy is the old object.
-    const legacyKey = `${project.s3Prefix}clips/${clip.rank}.mp4`;
-    if (legacyKey !== key) {
-      await deleteKey(legacyKey).catch((error: unknown) => {
-        console.warn(`⚠️  Could not retire legacy S3 key ${legacyKey}: ${getErrorMessage(error)}`);
+    // Retire the previous objects for this clip — the last render's key and
+    // the legacy rank-keyed / unrevisioned ones. Safe only after the new key
+    // is verified above: until then the clip's only copy is the old object.
+    const retire = new Set([
+      `${project.s3Prefix}clips/${clip.rank}.mp4`,
+      `${project.s3Prefix}clips/${clipId}.mp4`,
+      ...(clip.outputKey ? [clip.outputKey] : []),
+    ]);
+    retire.delete(key);
+    for (const oldKey of retire) {
+      await deleteKey(oldKey).catch((error: unknown) => {
+        console.warn(`⚠️  Could not retire S3 key ${oldKey}: ${getErrorMessage(error)}`);
       });
     }
     // S3 is the home copy. Drop any leftover local render for this clip (a
@@ -1224,9 +1466,23 @@ function encode(
         }
       })
       .on("end", () => resolve())
-      .on("error", (err) => reject(new Error(`Render failed: ${err.message}`)))
+      .on("error", (err, _stdout, stderr) => reject(new Error(`Render failed: ${ffmpegCause(err.message, stderr)}`)))
       .run();
   });
+}
+
+/**
+ * The line that says WHY. fluent-ffmpeg's message ends in the last stderr
+ * line, which for a filter that failed to parse is only "Conversion failed!";
+ * the cause was printed first.
+ */
+function ffmpegCause(message: string, stderr: string | null | undefined): string {
+  const cause = (stderr ?? "")
+    .split("\n")
+    .map((line) => line.trim())
+    .find((line) => /error|invalid|missing|failed to|no such|cannot|too many|not found/i.test(line) && !/conversion failed/i.test(line));
+  if (!cause) return message;
+  return `${message.split("\n")[0]} — ${cause.slice(0, 300)}`;
 }
 
 /**
@@ -1234,6 +1490,53 @@ function encode(
  * one continuous decode with a keyframed crop, so this is only for joining
  * separate source ranges — not for camera cuts inside a window.
  */
+/**
+ * The per-segment video graph. Without titles it is the single-pass chain;
+ * with them the picture is split so the behind-title sits between the
+ * background and the speaker's cutout (matte), and the front layer and the
+ * captions go on top.
+ */
+function segmentVideoGraph(
+  index: number,
+  segment: PreparedSegment,
+  matte?: ClipMatte,
+  matteIndex?: number
+): string[] {
+  const trim = `trim=start=${segment.startSec.toFixed(4)}:duration=${segment.duration.toFixed(4)}`;
+  const head = `[${index}:v]${trim},${alignPtsToTrim(segment.startSec)}`;
+  const titles = segment.titles;
+  if (!titles) return [`${head},${segment.filterChain}[v${index}]`];
+
+  const front = titles.frontAss ? `,${assVideoFilter(titles.frontAss)}` : "";
+  const lines: string[] = [];
+  if (titles.behindAss && titles.behindMaskAss && matte && matteIndex != null) {
+    const duration = segment.duration.toFixed(4);
+    const fps = titles.fps > 0 ? titles.fps : 30;
+    const matteStart = Math.max(0, titles.windowStartSec - matte.originSec).toFixed(4);
+    // libass writes no alpha, so the layer is two renders on black — the colour
+    // and its white silhouette — merged into RGBA. One second longer than the
+    // picture so `shortest` ends on the picture.
+    const canvas = `color=c=black:s=${OUTPUT_WIDTH}x${OUTPUT_HEIGHT}:r=${fps}:d=${(segment.duration + 1).toFixed(2)}`;
+    lines.push(
+      `${head},${titles.effects}[base${index}]`,
+      `[base${index}]split=2[bg${index}][fg${index}]`,
+      `${canvas},format=yuv420p,${assVideoFilter(titles.behindAss)},format=rgba[tc${index}]`,
+      `${canvas},format=yuv420p,${assVideoFilter(titles.behindMaskAss)},format=gray[tm${index}]`,
+      `[tc${index}][tm${index}]alphamerge[tb${index}]`,
+      `[bg${index}][tb${index}]overlay=shortest=1:format=auto[bgt${index}]`,
+      // The matte through the same crop and camera as the picture.
+      `[${matteIndex}:v]trim=start=${matteStart}:duration=${duration},setpts=PTS-STARTPTS[mraw${index}]`,
+      `[mraw${index}]scale=${titles.sourceWidth}:${titles.sourceHeight},${titles.picture},format=gray[mk${index}]`,
+      `[fg${index}]format=rgba[fga${index}]`,
+      `[fga${index}][mk${index}]alphamerge[cut${index}]`,
+      `[bgt${index}][cut${index}]overlay=format=auto[vb${index}]`,
+      `[vb${index}]null${front}${titles.captions},format=yuv420p[v${index}]`
+    );
+    return lines;
+  }
+  return [`${head},${titles.effects}${front}${titles.captions},format=yuv420p[v${index}]`];
+}
+
 async function encodeMerge(
   mediaPath: string,
   outputPath: string,
@@ -1241,7 +1544,8 @@ async function encodeMerge(
   audio: boolean,
   totalDuration: number,
   audioFilter: string,
-  onProgress: (pct: number) => void
+  onProgress: (pct: number) => void,
+  matte?: ClipMatte
 ): Promise<void> {
   const args: string[] = ["-y", "-hide_banner", "-loglevel", "error", "-nostats"];
   for (const segment of segments) {
@@ -1256,15 +1560,23 @@ async function encodeMerge(
       mediaPath
     );
   }
+  let matteIndex: number | undefined;
+  if (matte && segments.some((segment) => segment.titles?.behindAss)) {
+    matteIndex = segments.length;
+    args.push("-i", matte.path);
+  }
 
   const graph: string[] = [];
   const concatParts: string[] = [];
   segments.forEach((segment, index) => {
-    const trim = `trim=start=${segment.startSec.toFixed(4)}:duration=${segment.duration.toFixed(4)}`;
-    graph.push(`[${index}:v]${trim},${alignPtsToTrim(segment.startSec)},${segment.filterChain}[v${index}]`);
+    graph.push(...segmentVideoGraph(index, segment, matte, matteIndex));
     if (audio) {
       graph.push(
-        `[${index}:a]atrim=start=${segment.startSec.toFixed(4)}:duration=${segment.duration.toFixed(4)},aresample=async=1:first_pts=0,asetpts=PTS-(${segment.startSec.toFixed(4)}/TB)${audioFilter ? `,${audioFilter}` : ""}[a${index}]`
+        // Zero the clock BEFORE aresample: with `first_pts=0` on audio whose
+        // timestamps still read the source's (copyts), aresample pads the whole
+        // gap with silence — minutes of it for a window deep into an episode —
+        // and concat waits on that audio before it will start the next part.
+        `[${index}:a]atrim=start=${segment.startSec.toFixed(4)}:duration=${segment.duration.toFixed(4)},asetpts=PTS-(${segment.startSec.toFixed(4)}/TB),aresample=async=1:first_pts=0${audioFilter ? `,${audioFilter}` : ""}[a${index}]`
       );
     }
     concatParts.push(`[v${index}]`);
@@ -1274,6 +1586,7 @@ async function encodeMerge(
     `${concatParts.join("")}concat=n=${segments.length}:v=1:a=${audio ? 1 : 0}[outv]${audio ? "[outa]" : ""}`
   );
 
+  if (process.env.CLIPPER_DEBUG_GRAPH) console.log(`[graph]\n${graph.join(";\n")}`);
   args.push("-filter_complex", graph.join(";"), "-map", "[outv]");
   if (audio) args.push("-map", "[outa]");
   args.push(

@@ -159,6 +159,13 @@ export async function sweepMediaFragments(maxAgeMs = DEFAULT_FRAGMENT_MAX_AGE_MS
       for (const name of files) {
         const path = join(dir, name);
         if (live && path === live) continue;
+        // Person mattes are a cache owned by clips, not download debris.
+        if (name === "matte") {
+          const swept = await sweepMatteDir(path);
+          result.removedFragments += swept.removed;
+          result.freedBytes += swept.freedBytes;
+          continue;
+        }
         try {
           const info = await stat(path);
           if (info.mtimeMs >= cutoff) continue;
@@ -194,6 +201,32 @@ export async function sweepMediaFragments(maxAgeMs = DEFAULT_FRAGMENT_MAX_AGE_MS
     );
   }
   return result;
+}
+
+/**
+ * A project's `matte/` directory holds one mask video per clip that asked for
+ * one. A file survives only while a clip still records it as its matte.
+ */
+async function sweepMatteDir(dir: string): Promise<{ removed: number; freedBytes: number }> {
+  const out = { removed: 0, freedBytes: 0 };
+  const files = await readdir(dir).catch(() => [] as string[]);
+  for (const name of files) {
+    const path = join(dir, name);
+    const clipId = name.replace(/\.mp4$/, "");
+    const owner = /^[0-9a-f]{24}$/.test(clipId)
+      ? await Clip.findById(clipId).select("matte").lean()
+      : null;
+    if (owner?.matte?.path === path) continue;
+    try {
+      const info = await stat(path);
+      out.freedBytes += info.size;
+      await rm(path, { force: true });
+      out.removed++;
+    } catch {
+      // Vanished mid-walk.
+    }
+  }
+  return out;
 }
 
 export interface ReconcileResult {

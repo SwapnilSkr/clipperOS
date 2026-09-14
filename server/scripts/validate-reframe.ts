@@ -115,7 +115,8 @@ function maxStep(track: ReframeTrack): number {
   check("cut: the window stays one piece (source cut is not a splice)", segments.length === 1, `${segments.length}`);
   check("cut: that piece covers the whole window", Math.abs(segments[0]!.endSec - segments[0]!.startSec - 6) < 0.01);
   const chain = cropChainForTrack(track);
-  check("cut: crop expression snaps instead of splicing", chain.includes("if(lt(t"), chain.slice(0, 80));
+  // A snap is a step term (gte), never a ramp (clip) — and one filter, not two segments.
+  check("cut: crop expression snaps instead of splicing", chain.includes("*gte(t") && !chain.includes("clip((t-"), chain.slice(0, 80));
 }
 
 // ---------------------------------------------------------------------------
@@ -132,7 +133,7 @@ function maxStep(track: ReframeTrack): number {
   check("handover: several small steps, i.e. a glide", track.keyframes.length >= 4, `${track.keyframes.length} keyframes`);
   check(
     "handover: render expression interpolates rather than snapping",
-    cropChainForTrack(track).includes("+(t-"),
+    cropChainForTrack(track).includes("clip((t-"),
     cropChainForTrack(track).slice(0, 120)
   );
   const first = track.keyframes[0]!.cx;
@@ -297,7 +298,7 @@ function maxStep(track: ReframeTrack): number {
   );
   const segs = windowSegments({ startSec: 0, endSec: 6, mode: "smart" }, track);
   check("hold: still one continuous window", segs.length === 1, `${segs.length}`);
-  check("hold: crop expression keeps the snap", cropChainForTrack(track).includes("if(lt(t"));
+  check("hold: crop expression keeps the snap", cropChainForTrack(track).includes("*gte(t"));
 }
 
 // ---------------------------------------------------------------------------
@@ -468,6 +469,29 @@ function maxStep(track: ReframeTrack): number {
     (merged.cuts ?? []).some((cut) => Math.abs(cut - 43.2) < 0.001),
     (merged.cuts ?? []).join(",")
   );
+}
+
+// ---- the face path is the raw detection, the crop the smoothed box ----
+// The analyser's tracker EMAs every box to keep the crop steady; that EMA
+// halves a nod. The follow camera reads the per-frame detection instead.
+{
+  const n = 48;
+  const frames: AnalyzerFrame[] = Array.from({ length: n }, (_, i) => {
+    const nod = i >= 24 && i < 30 ? 12 : 0;
+    // Smoothed box stays put; the raw detection dips for half a second.
+    return { i, cut: false, faces: [{ ...face(300, 1), y: 80, faceX: 300, faceY: 115 + nod, faceW: 60 }] };
+  });
+  const track = build(frames, speechRms(n));
+  const faceYs = track.keyframes.filter((key) => key.fy != null).map((key) => key.fy!);
+  const scale = SOURCE_W / W;
+  check(
+    "face path follows the raw detection (a nod the smoothed box lacks reaches the track)",
+    Math.max(...faceYs) - Math.min(...faceYs) > 8 * scale,
+    `fy ${Math.min(...faceYs)}–${Math.max(...faceYs)}`
+  );
+  check("crop centre ignores the nod", new Set(track.keyframes.map((key) => key.cx)).size === 1);
+  const legacy = build(frames.map((frame) => ({ ...frame, faces: frame.faces.map(({ faceX: _x, faceY: _y, faceW: _w, ...rest }) => rest) })), speechRms(n));
+  check("older analyser output without raw fields still yields a face path", legacy.keyframes.every((key) => key.fx != null));
 }
 
 console.log(failures === 0 ? "\nall tracking-logic checks passed" : `\n${failures} FAILED`);

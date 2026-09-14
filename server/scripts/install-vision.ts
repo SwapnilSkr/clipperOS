@@ -8,9 +8,11 @@
  *
  *   • speaker-aware reframing  (python/reframe_analyze.py)
  *   • burned-in text / watermark removal  (python/cleanup_inpaint.py)
+ *   • the person matte behind creator-mode titles  (python/person_matte.py)
  *
- * Both degrade to a non-vision path when this has not been run — a centre crop
- * and ffmpeg's `delogo` — so a missing venv costs quality, never a render.
+ * All degrade to a non-vision path when this has not been run — a centre crop,
+ * ffmpeg's `delogo`, a title drawn in front — so a missing venv costs quality,
+ * never a render.
  *
  * OpenCV is a Python wheel, so a project-local venv is both possible and
  * preferable to a system install: it leaves the host Python alone and pins one
@@ -35,6 +37,14 @@ const modelPath = resolve(
   process.env.VISION_FACE_MODEL_PATH ||
     "./storage/vision/models/face_detection_yunet_2023mar.onnx"
 );
+const matteModelPath = resolve(
+  process.env.VISION_MATTE_MODEL_PATH || "./storage/vision/models/rvm_mobilenetv3_fp32.onnx"
+);
+// RobustVideoMatting, MobileNetV3 backbone. A recurrent matting network, so
+// the mask is temporally stable rather than flickering frame to frame; the
+// ONNX export runs on onnxruntime's CPU provider at ~15 ms per 512-wide frame.
+const MATTE_MODEL_URL =
+  "https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_mobilenetv3_fp32.onnx";
 
 // Raw path in the OpenCV Zoo. The 2023mar revision is the stable YuNet and is
 // what the score/NMS thresholds in reframe_analyze.py were tuned against.
@@ -121,12 +131,65 @@ function verifyModelLoads(): { exitCode: number; stdout: string } {
   ]);
 }
 
+/**
+ * The matte stack is best-effort on top of OpenCV: onnxruntime plus the RVM
+ * model. A failure here leaves titles rendering in front of the speaker and
+ * says so, rather than failing the whole install.
+ */
+async function ensureMatteStack(): Promise<void> {
+  const ready = () =>
+    probe([
+      pythonPath,
+      "-c",
+      [
+        "import onnxruntime as ort",
+        `s = ort.InferenceSession(${JSON.stringify(matteModelPath)}, providers=['CPUExecutionProvider'])`,
+        "print('rvm-ok', ort.__version__)",
+      ].join("; "),
+    ]);
+  try {
+    if (probe([pythonPath, "-c", "import onnxruntime"]).exitCode !== 0) {
+      console.log("Installing onnxruntime for the person matte (~15 MB; one-time)…");
+      const install = Bun.spawnSync(
+        [pythonPath, "-m", "pip", "install", "--disable-pip-version-check", "onnxruntime>=1.20"],
+        { stdout: "inherit", stderr: "inherit" }
+      );
+      if (install.exitCode !== 0) throw new Error(`pip install onnxruntime failed (exit ${install.exitCode})`);
+    }
+    try {
+      await access(matteModelPath);
+    } catch {
+      await mkdir(dirname(matteModelPath), { recursive: true });
+      console.log(`Downloading RobustVideoMatting model (~15 MB)…\n  ${MATTE_MODEL_URL}`);
+      const response = await fetch(MATTE_MODEL_URL);
+      if (!response.ok) throw new Error(`RVM download failed: HTTP ${response.status} ${response.statusText}`);
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      if (bytes.byteLength < 5_000_000) {
+        throw new Error(`RVM download looks wrong (${bytes.byteLength} bytes); expected ~15 MB.`);
+      }
+      await Bun.write(matteModelPath, bytes);
+      console.log(`✓ Matte model saved to ${matteModelPath}`);
+    }
+    const check = ready();
+    if (check.exitCode !== 0 || !check.stdout.includes("rvm-ok")) {
+      throw new Error("onnxruntime is installed but could not load the RVM model");
+    }
+    console.log(`✓ Person matte ready (onnxruntime ${check.stdout.trim().split(" ").pop()})`);
+  } catch (error) {
+    console.warn(
+      `⚠️  Person matte unavailable: ${error instanceof Error ? error.message : String(error)}\n` +
+        `   Creator-mode titles will render in front of the speaker. Re-run vision:install to retry.`
+    );
+  }
+}
+
 const opencvReady = probe([pythonPath, "-c", READINESS_CHECK]);
 if (opencvReady.exitCode === 0) {
   await ensureModel();
   const modelReady = verifyModelLoads();
   if (modelReady.exitCode === 0 && modelReady.stdout.includes("yunet-ok")) {
     console.log(`✓ OpenCV ${opencvReady.stdout.trim()} + YuNet ready\n  ${pythonPath}`);
+    await ensureMatteStack();
     process.exit(0);
   }
   console.error("OpenCV is present but the YuNet model failed to load. Check the model file and re-run.");
@@ -175,6 +238,8 @@ const verifyModel = verifyModelLoads();
 if (verifyModel.exitCode !== 0 || !verifyModel.stdout.includes("yunet-ok")) {
   throw new Error("OpenCV installed but the YuNet model could not be loaded; refusing to report success.");
 }
+
+await ensureMatteStack();
 
 console.log(
   `✓ Installed OpenCV ${verifyOpencv.stdout.trim()} + YuNet at\n  ${pythonPath}\n\n` +

@@ -70,6 +70,24 @@ const MIN_FACE_PRESENCE = 0.4;
 /** Emit a new keyframe once the target drifts this far, in source pixels.
  *  Tight values chase detector noise and the rendered concat looks like shake. */
 const KEYFRAME_MOVE_PX = 48;
+/**
+ * The speaker's FACE is recorded on every keyframe, and a keyframe is also
+ * emitted when the face alone has moved this far. The crop itself stays on the
+ * seat (steady); creator mode's "follow" blends the crop toward the face using
+ * these samples, so the pan mirrors the speaker without re-analysing.
+ *
+ * Dense on purpose (up to ~10 samples a second): a nod lasts 0.3 s, and the
+ * follow camera smooths the path on the way OUT by the plan's response, so
+ * what is not recorded here can never be followed.
+ */
+const FACE_KEYFRAME_PX = 8;
+const FACE_KEYFRAME_MIN_GAP_SEC = 0.1;
+/**
+ * Light EMA on the face sample (12 fps, so 0.5 ≈ one frame): enough to drop
+ * single-frame detector flicker, not enough to blunt a gesture. The follow
+ * camera's own smoothing (creator-timeline smoothedTrack) is the real filter.
+ */
+const FACE_EMA = 0.5;
 /** EMA factor applied to the crop centre during an in-shot glide. */
 const CENTRE_EMA = 0.22;
 /**
@@ -85,10 +103,15 @@ const SNAP_CUT_FRACTION = 0.2;
 
 export interface FaceObservation {
   trackId: number;
+  /** The tracker's smoothed box: what the crop follows. */
   x: number;
   y: number;
   w: number;
   h: number;
+  /** This frame's detection, unsmoothed — centre and width. The head's own path. */
+  faceX?: number;
+  faceY?: number;
+  faceW?: number;
   mouthEnergy: number;
 }
 
@@ -338,6 +361,8 @@ export function buildTrack(args: {
   const holdFrames = Math.max(1, Math.round(SWITCH_HOLD_SEC * ANALYSIS_FPS));
 
   const chosenCx = new Array<number | null>(n).fill(null);
+  /** The tracked speaker's face per frame, source pixels. */
+  const chosenFace = new Array<{ x: number; y: number; w: number } | null>(n).fill(null);
   const switchTimes: number[] = [];
   const coarseCuts = frames.map((f, i) => (f.cut ? i / ANALYSIS_FPS : -1)).filter((t) => t >= 0);
   const cutTimes = alignCutTimes(coarseCuts, sceneCuts ?? []);
@@ -377,6 +402,11 @@ export function buildTrack(args: {
           cropWidth,
           sourceWidth,
         });
+        chosenFace[shot.from] = {
+          x: (speaker.faceX ?? speaker.x + speaker.w / 2) * analysisScale,
+          y: (speaker.faceY ?? speaker.y + speaker.h / 2) * analysisScale,
+          w: (speaker.faceW ?? speaker.w) * analysisScale,
+        };
         carrySpeakerX = speakerX;
       }
       continue;
@@ -412,6 +442,13 @@ export function buildTrack(args: {
     const seatX = seatCentres.map((c) => new Array<number>(length).fill(c));
     const typicalFace = 0.1 * ANALYSIS_WIDTH;
     const seatW = seatCentres.map(() => new Array<number>(length).fill(typicalFace));
+    // Vertical position matters only to a zoom that anchors on the face, so a
+    // seat starts at the frame's upper third until a detection says otherwise.
+    const analysisHeight = (sourceHeight / sourceWidth) * ANALYSIS_WIDTH;
+    const seatY = seatCentres.map(() => new Array<number>(length).fill(analysisHeight * 0.42));
+    const headX = seatCentres.map((c) => new Array<number>(length).fill(c));
+    const headY = seatCentres.map(() => new Array<number>(length).fill(analysisHeight * 0.42));
+    const headW = seatCentres.map(() => new Array<number>(length).fill(typicalFace));
 
     for (let i = shot.from; i < shot.to; i++) {
       const local = i - shot.from;
@@ -432,6 +469,12 @@ export function buildTrack(args: {
         present[seat]![local] = true;
         seatX[seat]![local] = centre;
         seatW[seat]![local] = face.w;
+        seatY[seat]![local] = face.y + face.h / 2;
+        // The head as detected this frame, for the follow camera; the crop
+        // keeps the smoothed seat.
+        headX[seat]![local] = face.faceX ?? centre;
+        headY[seat]![local] = face.faceY ?? face.y + face.h / 2;
+        headW[seat]![local] = face.faceW ?? face.w;
       }
       // Carry the last observed position forward so a dropout does not move the
       // crop; the seat is still there even when the detector blinks.
@@ -439,6 +482,10 @@ export function buildTrack(args: {
         if (!present[s]![local] && local > 0) {
           seatX[s]![local] = seatX[s]![local - 1]!;
           seatW[s]![local] = seatW[s]![local - 1]!;
+          seatY[s]![local] = seatY[s]![local - 1]!;
+          headX[s]![local] = headX[s]![local - 1]!;
+          headY[s]![local] = headY[s]![local - 1]!;
+          headW[s]![local] = headW[s]![local - 1]!;
         }
       }
     }
@@ -520,6 +567,11 @@ export function buildTrack(args: {
         cropWidth,
         sourceWidth,
       });
+      chosenFace[shot.from + i] = {
+        x: headX[current]![i]! * analysisScale,
+        y: headY[current]![i]! * analysisScale,
+        w: headW[current]![i]! * analysisScale,
+      };
     }
     carrySpeakerX = seatCentres[current]! * analysisScale;
   }
@@ -553,12 +605,41 @@ export function buildTrack(args: {
       break;
     }
   }
+  let smoothFace: { x: number; y: number; w: number } | null = null;
+  // A holder rather than two `let`s: they are assigned inside `emit`, which
+  // TypeScript's narrowing cannot see, so bare variables read as never-set.
+  const emitted: { face: { x: number; y: number } | null; at: number } = { face: null, at: -Infinity };
+  let lastKnownFace: { x: number; y: number; w: number } | null = null;
+  const faceOf = (): Pick<CropKeyframe, "fx" | "fy" | "fw"> =>
+    smoothFace
+      ? { fx: Math.round(smoothFace.x), fy: Math.round(smoothFace.y), fw: Math.round(smoothFace.w) }
+      : {};
+  const emit = (t: number, cxValue: number) => {
+    keyframes.push({ t, cx: Math.round(cxValue), cy, width: cropWidth, ...faceOf() });
+    lastEmitted = cxValue;
+    emitted.face = smoothFace ? { x: smoothFace.x, y: smoothFace.y } : null;
+    emitted.at = t;
+  };
 
   for (let i = 0; i < n; i++) {
     const target = chosenCx[i];
     if (target !== null) lastKnownCx = target;
     const targetCx = clamp(lastKnownCx, half, sourceWidth - half);
     const t = i / ANALYSIS_FPS;
+    const face = chosenFace[i];
+    if (face) lastKnownFace = face;
+    // A cut invalidates the face just like the crop: start the EMA afresh.
+    if (frames[i]!.cut) smoothFace = null;
+    if (lastKnownFace) {
+      smoothFace =
+        smoothFace === null
+          ? { ...lastKnownFace }
+          : {
+              x: smoothFace.x + (lastKnownFace.x - smoothFace.x) * FACE_EMA,
+              y: smoothFace.y + (lastKnownFace.y - smoothFace.y) * FACE_EMA,
+              w: smoothFace.w + (lastKnownFace.w - smoothFace.w) * FACE_EMA,
+            };
+    }
 
     // A shot CUT and a speaker SWITCH want opposite treatments:
     //
@@ -579,8 +660,7 @@ export function buildTrack(args: {
           keyframes.pop();
         }
         smoothCx = targetCx;
-        keyframes.push({ t: snapAt, cx: Math.round(smoothCx), cy, width: cropWidth });
-        lastEmitted = smoothCx;
+        emit(snapAt, smoothCx);
         continue;
       }
     }
@@ -588,14 +668,19 @@ export function buildTrack(args: {
     if (smoothCx === null) smoothCx = targetCx;
     else smoothCx += (targetCx - smoothCx) * CENTRE_EMA;
 
-    if (i === 0 || Math.abs(smoothCx - lastEmitted) >= KEYFRAME_MOVE_PX) {
-      keyframes.push({ t, cx: Math.round(smoothCx), cy, width: cropWidth });
-      lastEmitted = smoothCx;
+    const faceMoved =
+      smoothFace !== null &&
+      t - emitted.at >= FACE_KEYFRAME_MIN_GAP_SEC &&
+      (emitted.face === null ||
+        Math.abs(smoothFace.x - emitted.face.x) >= FACE_KEYFRAME_PX ||
+        Math.abs(smoothFace.y - emitted.face.y) >= FACE_KEYFRAME_PX);
+    if (i === 0 || Math.abs(smoothCx - lastEmitted) >= KEYFRAME_MOVE_PX || faceMoved) {
+      emit(t, smoothCx);
     }
   }
 
   if (keyframes.length === 0 || keyframes[0]!.t !== 0) {
-    keyframes.unshift({ t: 0, cx: Math.round(lastKnownCx), cy, width: cropWidth });
+    keyframes.unshift({ t: 0, cx: Math.round(lastKnownCx), cy, width: cropWidth, ...faceOf() });
   }
 
   return {
