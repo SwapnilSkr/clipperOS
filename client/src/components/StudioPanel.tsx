@@ -274,6 +274,11 @@ export function StudioPanel({
                       {" · "}
                       {job.status === "failed" ? <span className="text-bad">{job.error ?? "failed"}</span> : job.status === "done" ? "ready" : "rendering…"}
                       {job.cost != null ? ` · $${job.cost.toFixed(2)}` : ""}
+                      {media?.sense?.quality != null ? (
+                        <span className={cn("ml-1", media.sense.quality >= 3 ? "text-accent" : "text-warn")} title={media.sense.flaws?.join(", ") || "Judged by the harness"}>
+                          · {media.sense.quality}/5{media.sense.quality < 3 && media.sense.flaws?.length ? ` — ${media.sense.flaws[0]}` : ""}
+                        </span>
+                      ) : null}
                     </p>
                   </div>
                   {job.status === "done" && job.assetId ? (

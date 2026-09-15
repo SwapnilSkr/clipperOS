@@ -72,6 +72,9 @@ export interface AssetSense {
   bpm?: number;
   energy?: number;
   suits?: string[];
+  /** Pictures: 1–5, and what is wrong with it; a still under 3 is never placed by the Director. */
+  quality?: number;
+  flaws?: string[];
   model: string;
   at: string;
 }

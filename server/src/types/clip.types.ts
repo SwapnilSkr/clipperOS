@@ -635,9 +635,19 @@ export interface AssetSense {
   energy?: number;
   /** What it suits, in the Director's words: "cold open", "a reveal", "under a calm story". */
   suits?: string[];
+  /**
+   * Pictures: whether it would hold up on screen, 1–5, and what is wrong with
+   * it (text, a watermark, artifacts, distorted anatomy, a subject cut off).
+   * A generated still below USABLE_STILL is never placed by the Director.
+   */
+  quality?: number;
+  flaws?: string[];
   model: string;
   at: string;
 }
+
+/** The least a generated still may score to be used as a cutaway. */
+export const USABLE_STILL = 3;
 
 /**
  * What the harness saw and heard in the clip window: the picture the words

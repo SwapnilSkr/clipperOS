@@ -48,6 +48,8 @@ check("clip sense: no JSON is null, not a throw", parseClipSense("I could not wa
 const asset = parseAssetSense(`{"line":"dark phonk beat, distorted cowbells","tags":["phonk","dark",7,"808s"],"bpm":"136","energy":4.4,"suits":["a hype peak"]}`, "m");
 check("asset sense: bpm from a string, energy rounded, non-string tags dropped", asset?.bpm === 136 && asset.energy === 4 && asset.tags.length === 3);
 check("asset sense: an sfx has no bpm", parseAssetSense(`{"line":"a whoosh","tags":[],"bpm":0,"energy":4}`, "m")?.bpm === undefined);
+const judged = parseAssetSense(`{"line":"a dragon","tags":["dragon"],"energy":3,"quality":"2","flaws":["text or lettering","AI artifacts"]}`, "m");
+check("asset sense: a picture's quality and flaws are kept", judged?.quality === 2 && judged.flaws?.length === 2);
 check("asset sense: no line is null", parseAssetSense(`{"tags":["x"]}`, "m") === null);
 
 // ---- render review ----
@@ -67,6 +69,7 @@ check("lessons: none is an empty block", describeLessons([]) === "");
 check("music: instrumental unless vocals are asked for", framePrompt({ kind: "music", prompt: "lo-fi bed" }).startsWith("Instrumental only") && !framePrompt({ kind: "music", prompt: "a sung hook with vocals" }).startsWith("Instrumental"));
 check("image: vertical by default, no text", framePrompt({ kind: "image", prompt: "a dragon" }).includes("vertical 9:16") && framePrompt({ kind: "image", prompt: "a dragon" }).includes("no text"));
 check("video: the aspect asked for", framePrompt({ kind: "video", prompt: "a push in", aspectRatio: "16:9" }).includes("widescreen 16:9"));
+check("a picture is asked to match the footage's look", framePrompt({ kind: "image", prompt: "a dragon", look: "moody dark studio, warm accent light" }).includes("match its lighting, palette and mood: moody dark studio"));
 
 if (failures > 0) {
   console.log(`\n${failures} harness check(s) failed`);

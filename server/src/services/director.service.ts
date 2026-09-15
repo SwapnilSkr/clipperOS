@@ -390,7 +390,7 @@ export function buildDirectorPrompt(brief: DirectorBrief): string {
     : "(empty)";
   const libraryPick = `a library "asset" id when one fits and is sharp (at least 720 on its short side — skip smaller ones)`;
   const stockPick = `a stock "query": 2–4 concrete, visual nouns ("server room racks", not "compute") and a "kind" (video preferred, image for a still idea)`;
-  const aiPick = `a "generate": { "kind": "image|video", "prompt": "..." } — a picture made to order. Write the prompt like a cinematographer's brief: subject, setting, light, lens, mood, 15–40 words, vertical; "video" for motion (5–8 s, a slow move), "image" for a still the cutaway will drift over. A generated video takes minutes: its still is placed now and the motion swaps in when it is ready.`;
+  const aiPick = `a "generate": { "kind": "image|video", "prompt": "..." } — a picture made to order. Write the prompt like a cinematographer's brief: one clear subject, setting, light, lens, mood, 15–40 words, vertical, composed for a two-second glance (no busy scenes, never any text or logos). It is generated to match the footage's lighting and palette and checked by the harness before use — one that would look cheap is dropped. "video" for motion (5–8 s, a slow move), "image" for a still the cutaway will drift over. A generated video takes minutes: its still is placed now and the motion swaps in when it is ready.`;
   const cutawaySource =
     brief.assets === "ai"
       ? `${libraryPick}, otherwise ${aiPick}`
@@ -588,6 +588,8 @@ export function applyDirectorAnswer(input: {
   sfxIds: Set<string>;
   /** Media assets a cutaway may use: the library plus anything fetched for this answer. */
   mediaIds?: Set<string>;
+  /** Which of those are stills: a still never sits static, it drifts. */
+  stillIds?: Set<string>;
   /** Music beds the plan may lay, and the ones already on the clip. */
   musicIds?: Set<string>;
   currentBeds?: MusicBed[];
@@ -719,7 +721,10 @@ export function applyDirectorAnswer(input: {
         endSec: abs(num(cutaway.end), false),
         assetId: String(cutaway.asset),
         fit: cutaway.fit === "blur" ? "blur" : "cover",
-        motion: CUTAWAY_MOTIONS.includes(cutaway.motion as Cutaway["motion"]) ? (cutaway.motion as Cutaway["motion"]) : "in",
+        motion:
+          CUTAWAY_MOTIONS.includes(cutaway.motion as Cutaway["motion"]) && !(cutaway.motion === "none" && input.stillIds?.has(String(cutaway.asset)))
+            ? (cutaway.motion as Cutaway["motion"])
+            : "in",
         in: directorEdge(cutaway.in),
         out: directorEdge(cutaway.out),
       }));
@@ -1111,6 +1116,7 @@ export async function directClip(clipId: string, input: DirectInput = {}): Promi
 
   // Stock queries and generation requests become library assets before anything is applied.
   const mediaIds = new Set(library.map((asset) => asset.id));
+  const stillIds = new Set(library.filter((asset) => asset.kind === "image").map((asset) => asset.id));
   const pending: string[] = [];
   const pendingVideos: { assetId: string; prompt: string }[] = [];
   const mayGenerate = assets === "ai" || assets === "both";
@@ -1121,15 +1127,19 @@ export async function directClip(clipId: string, input: DirectInput = {}): Promi
       findStock: stock && assets !== "ai" && assets !== "library" ? stockForQuery : undefined,
       generate: mayGenerate
         ? async (prompt, kind) => {
-            // A still now, in every case; a video is a job that replaces it when done.
-            const still = await generateImageNow(prompt, "9:16");
+            // A still now, in every case, matched to the footage's look and
+            // checked by the harness; a video is a job that replaces it when done.
+            const still = await generateImageNow(prompt, "9:16", { look: sense?.overall });
             if (!still) throw new Error("no image came back");
             return { asset: still, pendingVideo: kind === "video" };
           }
         : undefined,
     });
     answer.cutaways = resolved.cutaways;
-    for (const asset of resolved.assets) mediaIds.add(asset.id);
+    for (const asset of resolved.assets) {
+      mediaIds.add(asset.id);
+      if (asset.kind === "image") stillIds.add(asset.id);
+    }
     warnings.push(...resolved.warnings);
     pendingVideos.push(...resolved.pending);
   }
@@ -1160,6 +1170,7 @@ export async function directClip(clipId: string, input: DirectInput = {}): Promi
       keep,
       sfxIds: new Set(sounds.map((sound) => sound.id)),
       mediaIds,
+      stillIds,
       musicIds,
       currentBeds,
       windowsOutput,

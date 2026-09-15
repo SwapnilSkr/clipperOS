@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { config } from "../config";
 import { imageModel, musicModel, videoModel } from "../config/models";
 import { Clip, GenerationJob, type GenerationKind, type IGenerationJob } from "../models";
-import type { MediaAsset } from "../types/clip.types";
+import { USABLE_STILL, type MediaAsset } from "../types/clip.types";
 import { getErrorMessage } from "../types";
 import { ingestMediaFile, resolveMediaFile } from "./media-library.service";
 import { awaitVideo, downloadVideo, fileDataUrl, generateImage, generateMusic, startVideo } from "./openrouter.service";
@@ -39,6 +39,8 @@ export const MIN_VIDEO_SEC = 5;
 export interface GenerationRequest {
   kind: GenerationKind;
   prompt: string;
+  /** Describe and judge the result before returning (the Director's path); otherwise in the background. */
+  judge?: boolean;
   /** "9:16" (default), "16:9", "1:1". */
   aspectRatio?: string;
   /** Video only, 5–15 s. */
@@ -47,6 +49,8 @@ export interface GenerationRequest {
   fromAssetId?: string;
   /** The library label; defaults to the prompt's first words. */
   label?: string;
+  /** The footage's look (lighting, palette, mood) a picture should sit beside without clashing. */
+  look?: string;
   target?: { clipId: string; cutawayId?: string; bedId?: string };
 }
 
@@ -106,8 +110,11 @@ export function framePrompt(request: GenerationRequest): string {
   }
   const aspect = request.aspectRatio ?? "9:16";
   const orientation = aspect === "9:16" ? "vertical 9:16" : aspect === "16:9" ? "widescreen 16:9" : aspect;
-  if (request.kind === "image") return `${prompt}. ${orientation} composition, photographic, cinematic lighting, no text, no watermark, no logos.`;
-  return `${prompt}. ${orientation}, cinematic, smooth camera, no text, no watermark, no logos.`;
+  // A cutaway sits between two shots of the footage: it must read as the same film.
+  const match = request.look ? ` It cuts into footage that looks like this — match its lighting, palette and mood: ${request.look.slice(0, 300)}.` : "";
+  const clean = "Photoreal, shot on a cinema camera, natural lighting and grain, clean composition with the subject whole. Absolutely no text, lettering, captions, watermarks, logos or borders; no illustration or clip-art look; no distorted anatomy.";
+  if (request.kind === "image") return `${prompt}. ${orientation} composition.${match} ${clean}`;
+  return `${prompt}. ${orientation}, smooth slow camera move.${match} ${clean}`;
 }
 
 /** Start a generation; images and music complete before this resolves, a video keeps running. */
@@ -132,7 +139,7 @@ export async function startGeneration(request: GenerationRequest): Promise<Gener
   const label = labelFor({ ...request, prompt });
   try {
     if (request.kind === "image") {
-      await runImage(job, framed, label);
+      await runImage(job, framed, label, request.judge === true);
     } else if (request.kind === "music") {
       await runMusic(job, framed, label);
     } else {
@@ -157,7 +164,7 @@ async function stillDataUrl(assetId: string): Promise<string> {
   return fileDataUrl(file.path, "image/jpeg");
 }
 
-async function runImage(job: IGenerationJob, prompt: string, label: string): Promise<void> {
+async function runImage(job: IGenerationJob, prompt: string, label: string, judge: boolean): Promise<void> {
   const result = await generateImage({ model: job.modelId, prompt, aspectRatio: job.aspectRatio });
   const ext = result.mime.includes("jpeg") ? "jpg" : result.mime.includes("webp") ? "webp" : "png";
   const tmp = join(config.processingPath, `gen-${job._id}.${ext}`);
@@ -165,7 +172,9 @@ async function runImage(job: IGenerationJob, prompt: string, label: string): Pro
     await writeFile(tmp, result.bytes);
     const asset = await ingestMediaFile({ sourcePath: tmp, originalName: `${label}.${ext}`, kind: "image", source: "ai", prompt: job.prompt, model: job.modelId });
     await finish(job, asset.id, result.cost);
-    void describeMedia(asset);
+    // The Director waits for the verdict; the studio gets it in the background.
+    if (judge) await describeMedia(asset);
+    else void describeMedia(asset);
   } finally {
     await rm(tmp, { force: true }).catch(() => undefined);
   }
@@ -271,12 +280,30 @@ export async function resumeGenerationJobs(): Promise<number> {
   return running.length;
 }
 
-/** A blocking image for the Director: made now, in the library. */
-export async function generateImageNow(prompt: string, aspectRatio = "9:16", target?: GenerationRequest["target"]): Promise<MediaAsset | undefined> {
-  const job = await startGeneration({ kind: "image", prompt, aspectRatio, target });
-  if (job.status !== "done" || !job.assetId) throw new Error(job.error ?? "Image generation failed");
-  const file = await resolveMediaFile(job.assetId);
-  return file?.asset;
+/**
+ * A blocking image for the Director: made now, looked at by the harness,
+ * and only handed over if it would hold up on screen. A still that fails
+ * (lettering, a watermark, artifacts, a cut-off subject) is tried once more
+ * with the flaws named; a second failure is an error, so the cutaway is
+ * left out rather than placed ugly. The failed stills stay in the library,
+ * marked, for the creator to judge.
+ */
+export async function generateImageNow(prompt: string, aspectRatio = "9:16", options: { look?: string; target?: GenerationRequest["target"] } = {}): Promise<MediaAsset | undefined> {
+  let ask = prompt;
+  let lastFlaws: string[] = [];
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const job = await startGeneration({ kind: "image", prompt: ask, aspectRatio, look: options.look, target: options.target, judge: true });
+    if (job.status !== "done" || !job.assetId) throw new Error(job.error ?? "Image generation failed");
+    const file = await resolveMediaFile(job.assetId);
+    const asset = file?.asset;
+    if (!asset) throw new Error("The generated still did not land in the library");
+    const quality = asset.sense?.quality;
+    if (quality === undefined || quality >= USABLE_STILL) return asset;
+    lastFlaws = asset.sense?.flaws ?? [];
+    console.log(`✦ Still ${asset.id} judged ${quality}/5 (${lastFlaws.join(", ") || "no reason given"}); ${attempt === 0 ? "trying once more" : "giving up"}`);
+    ask = `${prompt}. Avoid: ${lastFlaws.join(", ") || "anything that looks generated"}.`;
+  }
+  throw new Error(`the still did not pass the harness's check (${lastFlaws.join(", ") || "low quality"})`);
 }
 
 /** A blocking music bed for the Director: made now, in the library. */

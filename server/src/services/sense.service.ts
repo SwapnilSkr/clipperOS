@@ -172,9 +172,9 @@ const AUDIO_SENSE_PROMPT = `You are a music supervisor cataloguing a sound for a
 { "line": "one line: what it is, genre/character, instrumentation, mood", "tags": ["3–8 tags: mood, genre, texture, 'loopable', 'vocals', 'one-shot', 'riser', 'impact'"], "bpm": 90, "energy": 3, "suits": ["2–4 uses in a vertical clip: 'under a calm story', 'a cold open', 'a punch-in hit'"] }
 "energy" is 1–5. For a sound effect, bpm is 0 and "line" says what the hit does (a whoosh, a sub boom, a UI tick).`;
 
-const MEDIA_SENSE_PROMPT = `You are cataloguing a picture for a short-form video editor's B-roll library. Describe it so the editor can pick it by content without seeing it. Return ONLY JSON:
-{ "line": "one line: subject, action or composition, lighting, colour, camera move if any", "tags": ["3–8 tags: subject, setting, mood, colours, 'portrait', 'slow motion', 'text on screen'"], "energy": 2, "suits": ["2–4 uses: 'a reveal', 'a cutaway on the word city', 'a calm intro'"] }
-"energy" is 1–5 (how much motion or intensity).`;
+const MEDIA_SENSE_PROMPT = `You are cataloguing a picture for a short-form video editor's B-roll library, and judging whether it would hold up full-screen on a phone for two seconds. Describe it so the editor can pick it by content without seeing it, then judge it hard: a picture that would make the video look cheap must be flagged. Return ONLY JSON:
+{ "line": "one line: subject, action or composition, lighting, colour, camera move if any", "tags": ["3–8 tags: subject, setting, mood, colours, 'portrait', 'slow motion', 'text on screen'"], "energy": 2, "suits": ["2–4 uses: 'a reveal', 'a cutaway on the word city', 'a calm intro'"], "quality": 4, "flaws": ["only real problems: 'text or lettering', 'watermark or logo', 'AI artifacts', 'distorted hands or faces', 'subject cut off', 'blurry', 'flat lighting', 'looks like clip art'"] }
+"energy" is 1–5 (how much motion or intensity). "quality" is 1–5, judged as a viewer on a phone would at a glance: 5 could pass for a shot from a film; 4 is polished; 3 is fine for two seconds; 2 has something a viewer would notice; 1 is embarrassing. Generated and stylised pictures are welcome — do NOT mark a picture down for being fantastical, illustrated on purpose, or obviously not a photo. Mark it down only for what a viewer would notice: lettering or captions baked in, a watermark or logo, warped anatomy or objects, smeared or duplicated details, a subject cut off by the frame, blur where there should be focus, a flat clip-art look. Any lettering or watermark caps quality at 2.`;
 
 export function parseAssetSense(text: string, model: string): AssetSense | null {
   const raw = jsonIn<Record<string, unknown>>(text);
@@ -183,12 +183,16 @@ export function parseAssetSense(text: string, model: string): AssetSense | null 
     Array.isArray(value) ? (value as unknown[]).filter((item): item is string => typeof item === "string").map((item) => item.trim().slice(0, 40)).filter(Boolean).slice(0, max) : [];
   const bpm = Number(raw.bpm);
   const energy = Number(raw.energy);
+  const quality = Number(raw.quality);
+  const flaws = strings(raw.flaws, 6);
   return {
     line: raw.line.trim().slice(0, 240),
     tags: strings(raw.tags, 8),
     ...(Number.isFinite(bpm) && bpm > 0 ? { bpm: Math.round(bpm) } : {}),
     ...(Number.isFinite(energy) ? { energy: Math.max(1, Math.min(5, Math.round(energy))) } : {}),
     suits: strings(raw.suits, 4),
+    ...(Number.isFinite(quality) ? { quality: Math.max(1, Math.min(5, Math.round(quality))) } : {}),
+    ...(flaws.length ? { flaws } : {}),
     model,
     at: new Date().toISOString(),
   };

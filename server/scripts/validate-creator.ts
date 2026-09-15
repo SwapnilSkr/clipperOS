@@ -912,6 +912,14 @@ check(
     generated.assets.length === 3 && generated.warnings.some((warning) => warning.includes("Only 3 pictures")),
   JSON.stringify({ c: generated.cutaways.map((c) => c.asset), p: generated.pending, w: generated.warnings })
 );
+const staticStill = applyDirectorAnswer({
+  ...baseDirect,
+  mediaIds: new Set(["still1", "vid1"]),
+  stillIds: new Set(["still1"]),
+  answer: { cutaways: [{ asset: "still1", start: 5, end: 7, motion: "none" }, { asset: "vid1", start: 10, end: 12, motion: "none" }] },
+});
+check("a still never sits static — it drifts; a video may hold", staticStill.plan.cutaways?.[0]?.motion === "in" && staticStill.plan.cutaways?.[1]?.motion === "none");
+
 const noGeneration = await resolveDirectorMedia({ cutaways: [{ generate: { kind: "image", prompt: "server room racks, blue light" } }], library });
 check("a generate request without generation falls back to the library by its words", noGeneration.cutaways[0]!.asset === library[0]!.id);
 
