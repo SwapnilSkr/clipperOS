@@ -35,9 +35,13 @@ export interface AudioAsset {
   label: string;
   /** How long the file actually is. Music loops to the clip. */
   durationSec: number;
-  /** Uploads are "upload"; the studio's are "ai" with their prompt. Built-ins carry neither. */
-  source?: "upload" | "ai";
+  /** Uploads are "upload"; the studio's are "ai" with their prompt; Freesound picks carry their credit. Built-ins carry neither. */
+  source?: "upload" | "ai" | "freesound";
   prompt?: string;
+  /** Credit line the licence asks for (CC-BY), and the sound's page. */
+  attribution?: string;
+  sourceUrl?: string;
+  sourceId?: string;
   /** What it sounds like, as the harness heard it (sense.service). */
   sense?: AssetSense;
 }
@@ -124,9 +128,18 @@ interface CustomMeta {
   kind: AudioKind;
   name: string;
   durationSec: number;
-  source?: "upload" | "ai";
+  source?: "upload" | "ai" | "freesound";
   prompt?: string;
+  attribution?: string;
+  sourceUrl?: string;
+  /** The provider's own id, so a Freesound pick is downloaded once. */
+  sourceId?: string;
   sense?: AssetSense;
+}
+
+/** The library track that came from this provider item, if it was picked before. */
+export async function findAudioBySource(source: "freesound", sourceId: string): Promise<AudioAsset | undefined> {
+  return (await listCustomAudio()).find((asset) => asset.source === source && asset.sourceId === sourceId);
 }
 
 /** Built-ins have no sidecar of their own; their descriptions live here. */
@@ -180,8 +193,11 @@ async function listAudioInDir(dir: string): Promise<AudioAsset[]> {
         kind: meta.kind,
         label: String(meta.name || "Upload").slice(0, 80),
         durationSec: Number(meta.durationSec) || 0,
-        source: meta.source === "ai" ? "ai" : "upload",
+        source: meta.source === "ai" || meta.source === "freesound" ? meta.source : "upload",
         ...(meta.prompt ? { prompt: meta.prompt } : {}),
+        ...(meta.attribution ? { attribution: meta.attribution } : {}),
+        ...(meta.sourceUrl ? { sourceUrl: meta.sourceUrl } : {}),
+        ...(meta.sourceId ? { sourceId: meta.sourceId } : {}),
         ...(meta.sense ? { sense: meta.sense } : {}),
       });
     } catch {
@@ -249,7 +265,7 @@ export async function ingestCustomAudio(
   kind: AudioKind,
   sourcePath: string,
   originalName: string,
-  origin: { source: "upload" | "ai"; prompt?: string; model?: string } = { source: "upload" }
+  origin: { source: "upload" | "ai" | "freesound"; prompt?: string; model?: string; attribution?: string; sourceUrl?: string; sourceId?: string } = { source: "upload" }
 ): Promise<AudioAsset> {
   await loadSharedAudioLibrary();
   const existing = await listAudioInDir(sharedAudioDir());
@@ -284,10 +300,28 @@ export async function ingestCustomAudio(
     durationSec,
     source: origin.source,
     ...(origin.prompt ? { prompt: origin.prompt } : {}),
+    ...(origin.attribution ? { attribution: origin.attribution } : {}),
+    ...(origin.sourceUrl ? { sourceUrl: origin.sourceUrl } : {}),
+    ...(origin.sourceId ? { sourceId: origin.sourceId } : {}),
   };
   await writeFile(
     join(dir, `${fileId}.json`),
-    JSON.stringify({ id: asset.id, kind, name: asset.label, durationSec, source: origin.source, ...(origin.prompt ? { prompt: origin.prompt } : {}), ...(origin.model ? { model: origin.model } : {}) }, null, 2)
+    JSON.stringify(
+      {
+        id: asset.id,
+        kind,
+        name: asset.label,
+        durationSec,
+        source: origin.source,
+        ...(origin.prompt ? { prompt: origin.prompt } : {}),
+        ...(origin.model ? { model: origin.model } : {}),
+        ...(origin.attribution ? { attribution: origin.attribution } : {}),
+        ...(origin.sourceUrl ? { sourceUrl: origin.sourceUrl } : {}),
+        ...(origin.sourceId ? { sourceId: origin.sourceId } : {}),
+      },
+      null,
+      2
+    )
   );
   return asset;
 }

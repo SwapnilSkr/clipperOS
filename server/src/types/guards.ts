@@ -382,6 +382,24 @@ export const GenerateAssetBody = t.Object({
   label: t.Optional(t.String({ maxLength: 80 })),
 });
 export const GenerationJobParams = t.Object({ id: t.String({ pattern: "^[0-9a-f]{24}$" }) });
+export const SoundSearchQuery = t.Object({
+  q: t.String({ minLength: 1, maxLength: 120 }),
+  maxSec: t.Optional(t.Numeric({ minimum: 0.2, maximum: 60 })),
+});
+export const SoundPickBody = t.Object({
+  id: t.String({ minLength: 1, maxLength: 16 }),
+  name: t.String({ minLength: 1, maxLength: 120 }),
+  durationSec: t.Number(),
+  license: t.String({ maxLength: 120 }),
+  needsCredit: t.Boolean(),
+  username: t.String({ maxLength: 120 }),
+  url: t.String({ maxLength: 400 }),
+  previewUrl: t.String({ maxLength: 400, pattern: "^https://(cdn\\.)?freesound\\.org/" }),
+  rating: t.Number(),
+  ratings: t.Number(),
+  tags: t.Array(t.String({ maxLength: 40 }), { maxItems: 12 }),
+  kind: t.Optional(t.Union([t.Literal("sfx"), t.Literal("music")])),
+});
 
 export const AudioLibraryQuery = t.Object({
   projectId: t.Optional(t.String({ pattern: OBJECT_ID_PATTERN })),

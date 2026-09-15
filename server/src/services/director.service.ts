@@ -53,6 +53,7 @@ import { fileDataUrl, chat, type ChatPart } from "./openrouter.service";
 import { proxyClip, senseClip, senseLibrary } from "./sense.service";
 import { describeLessons, lessonsFor } from "./taste.service";
 import { ensureProjectMedia } from "./ingest.service";
+import { freesoundConfigured, sfxForQuery } from "./freesound.service";
 import { updateClipEdit } from "./clip.service";
 import { listMediaAssets } from "./media-library.service";
 import { stockForQuery, stockSources } from "./stock.service";
@@ -316,6 +317,8 @@ export interface DirectorBrief {
   media: { id: string; kind: "image" | "video"; label: string; width?: number; height?: number; durationSec?: number; line?: string }[];
   /** A stock provider is configured, so a cutaway may ask for a query. */
   stock: boolean;
+  /** Freesound is configured, so a hit may ask for a query the catalogue lacks. */
+  freesound?: boolean;
   /** Where B-roll may come from this pass. */
   assets: DirectorAssetMode;
   /** Whether this pass may lay music. */
@@ -479,7 +482,7 @@ EDITING RULES
 - Cutaways (lane "cutaways"): B-roll laid over the speaker while the voice runs on. At most 2 per clip, 1.2–3s each, starting on the onset of the word that names what is shown, never in the first 1.5s and never over the peak line. Media: ${cutawaySource}. Transitions ≤ 0.4s ("dissolve" or "cut" by default; a slide or zoom for energy). fit "cover" for portrait media, "blur" for a wide shot you want to see whole.
 - Caption scenes: 2–4 scenes. The hook (first 2–4s) big and bold; the peak line its own scene with highlight "word" and a warm accent; the rest calm. Scenes must not overlap.
 - Titles (lane "titles", the creator's own text on screen, separate from the transcript captions): exactly 1 (the hook, 0–2.5s) unless the notes ask for more, depth "behind", placed where it peeks out around the head: y between the face's y and 0.62, large (sizeScale 1.6–2.4), uppercase. A second title only for a payoff punchline. "animation" is how it arrives: pop, fade, rise, zoom_in (grows from small), zoom_out (shrinks from big), slide_left / slide_right / slide_up / slide_down, drop, words (word by word); "exit" how it leaves: none, fade, pop, zoom_in, zoom_out, slide_left / slide_right / slide_up / slide_down, sink; "motion" while on screen: none, grow, shrink, pulse, wiggle, float. Default "pop" in, "fade" out, no motion; a punchline can "zoom_out" in and "pulse".
-- SFX: a whoosh-type sound on each camera move start (gain 0.6–0.9), a riser 0.6s before the peak punch, a low impact on the peak, a pop on the hook title's start, a tick on each applied cut (optional), a whoosh on a cutaway's arrival — choose by what each sound IS in the catalogue, including the creator's own uploads. At most ${MAX_SOUNDTRACK_HITS} hits.
+- SFX: a whoosh-type sound on each camera move start (gain 0.6–0.9), a riser 0.6s before the peak punch, a low impact on the peak, a pop on the hook title's start, a tick on each applied cut (optional), a whoosh on a cutaway's arrival — choose by what each sound IS in the catalogue, including the creator's own uploads. At most ${MAX_SOUNDTRACK_HITS} hits.${brief.freesound ? ` A sound the catalogue lacks that the picture calls for (glass shattering, a crowd gasp, a cash register, a door slam) may be a { "query": "2–4 concrete words", "at": …, "gain": … } instead of an "asset": it is found on Freesound, listened to, and only placed if the recording is clean — at most 3 per pass, and never for a plain whoosh, hit or tick the catalogue already has.` : ""}
 ${musicRules}
 - Times must land on word onsets from the WORDS list where possible.
 - A key you leave out of your answer leaves that lane exactly as it is in the current plan; an empty list clears the lane. Respect every KEEP instruction exactly.
@@ -964,6 +967,60 @@ export async function resolveDirectorMedia(input: {
 
 /** Pictures a single pass may generate (a still is ~10 s and a few cents; a video is minutes). */
 export const MAX_GENERATED_PER_PASS = 3;
+/** Sounds a single pass may look up on Freesound (each is a search, a download and a listen). */
+export const MAX_FOUND_SFX_PER_PASS = 3;
+
+/**
+ * Hits the answer asked to have found: each `query` becomes a library sound
+ * before the plan is applied, or is dropped with a warning. Same query, one
+ * lookup.
+ */
+export async function resolveDirectorSfx(input: {
+  sfx: unknown;
+  sfxIds: Set<string>;
+  findSound?: (query: string) => Promise<AudioAsset>;
+}): Promise<{ sfx: Record<string, unknown>[]; assets: AudioAsset[]; warnings: string[] }> {
+  const raw = Array.isArray(input.sfx) ? (input.sfx as unknown[]).slice(0, MAX_SOUNDTRACK_HITS) : [];
+  const assets: AudioAsset[] = [];
+  const warnings: string[] = [];
+  const found = new Map<string, Promise<AudioAsset>>();
+  const sfx: Record<string, unknown>[] = [];
+  for (const item of raw) {
+    if (typeof item !== "object" || item === null) continue;
+    const hit = { ...(item as Record<string, unknown>) };
+    if (typeof hit.asset === "string" && input.sfxIds.has(hit.asset)) {
+      sfx.push(hit);
+      continue;
+    }
+    const query = typeof hit.query === "string" ? hit.query.trim().slice(0, 80) : "";
+    if (!query) {
+      warnings.push(`A hit named a sound not in the catalogue${typeof hit.asset === "string" ? ` ("${hit.asset}")` : ""}, so it was left out.`);
+      continue;
+    }
+    if (!input.findSound) {
+      warnings.push(`The "${query}" hit needs Freesound (FREESOUND_API_KEY), so it was left out.`);
+      continue;
+    }
+    const key = query.toLowerCase();
+    if (!found.has(key)) {
+      if (found.size >= MAX_FOUND_SFX_PER_PASS) {
+        warnings.push(`Only ${MAX_FOUND_SFX_PER_PASS} sounds are looked up per pass; "${query}" was left out.`);
+        continue;
+      }
+      found.set(key, input.findSound(query));
+    }
+    try {
+      const asset = await found.get(key)!;
+      if (!assets.some((known) => known.id === asset.id)) assets.push(asset);
+      hit.asset = asset.id;
+      delete hit.query;
+      sfx.push(hit);
+    } catch (error: unknown) {
+      warnings.push(`No clean sound for "${query}" (${getErrorMessage(error)}), so that hit was left out.`);
+    }
+  }
+  return { sfx, assets, warnings };
+}
 
 /**
  * Beds the answer asked to have made: each `generate` becomes a real
@@ -1115,6 +1172,7 @@ export async function directClip(clipId: string, input: DirectInput = {}): Promi
       .slice(0, 40)
       .map((asset) => ({ id: asset.id, kind: asset.kind, label: asset.label, width: asset.width, height: asset.height, durationSec: asset.durationSec, line: asset.sense?.line })),
     stock,
+    freesound: freesoundConfigured(),
     assets,
     wantsMusic,
     sense,
@@ -1203,6 +1261,17 @@ export async function directClip(clipId: string, input: DirectInput = {}): Promi
     warnings.push(...resolved.warnings);
     pendingVideos.push(...resolved.pending);
   }
+  const sfxIds = new Set(sounds.map((sound) => sound.id));
+  if (answer.sfx !== undefined && !keep.includes("sfx")) {
+    const resolved = await resolveDirectorSfx({
+      sfx: answer.sfx,
+      sfxIds,
+      findSound: freesoundConfigured() ? (query) => sfxForQuery(query) : undefined,
+    });
+    answer.sfx = resolved.sfx;
+    for (const asset of resolved.assets) sfxIds.add(asset.id);
+    warnings.push(...resolved.warnings);
+  }
   const musicIds = new Set(beds.map((bed) => bed.id));
   if (wantsMusic && answer.music !== undefined && !keep.includes("music")) {
     const resolved = await resolveDirectorMusic({
@@ -1228,7 +1297,7 @@ export async function directClip(clipId: string, input: DirectInput = {}): Promi
       current,
       currentSfx: clip.edit?.soundtrack?.sfx ?? [],
       keep,
-      sfxIds: new Set(sounds.map((sound) => sound.id)),
+      sfxIds,
       mediaIds,
       stillIds,
       musicIds,

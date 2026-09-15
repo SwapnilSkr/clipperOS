@@ -531,9 +531,26 @@ export interface AudioAsset {
   kind: "music" | "sfx";
   label: string;
   durationSec: number;
-  source?: "upload" | "ai";
+  source?: "upload" | "ai" | "freesound";
   prompt?: string;
+  attribution?: string;
+  sourceUrl?: string;
   sense?: AssetSense;
+}
+
+/** A Freesound search result (server FreesoundResult). */
+export interface SoundResult {
+  id: string;
+  name: string;
+  durationSec: number;
+  license: string;
+  needsCredit: boolean;
+  username: string;
+  url: string;
+  previewUrl: string;
+  rating: number;
+  ratings: number;
+  tags: string[];
 }
 
 /**
@@ -946,6 +963,9 @@ export const api = {
     request<GenerationJob>("/studio/generate", { method: "POST", body: JSON.stringify(input) }),
   listGenerationJobs: () => request<GenerationJob[]>("/studio/jobs"),
   senseLibrary: () => request<{ described: number; failed: number; audio: number; media: number }>("/studio/sense-library", { method: "POST" }),
+  studioSources: () => request<{ freesound: boolean; fal: boolean }>("/studio/sources"),
+  searchSounds: (q: string, maxSec = 8) => request<SoundResult[]>(`/studio/sounds/search?q=${encodeURIComponent(q)}&maxSec=${maxSec}`),
+  pickSound: (result: SoundResult, kind: "sfx" | "music" = "sfx") => request<AudioAsset>("/studio/sounds/pick", { method: "POST", body: JSON.stringify({ ...result, kind }) }),
 
   /** Build (or confirm) the person matte behind-subject titles need in the preview. */
   buildClipMatte: (id: string) =>

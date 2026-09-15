@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
-import { Brain, Clapperboard, Image as ImageIcon, Loader2, Music, Sparkles, Trash2, Zap } from "lucide-react";
-import { api, mediaThumbUrl, type AudioAsset, type DirectorLesson, type GenerationJob, type GenerationKind, type MediaAsset } from "@/api";
+import { Brain, Clapperboard, Image as ImageIcon, Loader2, Music, Search, Sparkles, Trash2, Zap } from "lucide-react";
+import { api, mediaThumbUrl, type AudioAsset, type DirectorLesson, type GenerationJob, type GenerationKind, type MediaAsset, type SoundResult } from "@/api";
 import { cn } from "@/lib/utils";
 import { Panel } from "./editor-controls";
 
@@ -61,6 +61,12 @@ export function StudioPanel({
   const [rule, setRule] = useState("");
   const [describing, setDescribing] = useState(false);
   const [described, setDescribed] = useState<string | null>(null);
+  const [sources, setSources] = useState<{ freesound: boolean; fal: boolean }>({ freesound: false, fal: false });
+  const [soundQuery, setSoundQuery] = useState("");
+  const [sounds, setSounds] = useState<SoundResult[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [picking, setPicking] = useState<string | null>(null);
+  const [picked, setPicked] = useState<Record<string, string>>({});
 
   const stills = useMemo(() => mediaLibrary.filter((asset) => asset.kind === "image"), [mediaLibrary]);
   const known = useMemo(() => {
@@ -89,8 +95,37 @@ export function StudioPanel({
   useEffect(() => {
     void refreshJobs();
     void api.listLessons().then(setLessons).catch(() => undefined);
+    void api.studioSources().then(setSources).catch(() => undefined);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  async function searchSounds() {
+    const q = soundQuery.trim();
+    if (!q) return;
+    setSearching(true);
+    setError(null);
+    try {
+      setSounds(await api.searchSounds(q));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSearching(false);
+    }
+  }
+
+  async function pickSound(result: SoundResult) {
+    setPicking(result.id);
+    setError(null);
+    try {
+      const asset = await api.pickSound(result);
+      setPicked((prev) => ({ ...prev, [result.id]: asset.id }));
+      await onAudioChanged();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setPicking(null);
+    }
+  }
 
   useEffect(() => {
     if (!running) return;
@@ -257,7 +292,7 @@ export function StudioPanel({
         </button>
         <p className="text-meta mt-1 text-muted">
           {kind === "sfx"
-            ? "Made on fal.ai (Stable Audio SFX, ~2¢; needs FAL_KEY), trimmed and levelled like the bundled hits. Lands in the SFX list."
+            ? `Made on fal.ai (Stable Audio SFX, ~2¢)${sources.fal ? "" : " — needs FAL_KEY"}, trimmed and levelled like the bundled hits. Lands in the SFX list. For a real recording, search Freesound below.`
             : kind === "video"
             ? "Motion renders on the provider for a few minutes; it lands in the library when done."
             : kind === "music"
@@ -322,6 +357,69 @@ export function StudioPanel({
                 </li>
               );
             })}
+          </ul>
+        ) : null}
+      </Panel>
+
+      <Panel title="Find a sound" icon={Search}>
+        <p className="text-meta text-muted">
+          Real recordings from freesound.org, free — only CC0 and Attribution licences (the credit is kept with the file). Play a preview before you take it.
+          {!sources.freesound ? " Needs FREESOUND_API_KEY (free at freesound.org/apiv2/apply)." : ""}
+        </p>
+        <div className="mt-2 flex items-center gap-1.5">
+          <input
+            value={soundQuery}
+            onChange={(event) => setSoundQuery(event.target.value)}
+            maxLength={120}
+            placeholder="glass shatter, crowd gasp, cash register…"
+            aria-label="Search sounds"
+            disabled={!sources.freesound}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") void searchSounds();
+            }}
+            className="text-ui h-9 min-w-0 flex-1 rounded-md border border-control bg-panel-2 px-2 outline-none focus:border-accent disabled:opacity-50"
+          />
+          <button
+            type="button"
+            onClick={() => void searchSounds()}
+            disabled={searching || !soundQuery.trim() || !sources.freesound}
+            className="press text-ui inline-flex h-9 items-center gap-1 rounded-md border border-accent px-2 font-semibold text-accent disabled:opacity-50"
+          >
+            {searching ? <Loader2 className="size-3.5 animate-spin" aria-hidden="true" /> : <Search className="size-3.5" aria-hidden="true" />}
+            Search
+          </button>
+        </div>
+        {sounds.length > 0 ? (
+          <ul className="mt-2 space-y-1.5">
+            {sounds.map((result) => (
+              <li key={result.id} className="rounded-lg border border-border bg-panel-2/50 p-1.5">
+                <div className="flex items-center gap-2">
+                  <div className="min-w-0 flex-1">
+                    <p className="text-ui truncate" title={result.name}>
+                      {result.name}
+                    </p>
+                    <p className="text-micro text-muted">
+                      {result.durationSec.toFixed(1)} s · {result.ratings > 0 ? `${result.rating.toFixed(1)}★ (${result.ratings})` : "unrated"} · {result.needsCredit ? "credit" : "CC0"} · {result.username}
+                    </p>
+                  </div>
+                  {picked[result.id] ? (
+                    <button type="button" onClick={() => onPlaceHit(picked[result.id]!)} className="press text-micro rounded-md border border-accent px-2 py-1 font-semibold text-accent">
+                      Drop at playhead
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled={picking === result.id}
+                      onClick={() => void pickSound(result)}
+                      className="press text-micro rounded-md border border-border px-2 py-1 font-semibold text-muted hover:border-accent hover:text-fg disabled:opacity-50"
+                    >
+                      {picking === result.id ? "Taking…" : "Take it"}
+                    </button>
+                  )}
+                </div>
+                <audio controls preload="none" src={result.previewUrl} className="mt-1 h-8 w-full" aria-label={`Preview of ${result.name}`} />
+              </li>
+            ))}
           </ul>
         ) : null}
       </Panel>

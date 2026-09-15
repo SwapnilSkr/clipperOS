@@ -646,7 +646,7 @@ check("lenient overrides drop nonsense and keep the rest", JSON.stringify(lenien
 
 
 // ---- Creator Mode II: the Director writes speed, looks, B-roll and framing ----
-import { buildDirectorPrompt, gazeSummary, libraryMatch, resolveDirectorMedia, resolveDirectorMusic, type DirectorLane, type DirectorPlanJson } from "../src/services/director.service";
+import { buildDirectorPrompt, gazeSummary, libraryMatch, resolveDirectorMedia, resolveDirectorMusic, resolveDirectorSfx, type DirectorLane, type DirectorPlanJson } from "../src/services/director.service";
 
 const stored: CreatorPlan = {
   enabled: true,
@@ -922,6 +922,17 @@ check("a still never sits static — it drifts; a video may hold", staticStill.p
 
 const noGeneration = await resolveDirectorMedia({ cutaways: [{ generate: { kind: "image", prompt: "server room racks, blue light" } }], library });
 check("a generate request without generation falls back to the library by its words", noGeneration.cutaways[0]!.asset === library[0]!.id);
+
+const foundSfx = await resolveDirectorSfx({
+  sfx: [{ asset: "swoosh", at: 1 }, { query: "glass shatter", at: 5, gain: 0.8 }, { query: "Glass Shatter", at: 9 }, { query: "crowd gasp", at: 12 }, { asset: "nosuch", at: 2 }],
+  sfxIds: new Set(["swoosh"]),
+  findSound: async (query) => (query === "crowd gasp" ? Promise.reject(new Error("too noisy")) : { id: `custom:${query.toLowerCase()}`, kind: "sfx" as const, label: query, durationSec: 1 }),
+});
+check(
+  "found hits: a query becomes a track once, a failed lookup and an unknown asset are dropped with a reason",
+  foundSfx.sfx.length === 3 && foundSfx.sfx[1]!.asset === "custom:glass shatter" && foundSfx.sfx[2]!.asset === "custom:glass shatter" && foundSfx.assets.length === 1 && foundSfx.warnings.length === 2,
+  JSON.stringify({ s: foundSfx.sfx.map((h) => h.asset), w: foundSfx.warnings })
+);
 
 const generatedMusic = await resolveDirectorMusic({
   music: [{ generate: { prompt: "lo-fi bed" }, level: 0.2 }, { generate: { prompt: "second" } }, { asset: "warm" }],

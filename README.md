@@ -364,7 +364,13 @@ motion and music to order on OpenRouter — all models are swappable
 (`FAL_KEY`, `SFX_MODEL`; OpenRouter has no SFX model — its audio-output
 models are music and speech only. Stable Audio 3 Small SFX is ~2¢ an
 effect, ElevenLabs' SFX through fal $0.002 a second). A hit is trimmed of
-silence and levelled like the bundled ones. Everything lands in the shared
+silence and levelled like the bundled ones. *Find a sound* searches
+**Freesound** (`FREESOUND_API_KEY`, free): real recordings, filtered to CC0
+and Attribution licences (the credit is kept with the file), with a preview
+to play before taking one. The Director may ask for a sound the catalogue
+lacks (`{ "query": "glass shatter" }` on a hit): the rated matches are
+taken in turn and each is listened to — only a recording the harness scores
+clean is placed, at most three lookups a pass. Everything lands in the shared
 libraries like an upload does, described by the harness on arrival, so it is
 reusable in any project and pickable by content. *Animate a still* turns a
 library image into the first frame of a 5–15 s video — the way to build your

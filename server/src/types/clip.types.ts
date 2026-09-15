@@ -655,6 +655,8 @@ export interface AssetSense {
 
 /** The least a generated still may score to be used as a cutaway. */
 export const USABLE_STILL = 3;
+/** The least a found recording may score to be placed as a hit. */
+export const USABLE_RECORDING = 3;
 
 /**
  * What the harness saw and heard in the clip window: the picture the words

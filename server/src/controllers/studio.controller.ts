@@ -1,6 +1,7 @@
 import { getGenerationJob, listGenerationJobs, startGeneration } from "../services/ai-assets.service";
 import { senseLibrary } from "../services/sense.service";
 import { addLesson, deleteLesson, listLessons } from "../services/taste.service";
+import { freesoundConfigured, pickFreesound, searchFreesound, type FreesoundResult } from "../services/freesound.service";
 import type { ApiContext } from "../types/api.types";
 import { getErrorMessage } from "../types";
 import { fail, ok } from "../utils/response.utils";
@@ -73,4 +74,35 @@ export async function addLessonRoute({ body, set }: Ctx) {
 export async function deleteLessonRoute({ params }: Ctx) {
   await deleteLesson(params.id);
   return ok({ deleted: true });
+}
+
+/** GET /api/studio/sounds/search?q= — Freesound, filtered to licences a published clip may carry. */
+export async function searchSoundsRoute({ query, set }: Ctx) {
+  if (!freesoundConfigured()) {
+    set.status = 400;
+    return fail("FREESOUND_API_KEY is not set — get a free key at freesound.org/apiv2/apply");
+  }
+  try {
+    const input = query as { q: string; maxSec?: number };
+    return ok(await searchFreesound(input.q, { maxSec: input.maxSec ?? 8, pageSize: 15 }));
+  } catch (error: unknown) {
+    set.status = 502;
+    return fail(getErrorMessage(error));
+  }
+}
+
+/** POST /api/studio/sounds/pick — bring a search result into the shared library. */
+export async function pickSoundRoute({ body, set }: Ctx) {
+  try {
+    const input = body as FreesoundResult & { kind?: "sfx" | "music" };
+    return ok(await pickFreesound(input, input.kind ?? "sfx"));
+  } catch (error: unknown) {
+    set.status = 400;
+    return fail(getErrorMessage(error));
+  }
+}
+
+/** GET /api/studio/sources — which optional providers are configured, for the panel. */
+export function studioSourcesRoute() {
+  return ok({ freesound: freesoundConfigured(), fal: Boolean(process.env.FAL_KEY?.trim()) });
 }

@@ -168,9 +168,9 @@ export async function senseClip(clipId: string, options: { force?: boolean } = {
   return sense;
 }
 
-const AUDIO_SENSE_PROMPT = `You are a music supervisor cataloguing a sound for a short-form video editor. Listen and describe it so the editor can pick it without hearing it. Return ONLY JSON:
-{ "line": "one line: what it is, genre/character, instrumentation, mood", "tags": ["3–8 tags: mood, genre, texture, 'loopable', 'vocals', 'one-shot', 'riser', 'impact'"], "bpm": 90, "energy": 3, "suits": ["2–4 uses in a vertical clip: 'under a calm story', 'a cold open', 'a punch-in hit'"] }
-"energy" is 1–5. For a sound effect, bpm is 0 and "line" says what the hit does (a whoosh, a sub boom, a UI tick).`;
+const AUDIO_SENSE_PROMPT = `You are a music supervisor cataloguing a sound for a short-form video editor. Listen and describe it so the editor can pick it without hearing it, and judge whether it is clean enough to publish. Return ONLY JSON:
+{ "line": "one line: what it is, genre/character, instrumentation, mood", "tags": ["3–8 tags: mood, genre, texture, 'loopable', 'vocals', 'one-shot', 'riser', 'impact'"], "bpm": 90, "energy": 3, "suits": ["2–4 uses in a vertical clip: 'under a calm story', 'a cold open', 'a punch-in hit'"], "quality": 4, "flaws": ["only real problems: 'hiss or noise floor', 'clipping', 'roomy or distant', 'clicks or handling noise', 'long silence before the sound', 'low bitrate artifacts', 'several sounds not one'"] }
+"energy" is 1–5. "quality" is 1–5 as a recording: 5 is a library-grade sound, 3 is usable in a mix, 1–2 would be heard as bad on a phone. For a sound effect, bpm is 0 and "line" says what the hit does (a whoosh, a sub boom, a UI tick).`;
 
 const MEDIA_SENSE_PROMPT = `You are cataloguing a picture for a short-form video editor's B-roll library, and judging whether it would hold up full-screen on a phone for two seconds. Describe it so the editor can pick it by content without seeing it, then judge it hard: a picture that would make the video look cheap must be flagged. Return ONLY JSON:
 { "line": "one line: subject, action or composition, lighting, colour, camera move if any", "tags": ["3–8 tags: subject, setting, mood, colours, 'portrait', 'slow motion', 'text on screen'"], "energy": 2, "suits": ["2–4 uses: 'a reveal', 'a cutaway on the word city', 'a calm intro'"], "quality": 4, "flaws": ["only real problems: 'text or lettering', 'watermark or logo', 'AI artifacts', 'distorted hands or faces', 'subject cut off', 'blurry', 'flat lighting', 'looks like clip art'"] }

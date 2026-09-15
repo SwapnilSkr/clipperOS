@@ -25,6 +25,8 @@ export const config = {
   openRouterApiKey: process.env.OPENROUTER_API_KEY || "",
   /** fal.ai, for generated sound effects (OpenRouter has no SFX model). Optional. */
   falKey: process.env.FAL_KEY?.trim() || "",
+  /** Freesound.org, for real recorded sound effects (free). Optional. */
+  freesoundApiKey: process.env.FREESOUND_API_KEY?.trim() || "",
   openRouterBaseUrl: process.env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1",
   /** Empty = fall through to the model registry (config/models.ts). */
   llmModelOverride: process.env.LLM_MODEL || "",
