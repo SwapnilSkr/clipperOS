@@ -370,7 +370,15 @@ and Attribution licences (the credit is kept with the file), with a preview
 to play before taking one. The Director may ask for a sound the catalogue
 lacks (`{ "query": "glass shatter" }` on a hit): the rated matches are
 taken in turn and each is listened to — only a recording the harness scores
-clean is placed, at most three lookups a pass. With an **Epidemic Sound**
+clean is placed, at most three lookups a pass. **Sound packs** (Studio →
+Sound packs) install Kenney's public-domain (CC0) packs in one click — no
+key, no credit: impacts (glass, metal, wood, plates, punches, footsteps),
+interface, UI, digital, sci-fi, RPG, casino, jingles — several hundred
+one-shots ingested like uploads, folded away in the pickers until searched
+for, described by the harness in the background. The Director's sound
+lookups try the installed packs first (`searchLocalSounds`: name, pack, the
+harness's tags and description), then an online library if one is
+configured. With an **Epidemic Sound**
 partner key (`EPIDEMIC_SOUND_API_KEY`) the same search and the Director's
 lookups go to its licensed library instead — 250k effects and 55k tracks,
 with music too: the Director may ask for a bed by query and BPM window

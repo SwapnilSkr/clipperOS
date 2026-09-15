@@ -400,6 +400,11 @@ export const EpidemicPickBody = t.Object({
   hasVocals: t.Optional(t.Boolean()),
   previewOnly: t.Optional(t.Boolean()),
 });
+export const SoundPackParams = t.Object({ slug: t.String({ pattern: "^[a-z0-9-]{2,40}$" }) });
+export const LocalSoundSearchQuery = t.Object({
+  q: t.String({ minLength: 1, maxLength: 120 }),
+  kind: t.Optional(t.Union([t.Literal("sfx"), t.Literal("music")])),
+});
 export const EpidemicPreviewQuery = t.Object({
   kind: t.Union([t.Literal("sfx"), t.Literal("music")]),
   id: t.String({ minLength: 1, maxLength: 64 }),

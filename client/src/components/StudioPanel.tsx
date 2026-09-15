@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
-import { Brain, Clapperboard, Image as ImageIcon, Loader2, Music, Search, Sparkles, Trash2, Zap } from "lucide-react";
-import { api, mediaThumbUrl, type AudioAsset, type DirectorLesson, type GenerationJob, type GenerationKind, type LibrarySoundResult, type MediaAsset } from "@/api";
+import { Brain, Clapperboard, Image as ImageIcon, Loader2, Music, Package, Play, Search, Sparkles, Trash2, Zap } from "lucide-react";
+import { api, mediaThumbUrl, type AudioAsset, type DirectorLesson, type GenerationJob, type GenerationKind, type LibrarySoundResult, type MediaAsset, type SoundPackInfo } from "@/api";
+import { audition } from "./SfxPicker";
 import { cn } from "@/lib/utils";
 import { Panel } from "./editor-controls";
 
@@ -62,7 +63,10 @@ export function StudioPanel({
   const [describing, setDescribing] = useState(false);
   const [described, setDescribed] = useState<string | null>(null);
   const [sources, setSources] = useState<{ freesound: boolean; epidemic: boolean; fal: boolean }>({ freesound: false, epidemic: false, fal: false });
-  const [soundSource, setSoundSource] = useState<"epidemic" | "freesound" | null>(null);
+  const [soundSource, setSoundSource] = useState<"library" | "epidemic" | "freesound" | null>(null);
+  const [localHits, setLocalHits] = useState<AudioAsset[]>([]);
+  const [packs, setPacks] = useState<SoundPackInfo[]>([]);
+  const [installing, setInstalling] = useState<string | null>(null);
   const [soundKind, setSoundKind] = useState<"sfx" | "music">("sfx");
   const [soundQuery, setSoundQuery] = useState("");
   const [sounds, setSounds] = useState<LibrarySoundResult[]>([]);
@@ -70,8 +74,9 @@ export function StudioPanel({
   const [picking, setPicking] = useState<string | null>(null);
   const [picked, setPicked] = useState<Record<string, string>>({});
   const [previews, setPreviews] = useState<Record<string, string>>({});
-  const activeSource = soundSource ?? (sources.epidemic ? "epidemic" : "freesound");
-  const soundsOn = sources.epidemic || sources.freesound;
+  const activeSource = soundSource ?? "library";
+  const soundsOn = true;
+  const packsInstalling = packs.some((pack) => pack.install?.status === "running");
 
   const stills = useMemo(() => mediaLibrary.filter((asset) => asset.kind === "image"), [mediaLibrary]);
   const known = useMemo(() => {
@@ -101,8 +106,38 @@ export function StudioPanel({
     void refreshJobs();
     void api.listLessons().then(setLessons).catch(() => undefined);
     void api.studioSources().then(setSources).catch(() => undefined);
+    void api.listSoundPacks().then(setPacks).catch(() => undefined);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (!packsInstalling) return;
+    const timer = window.setInterval(() => {
+      void api
+        .listSoundPacks()
+        .then(async (next) => {
+          const finished = next.some((pack) => pack.install?.status === "done" && packs.find((prev) => prev.slug === pack.slug)?.install?.status === "running");
+          setPacks(next);
+          if (finished) await onAudioChanged();
+        })
+        .catch(() => undefined);
+    }, 3000);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [packsInstalling, packs]);
+
+  async function installPack(slug: string) {
+    setInstalling(slug);
+    setError(null);
+    try {
+      await api.installSoundPack(slug);
+      setPacks(await api.listSoundPacks());
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setInstalling(null);
+    }
+  }
 
   async function searchSounds() {
     const q = soundQuery.trim();
@@ -110,7 +145,13 @@ export function StudioPanel({
     setSearching(true);
     setError(null);
     try {
-      setSounds(await api.searchSounds(q, { source: activeSource, kind: activeSource === "epidemic" ? soundKind : "sfx" }));
+      if (activeSource === "library") {
+        setLocalHits(await api.searchLocalSounds(q, soundKind));
+        setSounds([]);
+      } else {
+        setLocalHits([]);
+        setSounds(await api.searchSounds(q, { source: activeSource, kind: activeSource === "epidemic" ? soundKind : "sfx" }));
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -379,17 +420,54 @@ export function StudioPanel({
         ) : null}
       </Panel>
 
+      <Panel title="Sound packs" icon={Package}>
+        <p className="text-meta text-muted">
+          Free, public-domain (CC0) packs by Kenney — no key, no credit needed. One click installs the whole pack into your library; the
+          harness listens to each sound in the background so the Director can find one by what it sounds like.
+        </p>
+        <ul className="mt-2 space-y-1.5">
+          {packs.map((pack) => {
+            const busy = pack.install?.status === "running" || installing === pack.slug;
+            return (
+              <li key={pack.slug} className="flex items-center gap-2 rounded-lg border border-border bg-panel-2/50 p-1.5">
+                <div className="min-w-0 flex-1">
+                  <p className="text-ui">
+                    {pack.label} <span className="text-micro text-muted">· ~{pack.count} sounds</span>
+                  </p>
+                  <p className="text-micro truncate text-muted" title={pack.covers}>
+                    {pack.covers}
+                  </p>
+                  {pack.install?.status === "failed" ? <p className="text-micro text-bad">{pack.install.error}</p> : null}
+                </div>
+                {pack.installed > 0 && !busy ? (
+                  <span className="text-micro shrink-0 font-semibold text-accent">{pack.installed} installed</span>
+                ) : (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void installPack(pack.slug)}
+                    className="press text-micro shrink-0 rounded-md border border-border px-2 py-1 font-semibold text-muted hover:border-accent hover:text-fg disabled:opacity-50"
+                  >
+                    {busy ? `${pack.install?.done ?? 0}/${pack.install?.total || pack.count}…` : "Install"}
+                  </button>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      </Panel>
+
       <Panel title="Find a sound" icon={Search}>
         <p className="text-meta text-muted">
-          {sources.epidemic
-            ? "Epidemic Sound's licensed library — sound effects and tracks — and freesound.org's recordings (CC0 / Attribution, credit kept with the file). Play before you take."
-            : sources.freesound
-              ? "Real recordings from freesound.org, free — only CC0 and Attribution licences (the credit is kept with the file). Play a preview before you take it."
-              : "Needs EPIDEMIC_SOUND_API_KEY (Epidemic Sound partner key) or FREESOUND_API_KEY (free at freesound.org/apiv2/apply)."}
+          Your library first — built-ins, uploads, installed packs — by name and by what the harness heard.
+          {sources.epidemic ? " Epidemic Sound's licensed library too." : ""}
+          {sources.freesound ? " And freesound.org (CC0 / Attribution, credit kept with the file)." : ""}
+          {!sources.epidemic && !sources.freesound ? " Freesound (free) needs FREESOUND_API_KEY: any placeholder works for its callback field, token search never uses it." : ""}
         </p>
-        {sources.epidemic && sources.freesound ? (
-          <div className="mt-2 flex flex-wrap items-center gap-1.5">
-            {(["epidemic", "freesound"] as const).map((source) => (
+        <div className="mt-2 flex flex-wrap items-center gap-1.5">
+          {(["library", "epidemic", "freesound"] as const)
+            .filter((source) => source === "library" || (source === "epidemic" ? sources.epidemic : sources.freesound))
+            .map((source) => (
               <button
                 key={source}
                 type="button"
@@ -397,15 +475,15 @@ export function StudioPanel({
                 onClick={() => {
                   setSoundSource(source);
                   setSounds([]);
+                  setLocalHits([]);
                 }}
                 className={cn("press text-micro rounded-full border px-2 py-0.5 font-semibold", activeSource === source ? "border-accent bg-accent/15 text-accent" : "border-border text-muted hover:border-control")}
               >
-                {source === "epidemic" ? "Epidemic Sound" : "Freesound"}
+                {source === "library" ? "My library" : source === "epidemic" ? "Epidemic Sound" : "Freesound"}
               </button>
             ))}
-          </div>
-        ) : null}
-        {activeSource === "epidemic" && sources.epidemic ? (
+        </div>
+        {activeSource === "library" || (activeSource === "epidemic" && sources.epidemic) ? (
           <div className="mt-2 flex flex-wrap items-center gap-1.5">
             {(["sfx", "music"] as const).map((kindOption) => (
               <button
@@ -446,6 +524,33 @@ export function StudioPanel({
             Search
           </button>
         </div>
+        {localHits.length > 0 ? (
+          <ul className="mt-2 space-y-1">
+            {localHits.map((asset) => (
+              <li key={asset.id} className="flex items-center gap-1.5 rounded-lg border border-border bg-panel-2/50 px-1.5 py-1">
+                <button type="button" onClick={() => audition(asset.id)} aria-label={`Play ${asset.label}`} className="press inline-flex size-7 shrink-0 items-center justify-center rounded text-muted hover:text-fg">
+                  <Play className="size-3 fill-current" aria-hidden="true" />
+                </button>
+                <div className="min-w-0 flex-1">
+                  <p className="text-ui truncate">{asset.label}</p>
+                  <p className="text-micro truncate text-muted">
+                    {asset.durationSec.toFixed(1)} s{asset.pack ? ` · ${asset.pack}` : asset.source ? ` · ${asset.source}` : ""}
+                    {asset.sense?.line ? ` · ${asset.sense.line}` : ""}
+                  </p>
+                </div>
+                {asset.kind === "music" ? (
+                  <button type="button" onClick={() => onAddBed(asset.id)} className="press text-micro rounded-md border border-border px-2 py-1 font-semibold text-muted hover:border-accent hover:text-fg">
+                    Lay as bed
+                  </button>
+                ) : (
+                  <button type="button" onClick={() => onPlaceHit(asset.id)} className="press text-micro rounded-md border border-border px-2 py-1 font-semibold text-muted hover:border-accent hover:text-fg">
+                    Drop at playhead
+                  </button>
+                )}
+              </li>
+            ))}
+          </ul>
+        ) : null}
         {sounds.length > 0 ? (
           <ul className="mt-2 space-y-1.5">
             {sounds.map((result) => (

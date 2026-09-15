@@ -11,6 +11,7 @@
 import { parseAssetSense, parseClipSense, parseRenderReview } from "../src/services/sense.service";
 import { describeLessons } from "../src/services/taste.service";
 import { framePrompt } from "../src/services/ai-assets.service";
+import { searchLocalSounds } from "../src/services/sound-packs.service";
 import { directorModel, imageModel, musicModel, senseModel, videoModel } from "../src/config/models";
 
 let failures = 0;
@@ -70,6 +71,17 @@ check("music: instrumental unless vocals are asked for", framePrompt({ kind: "mu
 check("image: vertical by default, no text", framePrompt({ kind: "image", prompt: "a dragon" }).includes("vertical 9:16") && framePrompt({ kind: "image", prompt: "a dragon" }).includes("no text"));
 check("video: the aspect asked for", framePrompt({ kind: "video", prompt: "a push in", aspectRatio: "16:9" }).includes("widescreen 16:9"));
 check("a picture is asked to match the footage's look", framePrompt({ kind: "image", prompt: "a dragon", look: "moody dark studio, warm accent light" }).includes("match its lighting, palette and mood: moody dark studio"));
+
+// ---- local sound search ----
+const shelf = [
+  { id: "custom:1", kind: "sfx" as const, label: "Impact glass heavy 000", durationSec: 0.8, source: "pack" as const, pack: "impact-sounds" },
+  { id: "custom:2", kind: "sfx" as const, label: "Impact wood light 001", durationSec: 0.4, source: "pack" as const, pack: "impact-sounds" },
+  { id: "custom:3", kind: "sfx" as const, label: "Whoosh", durationSec: 0.5, sense: { line: "a fast airy whoosh with a glassy tail", tags: ["whoosh", "transition"], model: "m", at: "t" } },
+  { id: "custom:4", kind: "sfx" as const, label: "Impact glass light 002", durationSec: 0.5, source: "pack" as const, pack: "impact-sounds", sense: { line: "a small glass tap", tags: ["glass"], quality: 2, flaws: ["hiss or noise floor"], model: "m", at: "t" } },
+];
+const glass = searchLocalSounds("glass shattering", shelf, { kind: "sfx" });
+check("local search: a clean name match leads, a described sound is found, a flawed one sinks below it", glass[0]!.id === "custom:1" && glass.some((a) => a.id === "custom:3") && glass.findIndex((a) => a.id === "custom:4") > 0, glass.map((a) => a.id).join(","));
+check("local search: nothing matches nothing", searchLocalSounds("cash register", shelf).length === 0);
 
 if (failures > 0) {
   console.log(`\n${failures} harness check(s) failed`);

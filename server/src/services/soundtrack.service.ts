@@ -24,6 +24,8 @@ export const DIP_FLOOR = 0.08;
 export const DIP_ATTACK_MS = 30;
 export const DIP_RELEASE_MS = 280;
 export const MAX_CUSTOM_AUDIO = 24;
+/** Uploads plus installed packs. */
+export const MAX_LIBRARY_AUDIO = 2000;
 export const MAX_CUSTOM_AUDIO_BYTES = 8 * 1024 * 1024;
 export const SHARED_AUDIO_OWNER = "shared";
 
@@ -36,8 +38,10 @@ export interface AudioAsset {
   /** How long the file actually is. Music loops to the clip. */
   durationSec: number;
   /** Uploads are "upload"; the studio's are "ai" with their prompt; Freesound picks carry their credit. Built-ins carry neither. */
-  source?: "upload" | "ai" | "freesound" | "epidemic";
+  source?: "upload" | "ai" | "freesound" | "epidemic" | "pack";
   prompt?: string;
+  /** Pack sounds: which pack (sound-packs.service), so pickers can fold them away until searched for. */
+  pack?: string;
   /** Credit line the licence asks for (CC-BY), and the sound's page. */
   attribution?: string;
   sourceUrl?: string;
@@ -128,8 +132,9 @@ interface CustomMeta {
   kind: AudioKind;
   name: string;
   durationSec: number;
-  source?: "upload" | "ai" | "freesound" | "epidemic";
+  source?: "upload" | "ai" | "freesound" | "epidemic" | "pack";
   prompt?: string;
+  pack?: string;
   attribution?: string;
   sourceUrl?: string;
   /** The provider's own id, so a Freesound or Epidemic pick is downloaded once. */
@@ -193,8 +198,9 @@ async function listAudioInDir(dir: string): Promise<AudioAsset[]> {
         kind: meta.kind,
         label: String(meta.name || "Upload").slice(0, 80),
         durationSec: Number(meta.durationSec) || 0,
-        source: meta.source === "ai" || meta.source === "freesound" || meta.source === "epidemic" ? meta.source : "upload",
+        source: meta.source === "ai" || meta.source === "freesound" || meta.source === "epidemic" || meta.source === "pack" ? meta.source : "upload",
         ...(meta.prompt ? { prompt: meta.prompt } : {}),
+        ...(meta.pack ? { pack: meta.pack } : {}),
         ...(meta.attribution ? { attribution: meta.attribution } : {}),
         ...(meta.sourceUrl ? { sourceUrl: meta.sourceUrl } : {}),
         ...(meta.sourceId ? { sourceId: meta.sourceId } : {}),
@@ -265,12 +271,17 @@ export async function ingestCustomAudio(
   kind: AudioKind,
   sourcePath: string,
   originalName: string,
-  origin: { source: "upload" | "ai" | "freesound" | "epidemic"; prompt?: string; model?: string; attribution?: string; sourceUrl?: string; sourceId?: string } = { source: "upload" }
+  origin: { source: "upload" | "ai" | "freesound" | "epidemic" | "pack"; prompt?: string; model?: string; pack?: string; attribution?: string; sourceUrl?: string; sourceId?: string } = { source: "upload" }
 ): Promise<AudioAsset> {
   await loadSharedAudioLibrary();
   const existing = await listAudioInDir(sharedAudioDir());
-  if (existing.length >= MAX_CUSTOM_AUDIO) {
+  // The cap is on what the creator adds by hand; installed packs sit beside it.
+  const own = existing.filter((asset) => asset.source !== "pack").length;
+  if (origin.source !== "pack" && own >= MAX_CUSTOM_AUDIO) {
     throw new Error(`The audio library can hold ${MAX_CUSTOM_AUDIO} uploads`);
+  }
+  if (origin.source === "pack" && existing.length >= MAX_LIBRARY_AUDIO) {
+    throw new Error(`The audio library can hold ${MAX_LIBRARY_AUDIO} sounds`);
   }
   const size = await getFileSize(sourcePath);
   if (size > MAX_CUSTOM_AUDIO_BYTES) {
@@ -300,6 +311,7 @@ export async function ingestCustomAudio(
     durationSec,
     source: origin.source,
     ...(origin.prompt ? { prompt: origin.prompt } : {}),
+    ...(origin.pack ? { pack: origin.pack } : {}),
     ...(origin.attribution ? { attribution: origin.attribution } : {}),
     ...(origin.sourceUrl ? { sourceUrl: origin.sourceUrl } : {}),
     ...(origin.sourceId ? { sourceId: origin.sourceId } : {}),
@@ -315,6 +327,7 @@ export async function ingestCustomAudio(
         source: origin.source,
         ...(origin.prompt ? { prompt: origin.prompt } : {}),
         ...(origin.model ? { model: origin.model } : {}),
+        ...(origin.pack ? { pack: origin.pack } : {}),
         ...(origin.attribution ? { attribution: origin.attribution } : {}),
         ...(origin.sourceUrl ? { sourceUrl: origin.sourceUrl } : {}),
         ...(origin.sourceId ? { sourceId: origin.sourceId } : {}),

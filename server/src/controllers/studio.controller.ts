@@ -3,6 +3,8 @@ import { senseLibrary } from "../services/sense.service";
 import { addLesson, deleteLesson, listLessons } from "../services/taste.service";
 import { freesoundConfigured, pickFreesound, searchFreesound, type FreesoundResult } from "../services/freesound.service";
 import { epidemicConfigured, epidemicDownloadUrl, pickEpidemic, searchEpidemicSfx, searchEpidemicTracks, type EpidemicSfx, type EpidemicTrack } from "../services/epidemic.service";
+import { installSoundPack, packCounts, packInstalls, searchLocalSounds, SOUND_PACKS } from "../services/sound-packs.service";
+import { listBuiltinAudio, listCustomAudio } from "../services/soundtrack.service";
 import type { ApiContext } from "../types/api.types";
 import { getErrorMessage } from "../types";
 import { fail, ok } from "../utils/response.utils";
@@ -146,4 +148,37 @@ export async function pickSoundRoute({ body, set }: Ctx) {
 /** GET /api/studio/sources — which optional providers are configured, for the panel. */
 export function studioSourcesRoute() {
   return ok({ freesound: freesoundConfigured(), epidemic: epidemicConfigured(), fal: Boolean(process.env.FAL_KEY?.trim()) });
+}
+
+/** GET /api/studio/packs — the free CC0 packs on offer, what is installed, what is installing. */
+export async function listSoundPacksRoute() {
+  const counts = await packCounts();
+  const installing = new Map(packInstalls().map((install) => [install.slug, install]));
+  return ok(
+    SOUND_PACKS.map((pack) => ({
+      slug: pack.slug,
+      label: pack.label,
+      covers: pack.covers,
+      count: pack.count,
+      installed: counts[pack.slug] ?? 0,
+      install: installing.get(pack.slug),
+    }))
+  );
+}
+
+/** POST /api/studio/packs/:slug/install — download, unpack and ingest a pack in the background. */
+export function installSoundPackRoute({ params, set }: Ctx) {
+  try {
+    return ok(installSoundPack(params.slug));
+  } catch (error: unknown) {
+    set.status = 400;
+    return fail(getErrorMessage(error));
+  }
+}
+
+/** GET /api/studio/sounds/local?q= — the library itself, built-ins and packs, by name and description. */
+export async function searchLocalSoundsRoute({ query }: Ctx) {
+  const input = query as { q: string; kind?: "sfx" | "music" };
+  const assets = [...listBuiltinAudio(), ...(await listCustomAudio())];
+  return ok(searchLocalSounds(input.q, assets, { kind: input.kind, limit: 40 }));
 }
