@@ -343,6 +343,9 @@ export interface ClipPayload {
   renderError?: string;
   reframeMode?: IClip["reframeMode"];
   reframeNote?: string;
+  /** What the harness saw in the window, and its critique of the last render it watched. */
+  sense?: IClip["sense"];
+  review?: IClip["review"];
   /** The user's edit spec, echoed back so the editor opens where it left off. */
   edit?: IClip["edit"];
   segments?: IClip["segments"];
@@ -391,6 +394,8 @@ export function serializeClip(doc: IClip): ClipPayload {
     renderError: doc.renderError,
     reframeMode: doc.reframeMode,
     reframeNote: doc.reframeNote,
+    sense: doc.sense,
+    review: doc.review,
     // Serialize subdocuments into plain objects field by field. Spreading a
     // Mongoose subdocument does NOT produce a plain object — it copies the
     // internal `$__` / `_doc` / `$__parent` machinery, so the client would

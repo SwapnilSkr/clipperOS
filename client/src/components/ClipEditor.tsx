@@ -32,11 +32,13 @@ import {
   type CaptionOverrides,
   type CaptionScene,
   type CaptionStyleInfo,
+  type ClipSense,
+  type DirectInput,
+  type RenderReview,
   type CaptionTextOverride,
   type CaptionWordOverride,
   type CleanupRegion,
   type CreatorPlan,
-  type DirectorLane,
   type AudioAsset,
   type EffectInfo,
   type MediaAsset,
@@ -211,6 +213,8 @@ export function ClipEditor({
   /** Stills and videos for cutaways, plus which stock providers are configured. */
   const [mediaLibrary, setMediaLibrary] = useState<MediaAsset[]>([]);
   const [stockSources, setStockSources] = useState<("pexels" | "pixabay")[]>([]);
+  // What the harness saw in the window and thought of the last render; seeded from the clip, updated by passes.
+  const [harness, setHarness] = useState<{ sense?: ClipSense; review?: RenderReview }>({ sense: clip.sense, review: clip.review });
   const [transitions, setTransitions] = useState<TransitionInfo[]>([]);
   const [trimStart, setTrimStart] = useState(clip.edit?.trimStartSec ?? clip.startSec);
   const [trimEnd, setTrimEnd] = useState(clip.edit?.trimEndSec ?? clip.endSec);
@@ -999,7 +1003,7 @@ export function ClipEditor({
     return { url: result.url, durationSec: result.durationSec };
   }
 
-  async function directClip(input: { notes?: string; keep: DirectorLane[] }): Promise<{ warnings: string[] }> {
+  async function directClip(input: DirectInput): Promise<{ warnings: string[]; pending: string[] }> {
     await onSave(buildDraft());
     setSaved(snapshot());
     const result = await api.directClip(clip.id, input);
@@ -1008,14 +1012,33 @@ export function ClipEditor({
     setSoundtrack((prev) => ({
       ...prev,
       sfx: result.clip.edit?.soundtrack?.sfx ?? [],
+      beds: result.clip.edit?.soundtrack?.beds ?? [],
     }));
+    if (result.sense) setHarness((prev) => ({ ...prev, sense: result.sense }));
     setBeatSelection(null);
     onClipUpdated?.(result.clip);
-    // A cutaway the Director found on stock is a new library asset.
+    // A cutaway the Director found on stock or made to order is a new library asset; a bed it made, a new track.
     if (next?.cutaways?.some((cutaway) => !mediaLibrary.some((asset) => asset.id === cutaway.assetId))) {
       void refreshMediaLibrary();
     }
-    return { warnings: result.warnings ?? [] };
+    if ((result.clip.edit?.soundtrack?.beds ?? []).some((bed) => !audioLibrary.some((asset) => asset.id === bed.assetId))) {
+      void refreshAudioLibrary();
+    }
+    return { warnings: result.warnings ?? [], pending: result.pending ?? [] };
+  }
+
+  async function directorFeedback(verdict: "up" | "down", note?: string): Promise<void> {
+    await api.directorFeedback(clip.id, { verdict, note });
+  }
+
+  async function senseNow(): Promise<void> {
+    const sense = await api.senseClip(clip.id, true);
+    setHarness((prev) => ({ ...prev, sense }));
+  }
+
+  async function reviewNow(): Promise<void> {
+    const review = await api.reviewClip(clip.id);
+    setHarness((prev) => ({ ...prev, review }));
   }
 
   async function prepareSource(): Promise<void> {
@@ -2320,6 +2343,13 @@ export function ClipEditor({
               outroSec={outroPlaythrough ? outroDur : 0}
               onUploadAudio={uploadAudio}
               onDirect={directClip}
+              onDirectorFeedback={directorFeedback}
+              onSense={senseNow}
+              onReview={reviewNow}
+              sense={harness.sense}
+              review={harness.review}
+              rendered={rendered}
+              onAudioChanged={refreshAudioLibrary}
             />
           ) : desk === "mix" ? (
             <>

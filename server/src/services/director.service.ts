@@ -1,5 +1,3 @@
-import { createOpenRouter } from "@openrouter/ai-sdk-provider";
-import { generateText } from "ai";
 import { config } from "../config";
 import { directorModel } from "../config/models";
 import { resolveGenreProfile } from "../config/genres";
@@ -12,9 +10,13 @@ import type {
   BehindTitle,
   CameraMove,
   CaptionScene,
+  ClipSense,
   CreatorPlan,
   Cutaway,
+  DirectorAssetMode,
+  DirectorLesson,
   DirectorTurn,
+  MusicBed,
   EffectSpan,
   MediaAsset,
   PauseCut,
@@ -45,7 +47,12 @@ import { expandWordTimings } from "./transcript.service";
 import { detectClipPauses, type PauseCandidate } from "./pause-detect.service";
 import { faceAnchorAt, headTravel, sourceToOutput, windowsFor } from "./creator-timeline";
 import { sanitizeCreatorPlan } from "./creator-plan.service";
-import { listBuiltinAudio, listCustomAudio, MAX_SOUNDTRACK_HITS } from "./soundtrack.service";
+import { DEFAULT_BED_DIP, DEFAULT_BED_GAIN, listBuiltinAudio, listCustomAudio, MAX_MUSIC_BEDS, MAX_SOUNDTRACK_HITS, musicBeds, type AudioAsset } from "./soundtrack.service";
+import { generateImageNow, generateMusicNow, startGeneration } from "./ai-assets.service";
+import { fileDataUrl, chat, type ChatPart } from "./openrouter.service";
+import { proxyClip, senseClip, senseLibrary } from "./sense.service";
+import { describeLessons, lessonsFor } from "./taste.service";
+import { ensureProjectMedia } from "./ingest.service";
 import { updateClipEdit } from "./clip.service";
 import { listMediaAssets } from "./media-library.service";
 import { stockForQuery, stockSources } from "./stock.service";
@@ -54,9 +61,12 @@ import { TEXT_ENTERS, TEXT_EXITS, TEXT_MOTIONS } from "./text-motion";
 // ============================================
 // THE DIRECTOR — one call that writes the whole beat plan.
 //
-// Given what the pipeline already knows about a clip — every word and when it
-// is spoken, the mined peak, the shot changes, where the speaker's face sits,
-// the dead air, and what looks and sounds exist — the model returns a plan in
+// Given what the pipeline knows about a clip — every word and when it is
+// spoken, the mined peak, the shot changes, where the speaker's face sits,
+// the dead air, what looks and sounds exist — AND what the harness saw and
+// heard (sense.service: the clip itself is attached as video, every sound
+// and picture in the library is described from its content, the creator's
+// taste is a list of learned lessons), the model returns a plan in
 // CLIP-RELATIVE seconds. Everything it says is then snapped to real word
 // onsets, clamped to the trim, sanitised like any other edit, and saved
 // through the same path the editor uses. A failed or malformed answer leaves
@@ -71,13 +81,23 @@ import { TEXT_ENTERS, TEXT_EXITS, TEXT_MOTIONS } from "./text-motion";
 // left out of the plan (with a warning), never the render.
 // ============================================
 
-export type DirectorLane = "cuts" | "camera" | "captions" | "titles" | "sfx" | "speed" | "fx" | "cutaways";
+export type DirectorLane = "cuts" | "camera" | "captions" | "titles" | "sfx" | "speed" | "fx" | "cutaways" | "music";
 
-export const DIRECTOR_LANES: DirectorLane[] = ["cuts", "camera", "speed", "fx", "cutaways", "captions", "titles", "sfx"];
+export const DIRECTOR_LANES: DirectorLane[] = ["cuts", "camera", "speed", "fx", "cutaways", "captions", "titles", "sfx", "music"];
 
 export interface DirectInput {
   notes?: string;
   keep?: DirectorLane[];
+  /**
+   * Where B-roll may come from: the library only, stock search, generated
+   * on OpenRouter, or both stock and generation (the Director picks per
+   * cutaway). Default: stock when a provider is configured, else library.
+   */
+  assets?: DirectorAssetMode;
+  /** Let the pass lay music beds (default true). */
+  music?: boolean;
+  /** Attach the clip itself so the model watches it (default true). */
+  see?: boolean;
 }
 
 export interface DirectResult {
@@ -86,6 +106,10 @@ export interface DirectResult {
   model: string;
   /** What the pass could not do, e.g. a stock query that found nothing. */
   warnings: string[];
+  /** Generated assets still rendering; they swap in when done. */
+  pending: string[];
+  /** What the harness saw, for the panel. */
+  sense?: ClipSense;
 }
 
 /** Cap on the word grid handed to the model; a 60 s clip is ~180 words. */
@@ -96,6 +120,7 @@ const SNAP_SEC = 0.18;
 export interface DirectorPlanJson {
   summary?: unknown;
   cuts?: unknown;
+  music?: unknown;
   camera?: unknown;
   captionScenes?: unknown;
   titles?: unknown;
@@ -204,7 +229,8 @@ export function describeCurrentPlan(
   plan: CreatorPlan | undefined,
   sfx: SoundtrackHit[] | undefined,
   trimStart: number,
-  mediaLabels: Map<string, string> = new Map()
+  mediaLabels: Map<string, string> = new Map(),
+  beds: MusicBed[] = []
 ): string {
   if (!plan) return "";
   const rel = (t: number) => (t - trimStart).toFixed(2);
@@ -247,6 +273,11 @@ export function describeCurrentPlan(
     lines.push(`title "${title.text}" ${rel(title.startSec)}–${rel(title.endSec)} at (${title.x}, ${title.y}) size ${title.sizeScale} ${title.depth} ${title.animation}`);
   }
   for (const hit of sfx ?? []) lines.push(`sfx ${hit.assetId} at ${hit.atSec.toFixed(2)} (output clock) gain ${hit.gain ?? 0.9}`);
+  for (const bed of beds) {
+    lines.push(
+      `music bed ${bed.assetId} level ${bed.gain ?? DEFAULT_BED_GAIN} dip ${bed.dip ?? DEFAULT_BED_DIP} in ${(bed.inSec ?? 0).toFixed(2)}${bed.outSec != null ? ` out ${bed.outSec.toFixed(2)}` : ""}${bed.offsetSec ? ` offset ${bed.offsetSec}` : ""} (output clock)`
+    );
+  }
   return lines.join("\n");
 }
 
@@ -266,15 +297,26 @@ export interface DirectorBrief {
   genre: { label: string; summary: string };
   styles: { id: string; summary: string }[];
   fonts: string[];
-  sfx: { id: string; label: string }[];
+  /** Sounds and beds, each with what the harness heard in it when it has listened. */
+  sfx: { id: string; label: string; line?: string }[];
+  music: { id: string; label: string; durationSec: number; line?: string; bpm?: number; energy?: number; suits?: string[] }[];
   effects: { id: string; group: string; summary: string; variants?: string[] }[];
   transitions: { id: string; summary: string }[];
-  /** The media library, most useful first. */
-  media: { id: string; kind: "image" | "video"; label: string; width?: number; height?: number; durationSec?: number }[];
+  /** The media library, most useful first, with what the harness saw in each. */
+  media: { id: string; kind: "image" | "video"; label: string; width?: number; height?: number; durationSec?: number; line?: string }[];
   /** A stock provider is configured, so a cutaway may ask for a query. */
   stock: boolean;
+  /** Where B-roll may come from this pass. */
+  assets: DirectorAssetMode;
+  /** Whether this pass may lay music. */
+  wantsMusic: boolean;
+  /** What the harness saw and heard in the clip (sense.service). */
+  sense?: ClipSense;
+  /** What the Director has learned about this creator's taste. */
+  lessons: DirectorLesson[];
   current?: CreatorPlan;
   currentSfx?: SoundtrackHit[];
+  currentBeds?: MusicBed[];
   notes?: string;
   keep: DirectorLane[];
   turns?: DirectorTurn[];
@@ -325,7 +367,7 @@ export function buildDirectorPrompt(brief: DirectorBrief): string {
     : "No face track: anchor camera moves on \"center\" and keep titles in front.";
   const keep = brief.keep.length ? `KEEP these lanes exactly as they are in the current plan (leave their keys out of your answer): ${brief.keep.join(", ")}.` : "";
   const mediaLabels = new Map(brief.media.map((item) => [item.id, item.label]));
-  const described = describeCurrentPlan(brief.current, brief.currentSfx, brief.trimStart, mediaLabels);
+  const described = describeCurrentPlan(brief.current, brief.currentSfx, brief.trimStart, mediaLabels, brief.currentBeds ?? []);
   const current = described ? `\nCURRENT PLAN (clip-relative seconds):\n${described.slice(0, 6000)}` : "";
   const turns = brief.turns?.length
     ? `\nEARLIER PASSES ON THIS CLIP (oldest first). This pass builds on them: keep what earlier notes asked for unless the new notes change it.\n${brief.turns
@@ -342,18 +384,55 @@ export function buildDirectorPrompt(brief: DirectorBrief): string {
     ? brief.media
         .map(
           (item) =>
-            `${item.id} — ${item.kind} "${item.label}"${item.width && item.height ? ` ${item.width}x${item.height}` : ""}${item.durationSec ? ` ${item.durationSec.toFixed(0)}s` : ""}`
+            `${item.id} — ${item.kind} "${item.label}"${item.width && item.height ? ` ${item.width}x${item.height}` : ""}${item.durationSec ? ` ${item.durationSec.toFixed(0)}s` : ""}${item.line ? ` — ${item.line}` : ""}`
         )
         .join("\n")
     : "(empty)";
-  const cutawaySource = brief.stock
-    ? `a library "asset" id when one fits and is sharp (at least 720 on its short side — skip smaller ones), otherwise a stock "query": 2–4 concrete, visual nouns ("server room racks", not "compute") and a "kind" (video preferred, image for a still idea)`
-    : brief.media.length
-      ? `a library "asset" id only (no stock search is configured)`
-      : `nothing — there is no library media and no stock search, so return "cutaways": []`;
+  const libraryPick = `a library "asset" id when one fits and is sharp (at least 720 on its short side — skip smaller ones)`;
+  const stockPick = `a stock "query": 2–4 concrete, visual nouns ("server room racks", not "compute") and a "kind" (video preferred, image for a still idea)`;
+  const aiPick = `a "generate": { "kind": "image|video", "prompt": "..." } — a picture made to order. Write the prompt like a cinematographer's brief: subject, setting, light, lens, mood, 15–40 words, vertical; "video" for motion (5–8 s, a slow move), "image" for a still the cutaway will drift over. A generated video takes minutes: its still is placed now and the motion swaps in when it is ready.`;
+  const cutawaySource =
+    brief.assets === "ai"
+      ? `${libraryPick}, otherwise ${aiPick}`
+      : brief.assets === "both"
+        ? `${libraryPick}, otherwise ${brief.stock ? `${stockPick} for real-world footage (a place, an object, a crowd), or ` : ""}${aiPick} for anything stylised, abstract, or that stock will not have`
+        : brief.assets === "stock" && brief.stock
+          ? `${libraryPick}, otherwise ${stockPick}`
+          : brief.media.length
+            ? `a library "asset" id only (no stock search or generation for this pass)`
+            : `nothing — there is no library media and no stock search, so return "cutaways": []`;
+  const seen = brief.sense
+    ? `\nWHAT THE HARNESS SAW AND HEARD (it watched this exact window; times are clip-relative):
+Overall: ${brief.sense.overall}
+Hook: ${brief.sense.hook}
+Payoff: ${brief.sense.payoff}
+Audio: ${brief.sense.audio}
+Shots: ${brief.sense.shots.map((shot) => `${shot.start.toFixed(1)}–${shot.end.toFixed(1)} ${shot.framing} (energy ${shot.energy})${shot.note ? ` — ${shot.note}` : ""}`).join("; ")}
+Visible moments to cut on: ${brief.sense.moments.map((moment) => `${moment.t.toFixed(1)} ${moment.what} → ${moment.use}`).join("; ") || "(none)"}
+B-roll that would earn its place: ${brief.sense.broll.map((idea) => `${idea.t.toFixed(1)} ${idea.idea} [${idea.query}]`).join("; ") || "(none)"}
+`
+    : "";
+  const musicCatalogue = brief.music.length
+    ? brief.music
+        .map(
+          (bed) =>
+            `${bed.id} — "${bed.label}" ${bed.durationSec.toFixed(0)}s${bed.line ? ` — ${bed.line}` : ""}${bed.bpm ? ` ${bed.bpm} BPM` : ""}${bed.energy ? ` energy ${bed.energy}/5` : ""}${bed.suits?.length ? ` suits: ${bed.suits.join(", ")}` : ""}`
+        )
+        .join("\n")
+    : "(none)";
+  const musicSource =
+    brief.assets === "ai" || brief.assets === "both"
+      ? ` A bed may also be made to order: { "generate": { "prompt": "..." }, ... } with a music brief (genre, mood, tempo, instrumentation, 15–40 words, instrumental) in place of "asset" — only when nothing in the catalogue fits the clip's tone.`
+      : "";
+  const musicRules = brief.wantsMusic
+    ? `- Music (lane "music"): 0–2 beds under the voice, on the OUTPUT clock like SFX. Pick by what the catalogue says the bed sounds like, matched to the genre, the speaker's energy and the harness's read of the tone — a calm story wants a low-energy pad, a hype peak a driving loop. Usually one bed for the whole clip at level 0.15–0.3 with dip 0.55–0.8 so it sits under speech; a second bed can take over at the peak (in at the peak punch, the first going out there) for a lift. Set "offset" to start a bed past a quiet intro. No music when the source already has music (see Audio) or the genre is music/performance.${musicSource}`
+    : `- Music: leave the "music" key out of your answer (this pass does not lay music).`;
+  const lessons = brief.lessons.length
+    ? `\nWHAT THIS CREATOR LIKES (learned from their edits, their feedback and reviewed renders — follow these over the default rules below):\n${describeLessons(brief.lessons)}\n`
+    : "";
 
-  return `You are the editor of a short-form vertical clip (a YouTube Short / Reel). You write the BEAT PLAN a professional editor would build for retention: tighten dead air, punch the camera in on the lines that matter, let the camera ride the speaker, style the captions per scene, put a hook title behind the speaker for the first beat, drop sound effects on every move — and, where they earn it, slow motion, looks and B-roll cutaways.
-${notes}${turns}
+  return `You are the editor of a short-form vertical clip (a YouTube Short / Reel). You write the BEAT PLAN a professional editor would build for retention: tighten dead air, punch the camera in on the lines that matter, let the camera ride the speaker, style the captions per scene, put a hook title behind the speaker for the first beat, drop sound effects on every move, lay a music bed that serves the voice — and, where they earn it, slow motion, looks and B-roll cutaways.${brief.sense ? " You have WATCHED the clip: use what you saw (a gesture, a look, a laugh, a prop, a cut in the source) to time and choose the beats, not only the words." : ""}
+${notes}${turns}${lessons}
 Genre: ${brief.genre.label} — ${brief.genre.summary}
 Clip length: ${brief.duration.toFixed(1)}s. All times below and in your answer are CLIP-RELATIVE SOURCE seconds (0 = the first frame), even inside slow motion.
 The mined PEAK (the payoff line) is at ${brief.peak.at.toFixed(2)}s${brief.peak.line ? `: "${brief.peak.line}"` : ""}.
@@ -365,10 +444,12 @@ ${words}
 ${brief.lines?.length ? `\nLINES (cue start, full wording — the WORDS grid misses some words; a word missing there is spoken inside its line here, so time it from the line's start and its neighbours):\n${brief.lines.map((line) => `${line.t.toFixed(2)} ${line.text}`).join("\n").slice(0, 6000)}\n` : ""}
 DEAD AIR CANDIDATES (id start–end, seconds saved):
 ${pauses}
-
+${seen}
 CAPTION LOOKS (id — summary): ${brief.styles.map((style) => `${style.id} — ${style.summary}`).join("; ")}
 FONTS: ${brief.fonts.join(", ")}
-SOUND EFFECTS (id — label): ${brief.sfx.map((sound) => `${sound.id} — ${sound.label}`).join("; ")}
+SOUND EFFECTS (id — label — what it sounds like): ${brief.sfx.map((sound) => `${sound.id} — ${sound.label}${sound.line ? ` — ${sound.line}` : ""}`).join("; ")}
+MUSIC BEDS (id — label — what it sounds like):
+${musicCatalogue}
 EFFECTS (id (group) — summary): ${effects}
 TRANSITIONS (for cutaways): ${brief.transitions.map((item) => `${item.id} — ${item.summary}`).join("; ")}
 CUTAWAY MOTIONS: none, in (slow push in), out (slow pull out), left, right, up, down (drifts)
@@ -388,7 +469,8 @@ EDITING RULES
 - Cutaways (lane "cutaways"): B-roll laid over the speaker while the voice runs on. At most 2 per clip, 1.2–3s each, starting on the onset of the word that names what is shown, never in the first 1.5s and never over the peak line. Media: ${cutawaySource}. Transitions ≤ 0.4s ("dissolve" or "cut" by default; a slide or zoom for energy). fit "cover" for portrait media, "blur" for a wide shot you want to see whole.
 - Caption scenes: 2–4 scenes. The hook (first 2–4s) big and bold; the peak line its own scene with highlight "word" and a warm accent; the rest calm. Scenes must not overlap.
 - Titles (lane "titles", the creator's own text on screen, separate from the transcript captions): exactly 1 (the hook, 0–2.5s) unless the notes ask for more, depth "behind", placed where it peeks out around the head: y between the face's y and 0.62, large (sizeScale 1.6–2.4), uppercase. A second title only for a payoff punchline. "animation" is how it arrives: pop, fade, rise, zoom_in (grows from small), zoom_out (shrinks from big), slide_left / slide_right / slide_up / slide_down, drop, words (word by word); "exit" how it leaves: none, fade, pop, zoom_in, zoom_out, slide_left / slide_right / slide_up / slide_down, sink; "motion" while on screen: none, grow, shrink, pulse, wiggle, float. Default "pop" in, "fade" out, no motion; a punchline can "zoom_out" in and "pulse".
-- SFX: a "swoosh" or "whoosh" on each camera move start (gain 0.6–0.9), a "riser" 0.6s before the peak punch, a "boom" or "thud" on the peak, a "pop" on the hook title's start, a "tick" on each applied cut (optional), a "whoosh" on a cutaway's arrival. At most ${MAX_SOUNDTRACK_HITS} hits.
+- SFX: a whoosh-type sound on each camera move start (gain 0.6–0.9), a riser 0.6s before the peak punch, a low impact on the peak, a pop on the hook title's start, a tick on each applied cut (optional), a whoosh on a cutaway's arrival — choose by what each sound IS in the catalogue, including the creator's own uploads. At most ${MAX_SOUNDTRACK_HITS} hits.
+${musicRules}
 - Times must land on word onsets from the WORDS list where possible.
 - A key you leave out of your answer leaves that lane exactly as it is in the current plan; an empty list clears the lane. Respect every KEEP instruction exactly.
 
@@ -408,9 +490,10 @@ Return ONLY JSON, no prose, with this shape (all times clip-relative source seco
   "cutaways": [{ "query": "server room racks", "kind": "video", "start": 12.4, "end": 14.6, "fit": "cover", "motion": "in", "in": { "transition": "dissolve", "sec": 0.3 }, "out": { "transition": "dissolve", "sec": 0.3 } }],
   "captionScenes": [{ "label": "hook", "start": 0, "end": 2.8, "styleId": "creator_hook", "overrides": { "highlight": "word", "uppercase": true, "peakColor": "#fde047", "fontFamily": "Anton", "sizeScale": 1.3 } }],
   "titles": [{ "text": "THE ONE RULE", "start": 0.1, "end": 2.4, "x": 0.5, "y": 0.5, "sizeScale": 1.9, "depth": "behind", "animation": "pop", "exit": "fade", "motion": "none", "color": "#ffffff", "fontFamily": "Anton" }],
-  "sfx": [{ "asset": "swoosh", "at": 0.0, "gain": 0.8 }]
+  "sfx": [{ "asset": "swoosh", "at": 0.0, "gain": 0.8 }],
+  "music": [{ "asset": "warm", "level": 0.22, "dip": 0.65, "in": 0, "out": null, "offset": 0 }]
 }
-(A cutaway from the library carries "asset": "<library id>" in place of "query" and "kind".)`;
+(A cutaway from the library carries "asset": "<library id>" in place of "query" and "kind"; a generated one carries "generate". A bed's "out" is null for the end of the clip.)`;
 }
 
 const CUTAWAY_MOTIONS: Cutaway["motion"][] = ["none", "in", "out", "left", "right", "up", "down"];
@@ -505,8 +588,11 @@ export function applyDirectorAnswer(input: {
   sfxIds: Set<string>;
   /** Media assets a cutaway may use: the library plus anything fetched for this answer. */
   mediaIds?: Set<string>;
+  /** Music beds the plan may lay, and the ones already on the clip. */
+  musicIds?: Set<string>;
+  currentBeds?: MusicBed[];
   windowsOutput: (sourceSec: number) => number;
-}): { plan: CreatorPlan; sfx: SoundtrackHit[]; summary: string } {
+}): { plan: CreatorPlan; sfx: SoundtrackHit[]; beds: MusicBed[]; summary: string } {
   const { answer, trimStart, trimEnd, onsets, candidates, current, keep } = input;
   const duration = trimEnd - trimStart;
   const abs = (t: number | undefined, snap = true) => {
@@ -692,6 +778,33 @@ export function applyDirectorAnswer(input: {
     sfx = [...users, ...placed].slice(0, MAX_SOUNDTRACK_HITS);
   }
 
+  // ---- music beds: on the OUTPUT clock, like SFX; the creator's own beds stay ----
+  let beds = input.currentBeds ?? [];
+  if (rewrite("music", "music")) {
+    const users = beds.filter((bed) => !bed.id.startsWith("dir_"));
+    const musicIds = input.musicIds ?? new Set<string>();
+    const placed: MusicBed[] = list(answer.music)
+      .filter((bed) => typeof bed.asset === "string" && musicIds.has(bed.asset as string))
+      .slice(0, MAX_MUSIC_BEDS)
+      .map((bed, index) => {
+        const inSec = round3(Math.max(0, input.windowsOutput(abs(num(bed.in) ?? 0, false))));
+        const outRaw = num(bed.out);
+        const outSec = outRaw != null && outRaw > 0 ? round3(Math.max(inSec + 0.5, input.windowsOutput(abs(outRaw, false)))) : undefined;
+        const out: MusicBed = {
+          id: newId("bed", index),
+          assetId: String(bed.asset),
+          gain: round3(Math.max(0, Math.min(1, num(bed.level ?? bed.gain) ?? DEFAULT_BED_GAIN))),
+          dip: round3(Math.max(0, Math.min(1, num(bed.dip) ?? DEFAULT_BED_DIP))),
+        };
+        if (inSec > 0.0005) out.inSec = inSec;
+        if (outSec != null) out.outSec = outSec;
+        const offset = num(bed.offset ?? bed.offsetSec);
+        if (offset != null && offset > 0) out.offsetSec = round3(offset);
+        return out;
+      });
+    beds = [...users, ...placed].slice(0, MAX_MUSIC_BEDS);
+  }
+
   const summary = typeof answer.summary === "string" ? answer.summary.trim().slice(0, 1200) : "";
   const plan = sanitizeCreatorPlan({
     enabled: true,
@@ -705,7 +818,7 @@ export function applyDirectorAnswer(input: {
     cutaways,
     director: { summary, generatedAt: new Date().toISOString() },
   });
-  return { plan, sfx, summary };
+  return { plan, sfx, beds, summary };
 }
 
 const STOP_WORDS = new Set(["the", "and", "for", "with", "shot", "stock", "video", "image", "photo", "footage", "clip", "of", "a", "an"]);
@@ -744,12 +857,16 @@ export async function resolveDirectorMedia(input: {
   library: MediaAsset[];
   /** Absent when no stock provider is configured. */
   findStock?: (query: string, kind: "image" | "video") => Promise<MediaAsset>;
-}): Promise<{ cutaways: Record<string, unknown>[]; assets: MediaAsset[]; warnings: string[] }> {
+  /** Absent when this pass may not generate. Makes a still now; a video is a job that swaps in later. */
+  generate?: (prompt: string, kind: "image" | "video") => Promise<{ asset: MediaAsset; pendingVideo?: boolean }>;
+}): Promise<{ cutaways: Record<string, unknown>[]; assets: MediaAsset[]; warnings: string[]; pending: { assetId: string; prompt: string }[] }> {
   const raw = Array.isArray(input.cutaways) ? (input.cutaways as unknown[]).slice(0, MAX_CUTAWAYS) : [];
   const byId = new Map(input.library.map((asset) => [asset.id, asset]));
   const fetched = new Map<string, Promise<MediaAsset>>();
   const assets: MediaAsset[] = [];
   const warnings: string[] = [];
+  const pending: { assetId: string; prompt: string }[] = [];
+  let generated = 0;
 
   const cutaways = await Promise.all(
     raw
@@ -758,13 +875,33 @@ export async function resolveDirectorMedia(input: {
         const out: Record<string, unknown> = { ...item };
         if (typeof item.asset === "string" && byId.has(item.asset)) return out;
         delete out.asset;
-        const query = typeof item.query === "string" ? item.query.trim().slice(0, 80) : "";
+        const wanted = item.generate as Record<string, unknown> | undefined;
+        const prompt = wanted && typeof wanted.prompt === "string" ? wanted.prompt.trim().slice(0, 600) : "";
+        if (prompt && input.generate) {
+          if (generated >= MAX_GENERATED_PER_PASS) {
+            warnings.push(`Only ${MAX_GENERATED_PER_PASS} pictures are generated per pass; "${prompt.slice(0, 40)}…" was left out.`);
+            return out;
+          }
+          generated++;
+          const kind = wanted!.kind === "video" ? "video" : "image";
+          try {
+            const made = await input.generate(prompt, kind);
+            assets.push(made.asset);
+            out.asset = made.asset.id;
+            if (made.pendingVideo) pending.push({ assetId: made.asset.id, prompt });
+            return out;
+          } catch (error: unknown) {
+            warnings.push(`Could not generate "${prompt.slice(0, 40)}…" (${getErrorMessage(error)}), so that cutaway was left out.`);
+            return out;
+          }
+        }
+        const query = typeof item.query === "string" ? item.query.trim().slice(0, 80) : prompt.split(/[,.]/)[0]?.trim().slice(0, 80) ?? "";
         if (!query) {
           warnings.push("A cutaway named no media it could use, so it was left out.");
           return out;
         }
         const kind = item.kind === "image" ? "image" : "video";
-        let reason = "no stock search is configured";
+        let reason = prompt ? "generation is off for this pass" : "no stock search is configured";
         if (input.findStock) {
           const key = `${kind}:${query.toLowerCase()}`;
           if (!fetched.has(key)) fetched.set(key, input.findStock(query, kind));
@@ -786,7 +923,54 @@ export async function resolveDirectorMedia(input: {
         return out;
       })
   );
-  return { cutaways, assets, warnings };
+  return { cutaways, assets, warnings, pending };
+}
+
+/** Pictures a single pass may generate (a still is ~10 s and a few cents; a video is minutes). */
+export const MAX_GENERATED_PER_PASS = 3;
+
+/**
+ * Beds the answer asked to have made: each `generate` becomes a real
+ * library track before the plan is applied (Lyria answers in ~15–40 s).
+ */
+export async function resolveDirectorMusic(input: {
+  music: unknown;
+  musicIds: Set<string>;
+  generate?: (prompt: string) => Promise<AudioAsset>;
+}): Promise<{ music: Record<string, unknown>[]; assets: AudioAsset[]; warnings: string[] }> {
+  const raw = Array.isArray(input.music) ? (input.music as unknown[]).slice(0, MAX_MUSIC_BEDS) : [];
+  const assets: AudioAsset[] = [];
+  const warnings: string[] = [];
+  let generated = 0;
+  const music: Record<string, unknown>[] = [];
+  for (const item of raw) {
+    if (typeof item !== "object" || item === null) continue;
+    const bed = { ...(item as Record<string, unknown>) };
+    if (typeof bed.asset === "string" && input.musicIds.has(bed.asset)) {
+      music.push(bed);
+      continue;
+    }
+    const wanted = bed.generate as Record<string, unknown> | undefined;
+    const prompt = wanted && typeof wanted.prompt === "string" ? wanted.prompt.trim().slice(0, 600) : "";
+    if (!prompt || !input.generate) {
+      warnings.push(prompt ? "A bed asked to be generated, but generation is off for this pass." : "A bed named no track in the catalogue, so it was left out.");
+      continue;
+    }
+    if (generated >= 1) {
+      warnings.push("Only one bed is generated per pass.");
+      continue;
+    }
+    generated++;
+    try {
+      const asset = await input.generate(prompt);
+      assets.push(asset);
+      bed.asset = asset.id;
+      music.push(bed);
+    } catch (error: unknown) {
+      warnings.push(`Could not generate the bed "${prompt.slice(0, 40)}…" (${getErrorMessage(error)}).`);
+    }
+  }
+  return { music, assets, warnings };
 }
 
 export async function directClip(clipId: string, input: DirectInput = {}): Promise<DirectResult> {
@@ -817,11 +1001,34 @@ export async function directClip(clipId: string, input: DirectInput = {}): Promi
   const firstFace = track?.keyframes.find((key) => key.fw != null);
   const faceWidth = firstFace?.fw && firstFace.width ? Math.min(0.9, firstFace.fw / firstFace.width) : 0.3;
   const profile = resolveGenreProfile(project.genreId);
-  const [builtin, custom, library] = [listBuiltinAudio(), await listCustomAudio().catch(() => []), await listMediaAssets().catch(() => [])];
-  const sounds = [...builtin, ...custom].filter((asset) => asset.kind === "sfx");
-  const keep = (input.keep ?? []).filter((lane): lane is DirectorLane => DIRECTOR_LANES.includes(lane));
   const stock = stockSources().length > 0;
+  const assets: DirectorAssetMode = input.assets ?? (stock ? "stock" : "library");
+  const wantsMusic = input.music !== false;
+  const see = input.see !== false;
+  const keep = (input.keep ?? []).filter((lane): lane is DirectorLane => DIRECTOR_LANES.includes(lane));
+  const warnings: string[] = [];
+
+  // The harness looks and listens first: the clip (cached per trim), and
+  // every sound and picture it has not described yet.
+  const [sense, catalogue, lessons] = await Promise.all([
+    see
+      ? senseClip(clipId).catch((error: unknown) => {
+          warnings.push(`The Director could not watch the clip (${getErrorMessage(error)}); it worked from the words.`);
+          return undefined;
+        })
+      : Promise.resolve(undefined),
+    senseLibrary(12).catch(async (error: unknown) => {
+      warnings.push(`Some sounds and pictures are not described yet (${getErrorMessage(error)}).`);
+      const [builtin, custom, media] = await Promise.all([listBuiltinAudio(), listCustomAudio().catch(() => []), listMediaAssets().catch(() => [])]);
+      return { audio: [...builtin, ...custom], media, described: 0, failed: 0 };
+    }),
+    lessonsFor(String(project._id)).catch(() => [] as DirectorLesson[]),
+  ]);
+  const sounds = catalogue.audio.filter((asset) => asset.kind === "sfx");
+  const beds = catalogue.audio.filter((asset) => asset.kind === "music");
+  const library = catalogue.media;
   const current = clip.edit?.creator;
+  const currentBeds = musicBeds(clip.edit?.soundtrack);
   const previousTurns: DirectorTurn[] = (current?.director?.turns ?? []).map((turn) => ({
     ...(turn.notes ? { notes: turn.notes } : {}),
     summary: turn.summary,
@@ -850,7 +1057,16 @@ export async function directClip(clipId: string, input: DirectInput = {}): Promi
     genre: { label: profile.label, summary: profile.summary },
     styles: listCaptionStyles().map((style) => ({ id: style.id, summary: style.summary })),
     fonts: listCaptionFonts().map((font) => font.family),
-    sfx: sounds.map((sound) => ({ id: sound.id, label: sound.label })),
+    sfx: sounds.map((sound) => ({ id: sound.id, label: sound.label, line: sound.sense?.line })),
+    music: beds.map((bed) => ({
+      id: bed.id,
+      label: bed.label,
+      durationSec: bed.durationSec,
+      line: bed.sense?.line,
+      bpm: bed.sense?.bpm,
+      energy: bed.sense?.energy,
+      suits: bed.sense?.suits,
+    })),
     effects: effectInfo().map((effect) => ({
       id: effect.id,
       group: effect.group,
@@ -860,26 +1076,32 @@ export async function directClip(clipId: string, input: DirectInput = {}): Promi
     transitions: transitionInfo().map(({ id, summary }) => ({ id, summary })),
     media: library
       .slice(0, 40)
-      .map((asset) => ({ id: asset.id, kind: asset.kind, label: asset.label, width: asset.width, height: asset.height, durationSec: asset.durationSec })),
+      .map((asset) => ({ id: asset.id, kind: asset.kind, label: asset.label, width: asset.width, height: asset.height, durationSec: asset.durationSec, line: asset.sense?.line })),
     stock,
+    assets,
+    wantsMusic,
+    sense,
+    lessons,
     current,
     currentSfx: clip.edit?.soundtrack?.sfx,
+    currentBeds,
     notes: input.notes?.trim() || undefined,
     keep,
     turns: previousTurns,
   };
 
   const model = directorModel();
-  const openrouter = createOpenRouter({ apiKey: config.openRouterApiKey });
   const startedAt = Date.now();
   let text: string;
   try {
-    const result = await generateText({
-      model: openrouter(model),
-      prompt: buildDirectorPrompt(brief),
-      temperature: 0.45,
-      maxOutputTokens: 4000,
-    });
+    // The model gets the clip itself alongside the brief when it can watch,
+    // so a beat can land on something it saw, not only on a word.
+    const parts: ChatPart[] = [{ type: "text", text: buildDirectorPrompt(brief) }];
+    if (see && sense) {
+      const proxy = await proxyClip(await ensureProjectMedia(String(project._id)), trimStart, trimEnd);
+      parts.push({ type: "video_url", video_url: { url: await fileDataUrl(proxy, "video/mp4") } });
+    }
+    const result = await chat({ model, parts, temperature: 0.45, maxTokens: 9000, reasoning: "medium", label: "director" });
     text = result.text ?? "";
   } catch (error: unknown) {
     throw new Error(`The Director could not reach the model: ${getErrorMessage(error)}`);
@@ -887,21 +1109,45 @@ export async function directClip(clipId: string, input: DirectInput = {}): Promi
   const answer = extractJson(text);
   if (!answer) throw new Error("The Director returned something that was not a plan. Try again.");
 
-  // Stock queries become library assets before anything is applied.
-  const warnings: string[] = [];
+  // Stock queries and generation requests become library assets before anything is applied.
   const mediaIds = new Set(library.map((asset) => asset.id));
+  const pending: string[] = [];
+  const pendingVideos: { assetId: string; prompt: string }[] = [];
+  const mayGenerate = assets === "ai" || assets === "both";
   if (answer.cutaways !== undefined && !keep.includes("cutaways")) {
     const resolved = await resolveDirectorMedia({
       cutaways: answer.cutaways,
       library,
-      findStock: stock ? stockForQuery : undefined,
+      findStock: stock && assets !== "ai" && assets !== "library" ? stockForQuery : undefined,
+      generate: mayGenerate
+        ? async (prompt, kind) => {
+            // A still now, in every case; a video is a job that replaces it when done.
+            const still = await generateImageNow(prompt, "9:16");
+            if (!still) throw new Error("no image came back");
+            return { asset: still, pendingVideo: kind === "video" };
+          }
+        : undefined,
     });
     answer.cutaways = resolved.cutaways;
     for (const asset of resolved.assets) mediaIds.add(asset.id);
     warnings.push(...resolved.warnings);
+    pendingVideos.push(...resolved.pending);
+  }
+  const musicIds = new Set(beds.map((bed) => bed.id));
+  if (wantsMusic && answer.music !== undefined && !keep.includes("music")) {
+    const resolved = await resolveDirectorMusic({
+      music: answer.music,
+      musicIds,
+      generate: mayGenerate ? (prompt) => generateMusicNow(prompt) : undefined,
+    });
+    answer.music = resolved.music;
+    for (const asset of resolved.assets) musicIds.add(asset.id);
+    warnings.push(...resolved.warnings);
+  } else if (!wantsMusic) {
+    delete answer.music;
   }
 
-  // SFX are placed on the output clock, which depends on the cuts and speed the plan applies.
+  // SFX and beds are placed on the output clock, which depends on the cuts and speed the plan applies.
   const applyWith = (windowsOutput: (sourceSec: number) => number) =>
     applyDirectorAnswer({
       answer,
@@ -914,12 +1160,35 @@ export async function directClip(clipId: string, input: DirectInput = {}): Promi
       keep,
       sfxIds: new Set(sounds.map((sound) => sound.id)),
       mediaIds,
+      musicIds,
+      currentBeds,
       windowsOutput,
     });
   const provisional = applyWith((sourceSec) => sourceSec - trimStart);
   const windows = windowsFor(trimStart, trimEnd, provisional.plan.cuts, provisional.plan.speed);
   const applied = applyWith((sourceSec) => sourceToOutput(windows, sourceSec));
   const { plan, sfx } = applied;
+
+  // Videos still rendering: the still stands in; the job knows which cutaway to fill.
+  for (const wanted of pendingVideos) {
+    const cutaway = plan.cutaways?.find((item) => item.assetId === wanted.assetId);
+    if (!cutaway) continue;
+    try {
+      const job = await startGeneration({
+        kind: "video",
+        prompt: wanted.prompt,
+        aspectRatio: "9:16",
+        durationSec: Math.max(5, Math.min(15, Math.ceil(cutaway.endSec - cutaway.startSec) + 1)),
+        fromAssetId: wanted.assetId,
+        target: { clipId, cutawayId: cutaway.id },
+      });
+      if (job.status === "failed") warnings.push(`The video for "${wanted.prompt.slice(0, 40)}…" could not start (${job.error}); its still stays.`);
+      else pending.push(`Motion for "${wanted.prompt.slice(0, 40)}…" is rendering; its still stands in until it lands.`);
+    } catch (error: unknown) {
+      warnings.push(`The video for "${wanted.prompt.slice(0, 40)}…" could not start (${getErrorMessage(error)}); its still stays.`);
+    }
+  }
+
   // The model describes what it meant to do; say what could not be done, so
   // the creator and the next pass are not told about a cutaway that is not there.
   const summary = warnings.length ? `${applied.summary} (Not done: ${warnings.join(" ")})`.slice(0, 1200) : applied.summary;
@@ -936,15 +1205,18 @@ export async function directClip(clipId: string, input: DirectInput = {}): Promi
   const updated = await updateClipEdit(clipId, {
     edit: {
       creator: plan,
-      soundtrack: { ...(clip.edit?.soundtrack ?? {}), sfx },
+      soundtrack: { ...(clip.edit?.soundtrack ?? {}), sfx, beds: applied.beds },
     },
   });
+  // What was directed, kept apart from what the creator goes on to edit, so
+  // the difference can be read as taste when the clip is rendered.
+  await Clip.updateOne({ _id: clipId }, { $set: { directed: { plan, sfx, beds: applied.beds, at } } });
   console.log(
     `🎬 Directed clip ${clip.rank} of ${project._id} in ${((Date.now() - startedAt) / 1000).toFixed(1)}s ` +
-      `(${model}): ${plan.cuts?.filter((cut) => cut.enabled).length ?? 0} cuts, ${plan.camera?.moves.length ?? 0} moves, ` +
+      `(${model}${see && sense ? ", watched" : ""}, ${catalogue.described} new descriptions, ${lessons.length} lessons): ${plan.cuts?.filter((cut) => cut.enabled).length ?? 0} cuts, ${plan.camera?.moves.length ?? 0} moves, ` +
       `${plan.speed?.length ?? 0} speed, ${plan.effects?.length ?? 0} fx, ${plan.cutaways?.length ?? 0} cutaways, ` +
-      `${plan.captionScenes?.length ?? 0} scenes, ${plan.titles?.length ?? 0} titles, ${sfx.length} hits` +
+      `${plan.captionScenes?.length ?? 0} scenes, ${plan.titles?.length ?? 0} titles, ${sfx.length} hits, ${applied.beds.length} beds` +
       (warnings.length ? ` — ${warnings.join(" ")}` : "")
   );
-  return { clip: updated, summary, model, warnings };
+  return { clip: updated, summary, model, warnings, pending, sense };
 }

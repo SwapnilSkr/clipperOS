@@ -48,4 +48,7 @@ export {
   buildClipMatte,
   streamClipMatte,
   directClipRoute,
+  directorFeedbackRoute,
+  reviewClipRoute,
+  senseClipRoute,
 } from "./clip.controller";

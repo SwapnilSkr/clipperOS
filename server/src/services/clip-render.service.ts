@@ -52,6 +52,7 @@ import { holdCropUntilCuts } from "./speaker-reframe.service";
 import { cdnUrlFor, deleteKey, isS3Configured, uploadFileAtKey } from "./s3.service";
 import { recomputeProjectStorage } from "./clip.service";
 import { mixSoundtrackOntoClip, soundtrackNeedsMix, soundtrackSpansOutro } from "./soundtrack.service";
+import { learnFromRender } from "./taste.service";
 import { appendOutroToClip, loadSharedOutroLibrary, overlaySharedOutroLibrary, pickProjectOutro } from "./outro.service";
 import { creatorPlanActive } from "./creator-plan.service";
 import {
@@ -814,6 +815,10 @@ export async function renderClip(clipId: string, options: RenderClipOptions = {}
       );
       await validateArtifact(outputPath, joined.durationSec);
     }
+
+    // The harness watches what was made and learns from what the creator
+    // changed since the Director's pass (a proxy is taken before scratch goes).
+    await learnFromRender(clipId, outputPath).catch((error: unknown) => console.warn(`Learning skipped: ${getErrorMessage(error)}`));
 
     const delivered = await deliverArtifact(clip, project, outputPath, revision);
 

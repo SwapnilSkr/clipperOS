@@ -646,7 +646,7 @@ check("lenient overrides drop nonsense and keep the rest", JSON.stringify(lenien
 
 
 // ---- Creator Mode II: the Director writes speed, looks, B-roll and framing ----
-import { buildDirectorPrompt, gazeSummary, libraryMatch, resolveDirectorMedia, type DirectorLane, type DirectorPlanJson } from "../src/services/director.service";
+import { buildDirectorPrompt, gazeSummary, libraryMatch, resolveDirectorMedia, resolveDirectorMusic, type DirectorLane, type DirectorPlanJson } from "../src/services/director.service";
 
 const stored: CreatorPlan = {
   enabled: true,
@@ -808,9 +808,26 @@ const prompt = buildDirectorPrompt({
   sfx: [],
   effects: [{ id: "vhs", group: "texture", summary: "Tape.", variants: ["worn"] }],
   transitions: [{ id: "dissolve", summary: "Cross-fades." }],
-  media: [{ id: "lib1", kind: "video", label: "Server room racks", width: 1080, height: 1920, durationSec: 12 }],
+  media: [{ id: "lib1", kind: "video", label: "Server room racks", width: 1080, height: 1920, durationSec: 12, line: "Slow push over racks of blinking servers." }],
+  music: [{ id: "warm", label: "Warm pad", durationSec: 16, line: "A soft synth pad, unhurried.", bpm: 80, energy: 2, suits: ["under a calm story"] }],
   stock: false,
+  assets: "library",
+  wantsMusic: true,
+  sense: {
+    for: { startSec: 100, endSec: 140 },
+    model: "m",
+    at: "t0",
+    overall: "A podcast studio, warm light.",
+    shots: [{ start: 0, end: 40, framing: "medium close-up", note: "one shot", energy: 3 }],
+    moments: [{ t: 12.5, what: "slaps the table", use: "punch in" }],
+    broll: [{ t: 20, idea: "a rocket", query: "rocket launch" }],
+    audio: "clean voice, no music",
+    hook: "starts mid-sentence",
+    payoff: "lands at 20 s",
+  },
+  lessons: [{ id: "l1", scope: "global", kind: "feedback", text: "Fewer camera moves.", weight: 9, at: "t0" }],
   current: stored,
+  currentBeds: [{ id: "bed-1", assetId: "warm", gain: 0.2 }],
   keep: ["fx"],
   notes: "slow-mo the last line",
   turns: [{ notes: "VHS on the hook", summary: "Put VHS on the hook.", at: "t0" }],
@@ -829,6 +846,83 @@ check(
     prompt.includes('1. creator: "VHS on the hook" → you: Put VHS on the hook.') &&
     prompt.includes("a library \"asset\" id only") &&
     prompt.includes("KEEP these lanes exactly as they are in the current plan (leave their keys out of your answer): fx.")
+);
+check(
+  "the brief carries what the harness saw, the described catalogue, the taste lessons and the beds",
+  prompt.includes("WHAT THE HARNESS SAW AND HEARD") &&
+    prompt.includes("12.5 slaps the table → punch in") &&
+    prompt.includes("Slow push over racks of blinking servers.") &&
+    prompt.includes('warm — "Warm pad" 16s — A soft synth pad, unhurried. 80 BPM energy 2/5 suits: under a calm story') &&
+    prompt.includes("- Fewer camera moves. (the creator said so)") &&
+    prompt.includes("music bed warm level 0.2") &&
+    prompt.includes('- Music (lane "music")') &&
+    prompt.includes("You have WATCHED the clip")
+);
+const aiPrompt = buildDirectorPrompt({
+  duration: 10, trimStart: 0, peak: { at: 5 }, words: [], cuts: [], pauses: [], genre: { label: "g", summary: "s" }, styles: [], fonts: [], sfx: [], music: [], effects: [], transitions: [], media: [],
+  stock: true, assets: "both", wantsMusic: false, lessons: [], keep: [],
+});
+check(
+  "assets 'both' offers stock and generation; no music means no music key",
+  aiPrompt.includes('a stock "query"') && aiPrompt.includes('"generate": { "kind": "image|video", "prompt": "..." }') && aiPrompt.includes('leave the "music" key out')
+);
+
+// ---- music beds in the answer, on the output clock ----
+const withMusic = applyDirectorAnswer({
+  ...baseDirect,
+  musicIds: new Set(["warm", "custom:aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"]),
+  currentBeds: [{ id: "bed-user", assetId: "pulse", gain: 0.3 }, { id: "dir_bed_old", assetId: "night" }],
+  answer: {
+    music: [
+      { asset: "warm", level: 0.25, dip: 0.7, in: 0, out: null },
+      { asset: "custom:aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", level: 0.4, in: 20, out: 30, offset: 12 },
+      { asset: "nosuch", level: 0.2 },
+    ],
+  },
+});
+check(
+  "beds: the creator's own stay, the Director's old ones go, unknown tracks are dropped",
+  withMusic.beds.length === 3 && withMusic.beds[0]!.id === "bed-user" && withMusic.beds.every((bed) => bed.id !== "dir_bed_old") && !withMusic.beds.some((bed) => bed.assetId === "nosuch")
+);
+const secondBed = withMusic.beds[2]!;
+check(
+  "a bed's in/out land on the output clock with its level, dip and offset",
+  withMusic.beds[1]!.gain === 0.25 && withMusic.beds[1]!.dip === 0.7 && withMusic.beds[1]!.inSec === undefined && withMusic.beds[1]!.outSec === undefined &&
+    secondBed.inSec === 20 && secondBed.outSec === 30 && secondBed.offsetSec === 12 && secondBed.gain === 0.4 && secondBed.dip === 0.6,
+  JSON.stringify(withMusic.beds)
+);
+const keptMusic = applyDirectorAnswer({ ...baseDirect, keep: ["music"], currentBeds: [{ id: "dir_bed_1", assetId: "warm" }], musicIds: new Set(["pulse"]), answer: { music: [{ asset: "pulse" }] } });
+check("a locked music lane keeps its beds", keptMusic.beds.length === 1 && keptMusic.beds[0]!.assetId === "warm");
+
+// ---- generated cutaways: a still stands in, a video is pending ----
+const generatedStill: MediaAsset = { id: "gen-still", kind: "image", source: "ai", label: "✦ neon city", width: 768, height: 1376 };
+const generated = await resolveDirectorMedia({
+  cutaways: [
+    { generate: { kind: "video", prompt: "a neon city at night, slow push" }, start: 5, end: 7 },
+    { generate: { kind: "image", prompt: "a rocket on the pad" }, start: 8, end: 9 },
+    { generate: { prompt: "x" } },
+    { generate: { prompt: "y" } },
+  ],
+  library,
+  generate: async (prompt, kind) => ({ asset: { ...generatedStill, id: `gen-${prompt.split(" ")[1] ?? "x"}` }, pendingVideo: kind === "video" }),
+});
+check(
+  "generation: each request becomes a still, a video is marked pending, the pass is capped",
+  generated.cutaways[0]!.asset === "gen-neon" && generated.cutaways[1]!.asset === "gen-rocket" && generated.pending.length === 1 && generated.pending[0]!.assetId === "gen-neon" &&
+    generated.assets.length === 3 && generated.warnings.some((warning) => warning.includes("Only 3 pictures")),
+  JSON.stringify({ c: generated.cutaways.map((c) => c.asset), p: generated.pending, w: generated.warnings })
+);
+const noGeneration = await resolveDirectorMedia({ cutaways: [{ generate: { kind: "image", prompt: "server room racks, blue light" } }], library });
+check("a generate request without generation falls back to the library by its words", noGeneration.cutaways[0]!.asset === library[0]!.id);
+
+const generatedMusic = await resolveDirectorMusic({
+  music: [{ generate: { prompt: "lo-fi bed" }, level: 0.2 }, { generate: { prompt: "second" } }, { asset: "warm" }],
+  musicIds: new Set(["warm"]),
+  generate: async (prompt) => ({ id: `custom:${prompt}`, kind: "music", label: prompt, durationSec: 30 }),
+});
+check(
+  "a generated bed becomes a track; only one per pass; catalogue beds pass through",
+  generatedMusic.music.length === 2 && generatedMusic.music[0]!.asset === "custom:lo-fi bed" && generatedMusic.music[1]!.asset === "warm" && generatedMusic.warnings.length === 1
 );
 
 console.log("\nall director checks passed");

@@ -1,7 +1,7 @@
 import { readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { config } from "../config";
-import type { MediaAsset } from "../types/clip.types";
+import type { AssetSense, MediaAsset } from "../types/clip.types";
 import { containedPath, ensureDir, fileExists, getFileSize, runCommand } from "../utils";
 import { getVideoMetadata } from "./ffmpeg.service";
 
@@ -111,6 +111,9 @@ export async function ingestMediaFile(input: {
   attribution?: string;
   sourceUrl?: string;
   sourceId?: string;
+  /** Generated assets: the prompt and model that made them. */
+  prompt?: string;
+  model?: string;
 }): Promise<MediaAsset> {
   const dir = mediaLibraryDir();
   await ensureDir(dir);
@@ -162,6 +165,8 @@ export async function ingestMediaFile(input: {
       ...(input.attribution ? { attribution: input.attribution } : {}),
       ...(input.sourceUrl ? { sourceUrl: input.sourceUrl } : {}),
       ...(input.sourceId ? { sourceId: input.sourceId } : {}),
+      ...(input.prompt ? { prompt: input.prompt.slice(0, 1000) } : {}),
+      ...(input.model ? { model: input.model } : {}),
     };
     await writeFile(join(dir, `${id}.json`), JSON.stringify(sidecar, null, 2));
     return publicAsset(sidecar);
@@ -170,6 +175,14 @@ export async function ingestMediaFile(input: {
     await rm(mediaThumbPath(id), { force: true }).catch(() => undefined);
     throw error;
   }
+}
+
+/** Store what the harness saw in a picture. */
+export async function updateMediaSense(id: string, sense: AssetSense): Promise<void> {
+  const sidecar = await readSidecar(id);
+  if (!sidecar) throw new Error("Unknown media asset");
+  sidecar.sense = sense;
+  await writeFile(join(mediaLibraryDir(), `${id}.json`), JSON.stringify(sidecar, null, 2));
 }
 
 export async function deleteMediaAsset(id: string): Promise<void> {

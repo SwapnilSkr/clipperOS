@@ -22,7 +22,8 @@
     "creator:validate": "bun run scripts/validate-creator.ts",
     "effects:validate": "bun run scripts/validate-effects.ts",
     "cutaways:validate": "bun run scripts/validate-cutaways.ts",
-    "text:validate": "bun run scripts/validate-text.ts"
+    "text:validate": "bun run scripts/validate-text.ts",
+    "harness:validate": "bun run scripts/validate-harness.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.958.0",

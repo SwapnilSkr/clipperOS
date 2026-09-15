@@ -3,6 +3,11 @@ import type {
   ClipEdit,
   ClipKind,
   ClipSegment,
+  ClipSense,
+  CreatorPlan,
+  MusicBed,
+  RenderReview,
+  SoundtrackHit,
   PeakKind,
   ReframeMode,
   ReframeTrack,
@@ -66,6 +71,12 @@ export interface IClip extends Document {
 
   /** The user's edit spec. Absent means "render the mined window as-is". */
   edit?: ClipEdit;
+  /** What the harness saw in the window (sense.service); keyed to the trim it was made for. */
+  sense?: ClipSense;
+  /** The harness's critique of the last render it watched. */
+  review?: RenderReview;
+  /** The plan exactly as the Director last wrote it, so the creator's edits can be read as taste. */
+  directed?: { plan: CreatorPlan; sfx: SoundtrackHit[]; beds: MusicBed[]; at: string };
   /**
    * Cached person matte (a grayscale mask video in source space) for
    * behind-subject titles. Built on demand, keyed to the analysed span, and
@@ -475,6 +486,10 @@ const clipSchema = new Schema<IClip>(
     reframeNote: { type: String, trim: true },
     // Free-form: a track is keyframe geometry, not a fixed shape.
     reframeTrack: { type: Schema.Types.Mixed },
+    // The harness's notes: free-form JSON the sense/review services own.
+    sense: { type: Schema.Types.Mixed },
+    review: { type: Schema.Types.Mixed },
+    directed: { type: Schema.Types.Mixed },
     matte: {
       type: new Schema(
         {

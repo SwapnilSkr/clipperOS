@@ -344,11 +344,42 @@ export const DirectClipBody = t.Object({
         t.Literal("speed"),
         t.Literal("fx"),
         t.Literal("cutaways"),
+        t.Literal("music"),
       ]),
-      { maxItems: 8 }
+      { maxItems: 9 }
     )
   ),
+  /** Where B-roll may come from: the library, stock, generated, or both. */
+  assets: t.Optional(t.Union([t.Literal("library"), t.Literal("stock"), t.Literal("ai"), t.Literal("both")])),
+  /** Let the pass lay music beds (default true). */
+  music: t.Optional(t.Boolean()),
+  /** Attach the clip so the model watches it (default true). */
+  see: t.Optional(t.Boolean()),
 });
+
+export const DirectorFeedbackBody = t.Object({
+  verdict: t.Union([t.Literal("up"), t.Literal("down")]),
+  note: t.Optional(t.String({ maxLength: 400 })),
+  /** Learn it for every project (default) or this one only. */
+  scope: t.Optional(t.Union([t.Literal("global"), t.Literal("project")])),
+});
+
+export const LessonParams = t.Object({ id: t.String({ pattern: "^[0-9a-f]{24}$" }) });
+export const LessonBody = t.Object({
+  text: t.String({ minLength: 4, maxLength: 400 }),
+  scope: t.Optional(t.String({ maxLength: 40 })),
+});
+
+export const GenerateAssetBody = t.Object({
+  kind: t.Union([t.Literal("image"), t.Literal("video"), t.Literal("music")]),
+  prompt: t.String({ minLength: 3, maxLength: 2000 }),
+  aspectRatio: t.Optional(t.String({ pattern: "^\\d+:\\d+$" })),
+  durationSec: t.Optional(t.Number({ minimum: 1, maximum: 30 })),
+  /** Video from a library still. */
+  fromAssetId: t.Optional(t.String({ pattern: "^[0-9a-f-]{36}$" })),
+  label: t.Optional(t.String({ maxLength: 80 })),
+});
+export const GenerationJobParams = t.Object({ id: t.String({ pattern: "^[0-9a-f]{24}$" }) });
 
 export const AudioLibraryQuery = t.Object({
   projectId: t.Optional(t.String({ pattern: OBJECT_ID_PATTERN })),

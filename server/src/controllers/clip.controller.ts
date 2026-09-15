@@ -1,5 +1,6 @@
-import { readdir } from "node:fs/promises";
+import { readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { config } from "../config";
 import { Clip } from "../models";
 import { serializeClip } from "../services/project.service";
 import { enqueueRender } from "../queue/queues";
@@ -26,6 +27,9 @@ import { cleanClipCaptions } from "../services/caption-clean.service";
 import { detectClipPauses } from "../services/pause-detect.service";
 import { ensureClipMatte, matteAvailable } from "../services/matte.service";
 import { directClip, type DirectorLane } from "../services/director.service";
+import { reviewRender, senseClip } from "../services/sense.service";
+import { recordFeedback } from "../services/taste.service";
+import type { DirectorAssetMode } from "../types/clip.types";
 
 type Ctx = ApiContext;
 
@@ -260,9 +264,76 @@ export async function streamClipMatte({ params, set }: Ctx) {
 /** POST /api/clips/:id/direct — one Director pass; writes the plan and returns the clip. */
 export async function directClipRoute({ params, body, set }: Ctx) {
   try {
-    const input = (body ?? {}) as { notes?: string; keep?: DirectorLane[] };
-    const result = await directClip(params.id, { notes: input.notes, keep: input.keep });
-    return ok({ clip: serializeClip(result.clip), summary: result.summary, model: result.model, warnings: result.warnings });
+    const input = (body ?? {}) as { notes?: string; keep?: DirectorLane[]; assets?: DirectorAssetMode; music?: boolean; see?: boolean };
+    const result = await directClip(params.id, { notes: input.notes, keep: input.keep, assets: input.assets, music: input.music, see: input.see });
+    return ok({
+      clip: serializeClip(result.clip),
+      summary: result.summary,
+      model: result.model,
+      warnings: result.warnings,
+      pending: result.pending,
+      sense: result.sense,
+    });
+  } catch (error: unknown) {
+    const message = getErrorMessage(error);
+    set.status = message === "Clip not found" ? 404 : 500;
+    return fail(message);
+  }
+}
+
+/** POST /api/clips/:id/sense — the harness watches the window (again, with force). */
+export async function senseClipRoute({ params, query, set }: Ctx) {
+  try {
+    const sense = await senseClip(params.id, { force: (query as { force?: string })?.force === "1" });
+    return ok(sense);
+  } catch (error: unknown) {
+    const message = getErrorMessage(error);
+    set.status = message === "Clip not found" ? 404 : 500;
+    return fail(message);
+  }
+}
+
+/** POST /api/clips/:id/review — the harness watches the last render and critiques it. */
+export async function reviewClipRoute({ params, set }: Ctx) {
+  try {
+    const clip = await Clip.findById(params.id);
+    if (!clip) {
+      set.status = 404;
+      return fail("Clip not found");
+    }
+    if (clip.status !== "rendered") {
+      set.status = 409;
+      return fail("Render the clip first — there is nothing to watch yet");
+    }
+    // A remote render is fetched to scratch for the watch, then dropped.
+    let path = await findLocalRender(String(clip.projectId), params.id);
+    let temporary: string | undefined;
+    if (!path && clip.outputUrl && /^https?:\/\//i.test(clip.outputUrl)) {
+      temporary = join(config.processingPath, `review-${params.id}-${Date.now()}.mp4`);
+      await Bun.write(temporary, new Uint8Array(await downloadFromUrl(clip.outputUrl)));
+      path = temporary;
+    }
+    if (!path) {
+      set.status = 404;
+      return fail("Rendered file is missing on disk");
+    }
+    try {
+      return ok(await reviewRender(String(clip._id), path));
+    } finally {
+      if (temporary) await rm(temporary, { force: true }).catch(() => undefined);
+    }
+  } catch (error: unknown) {
+    set.status = 500;
+    return fail(getErrorMessage(error));
+  }
+}
+
+/** POST /api/clips/:id/director/feedback — a thumbs up / down on the last pass, learned. */
+export async function directorFeedbackRoute({ params, body, set }: Ctx) {
+  try {
+    const input = body as { verdict: "up" | "down"; note?: string; scope?: "global" | "project" };
+    const lessons = await recordFeedback({ clipId: params.id, verdict: input.verdict, note: input.note, scope: input.scope });
+    return ok({ lessons });
   } catch (error: unknown) {
     const message = getErrorMessage(error);
     set.status = message === "Clip not found" ? 404 : 500;

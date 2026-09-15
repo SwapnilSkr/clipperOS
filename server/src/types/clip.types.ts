@@ -603,11 +603,11 @@ export const MAX_EFFECT_SPANS = 24;
 export const MAX_CUTAWAYS = 8;
 export const MAX_TRANSITION_SEC = 1.5;
 
-/** A still or a video in the shared media library (uploads and stock picks). */
+/** A still or a video in the shared media library (uploads, stock picks, generated). */
 export interface MediaAsset {
   id: string;
   kind: "image" | "video";
-  source: "upload" | "pexels" | "pixabay";
+  source: "upload" | "pexels" | "pixabay" | "ai";
   label: string;
   width: number;
   height: number;
@@ -617,7 +617,79 @@ export interface MediaAsset {
   attribution?: string;
   /** The provider's page for the item, when it has one. */
   sourceUrl?: string;
+  /** Generated assets: what was asked for, and with which model. */
+  prompt?: string;
+  model?: string;
+  /** What the harness saw in it (sense.service), so the Director can pick it by content. */
+  sense?: AssetSense;
 }
+
+/** What a picture or a sound IS, as the harness described it — the Director's catalogue entry. */
+export interface AssetSense {
+  /** One line: "Slow push over a dim server room, blue rack lights." */
+  line: string;
+  /** Loose tags: subject, mood, colours, "loopable", "vocals". */
+  tags: string[];
+  /** Music/SFX: tempo and energy 1–5; pictures: energy of the motion. */
+  bpm?: number;
+  energy?: number;
+  /** What it suits, in the Director's words: "cold open", "a reveal", "under a calm story". */
+  suits?: string[];
+  model: string;
+  at: string;
+}
+
+/**
+ * What the harness saw and heard in the clip window: the picture the words
+ * do not carry. Cached on the clip, keyed to the trim it was made for.
+ */
+export interface ClipSense {
+  for: { startSec: number; endSec: number };
+  model: string;
+  at: string;
+  /** Setting, lighting, framing, palette, the speaker's energy and how the delivery lands. */
+  overall: string;
+  shots: { start: number; end: number; framing: string; note: string; energy: number }[];
+  /** Visible beats the plan can cut on: a gesture, a laugh, a prop, a look off-camera, on-screen text. */
+  moments: { t: number; what: string; use: string }[];
+  /** What B-roll would earn its place, and on which word. */
+  broll: { t: number; idea: string; query: string }[];
+  /** How it sounds: room, noise, music already there, pace. */
+  audio: string;
+  /** The harness's own read of the hook and the payoff. */
+  hook: string;
+  payoff: string;
+}
+
+/** The harness's critique of a rendered clip, next to the plan that made it. */
+export interface RenderReview {
+  revision: number;
+  model: string;
+  at: string;
+  /** 1–10, an editor's overall verdict. */
+  score: number;
+  verdict: string;
+  /** Things that hurt, with a time. */
+  issues: { t?: number; what: string; fix: string }[];
+  /** What worked and should be kept. */
+  keep: string[];
+}
+
+/** One thing the Director has learned about how this creator likes clips cut. */
+export interface DirectorLesson {
+  id: string;
+  /** "global" or a project id. */
+  scope: string;
+  /** Where it came from. */
+  kind: "edit" | "review" | "feedback";
+  text: string;
+  /** How much it should weigh: feedback outranks an inferred diff. */
+  weight: number;
+  clipId?: string;
+  at: string;
+}
+
+export type DirectorAssetMode = "library" | "stock" | "ai" | "both";
 export const MIN_SPEED_RATE = 0.2;
 export const MAX_SPEED_RATE = 3;
 export const MAX_CAMERA_MOVES = 24;

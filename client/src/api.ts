@@ -65,16 +65,31 @@ export interface Cutaway {
   offsetSec?: number;
 }
 
+/** What a picture or a sound IS, as the harness described it (server AssetSense). */
+export interface AssetSense {
+  line: string;
+  tags: string[];
+  bpm?: number;
+  energy?: number;
+  suits?: string[];
+  model: string;
+  at: string;
+}
+
 export interface MediaAsset {
   id: string;
   kind: "image" | "video";
-  source: "upload" | "pexels" | "pixabay";
+  source: "upload" | "pexels" | "pixabay" | "ai";
   label: string;
   width: number;
   height: number;
   durationSec?: number;
   attribution?: string;
   sourceUrl?: string;
+  /** Generated assets: what was asked for. */
+  prompt?: string;
+  model?: string;
+  sense?: AssetSense;
 }
 
 export interface TransitionInfo {
@@ -262,7 +277,72 @@ export const MAX_CAMERA_ZOOM = 1.5;
 export const MIN_CAMERA_ZOOM = 0.75;
 export const MAX_FOLLOW_ZOOM = 1.3;
 
-export type DirectorLane = "cuts" | "camera" | "speed" | "fx" | "cutaways" | "captions" | "titles" | "sfx";
+export type DirectorLane = "cuts" | "camera" | "speed" | "fx" | "cutaways" | "captions" | "titles" | "sfx" | "music";
+export type DirectorAssetMode = "library" | "stock" | "ai" | "both";
+
+export interface DirectInput {
+  notes?: string;
+  keep?: DirectorLane[];
+  /** Where B-roll may come from: the library, stock, generated, or both. */
+  assets?: DirectorAssetMode;
+  /** Let the pass lay music beds (default true). */
+  music?: boolean;
+  /** Attach the clip so the model watches it (default true). */
+  see?: boolean;
+}
+
+/** What the harness saw and heard in the clip window (server ClipSense). */
+export interface ClipSense {
+  for: { startSec: number; endSec: number };
+  model: string;
+  at: string;
+  overall: string;
+  shots: { start: number; end: number; framing: string; note: string; energy: number }[];
+  moments: { t: number; what: string; use: string }[];
+  broll: { t: number; idea: string; query: string }[];
+  audio: string;
+  hook: string;
+  payoff: string;
+}
+
+/** The harness's critique of a rendered clip (server RenderReview). */
+export interface RenderReview {
+  revision: number;
+  model: string;
+  at: string;
+  score: number;
+  verdict: string;
+  issues: { t?: number; what: string; fix: string }[];
+  keep: string[];
+}
+
+export interface DirectorLesson {
+  id: string;
+  scope: string;
+  kind: "edit" | "review" | "feedback";
+  text: string;
+  weight: number;
+  clipId?: string;
+  at: string;
+}
+
+export type GenerationKind = "image" | "video" | "music";
+export interface GenerationJob {
+  id: string;
+  kind: GenerationKind;
+  status: "queued" | "running" | "done" | "failed";
+  prompt: string;
+  model: string;
+  aspectRatio?: string;
+  durationSec?: number;
+  fromAssetId?: string;
+  assetId?: string;
+  error?: string;
+  cost?: number;
+  target?: { clipId: string; cutawayId?: string; bedId?: string };
+  createdAt: string;
+  updatedAt: string;
+}
 
 export interface MatteInfo {
   ready: boolean;
@@ -443,6 +523,9 @@ export interface AudioAsset {
   kind: "music" | "sfx";
   label: string;
   durationSec: number;
+  source?: "upload" | "ai";
+  prompt?: string;
+  sense?: AssetSense;
 }
 
 /**
@@ -652,6 +735,9 @@ export interface ClipPayload {
   renderError?: string;
   reframeMode?: "center" | "crop" | "resize";
   reframeNote?: string;
+  /** What the harness saw in the window, and its critique of the last render it watched. */
+  sense?: ClipSense;
+  review?: RenderReview;
   /**
    * The framing the renderer will use. Only set for a single-window clip; a merge
    * resolves one per part, so its preview falls back to a centre crop.
@@ -831,12 +917,27 @@ export const api = {
     return request<PauseDetectResult>(`/clips/${id}/pauses${query ? `?${query}` : ""}`);
   },
 
-  /** One Director pass: writes a beat plan (and SFX hits) for the clip. */
-  directClip: (id: string, input: { notes?: string; keep?: DirectorLane[] } = {}) =>
-    request<{ clip: ClipPayload; summary: string; model: string; warnings?: string[] }>(`/clips/${id}/direct`, {
+  /** One Director pass: writes a beat plan (SFX hits and music beds too) for the clip. */
+  directClip: (id: string, input: DirectInput = {}) =>
+    request<{ clip: ClipPayload; summary: string; model: string; warnings?: string[]; pending?: string[]; sense?: ClipSense }>(`/clips/${id}/direct`, {
       method: "POST",
       body: JSON.stringify(input),
     }),
+  /** The harness watches the clip window (again, with force). */
+  senseClip: (id: string, force = false) => request<ClipSense>(`/clips/${id}/sense${force ? "?force=1" : ""}`, { method: "POST" }),
+  /** The harness watches the last render and critiques it. */
+  reviewClip: (id: string) => request<RenderReview>(`/clips/${id}/review`, { method: "POST" }),
+  /** A thumbs up / down on the last pass, learned as a lesson. */
+  directorFeedback: (id: string, input: { verdict: "up" | "down"; note?: string; scope?: "global" | "project" }) =>
+    request<{ lessons: DirectorLesson[] }>(`/clips/${id}/director/feedback`, { method: "POST", body: JSON.stringify(input) }),
+  listLessons: () => request<DirectorLesson[]>("/studio/lessons"),
+  addLesson: (input: { text: string; scope?: string }) => request<DirectorLesson>("/studio/lessons", { method: "POST", body: JSON.stringify(input) }),
+  deleteLesson: (id: string) => request<{ deleted: boolean }>(`/studio/lessons/${id}`, { method: "DELETE" }),
+  /** The studio: a still, a video or a bed made on OpenRouter into the library. */
+  generateAsset: (input: { kind: GenerationKind; prompt: string; aspectRatio?: string; durationSec?: number; fromAssetId?: string; label?: string }) =>
+    request<GenerationJob>("/studio/generate", { method: "POST", body: JSON.stringify(input) }),
+  listGenerationJobs: () => request<GenerationJob[]>("/studio/jobs"),
+  senseLibrary: () => request<{ described: number; failed: number; audio: number; media: number }>("/studio/sense-library", { method: "POST" }),
 
   /** Build (or confirm) the person matte behind-subject titles need in the preview. */
   buildClipMatte: (id: string) =>

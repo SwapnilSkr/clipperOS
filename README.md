@@ -316,7 +316,57 @@ notes build on each other; a lane the answer leaves out stays as it is. A
 cutaway may name a library asset or a stock query — the server searches, takes
 the first portrait result and downloads it; one that finds nothing is left out
 with a warning, never the render. A malformed answer leaves the stored plan
-untouched. `DIRECTOR_MODEL` picks the model (default `google/gemini-2.5-flash`).
+untouched.
+
+**The harness** (`sense.service`, `taste.service`, `ai-assets.service`) is
+what makes the Director an editor rather than a transcript reader:
+
+- **It watches the clip.** The trim window goes to the model as a 360p / 8 fps
+  proxy with its audio (`video_url` base64 on OpenRouter; Gemini 3.8 Flash,
+  routed to Vertex) and comes back as shots, visible moments to cut on ("2.2 s
+  laughs and gestures outward → punch in"), B-roll it would earn, how it
+  sounds, and its own read of the hook and payoff. Cached on the clip per
+  trim; shown on the Director tab as *What it saw*. The pass itself gets the
+  video too, so beats land on what it sees, not only on a word.
+- **It listens to the library.** Every bed and hit — built-in, uploaded or
+  generated — is described once from its actual sound (`input_audio`): "dark
+  aggressive phonk beat with distorted cowbells, punchy 808s, 136 BPM, energy
+  4". Pictures likewise. The catalogue in the prompt is those descriptions,
+  so it picks *your* uploads by what they sound like. *Describe the library*
+  on the Studio tab fills in anything new; a pass describes up to 12 on its own.
+- **It lays music.** Beds are a lane (`music`): up to two, chosen by sound
+  against the genre and the speaker's energy, at a level and dip under speech
+  the mixer honours exactly (see Sound above), a second bed taking over at
+  the peak when it earns it.
+- **It makes what it cannot find.** B-roll comes from the *Library*, *Stock*,
+  *AI* or *Both* (the Director picks per cutaway in *Both*). A generated
+  still is made in the pass (~10 s, `IMAGE_MODEL`); a generated video is
+  submitted (`VIDEO_MODEL`, minutes) with that still standing in as the
+  cutaway until the motion lands and swaps itself in. A bed can be composed
+  to order (`MUSIC_MODEL`, ~20 s) when nothing in the catalogue fits.
+- **It learns.** Three signals become short lessons in its memory: what you
+  changed after a pass (read as taste when the clip renders), what it found
+  wrong watching the render (it scores every directed export 1–10, with
+  timed issues and fixes — *After the render* on the Director tab), and a
+  thumbs up / down with a note. Lessons are global or per project, weighted
+  (your own words outrank inference), fed back into every pass, and
+  consolidated when they pile up. The Studio tab lists them; any can be
+  forgotten or written directly. `DIRECTOR_LEARN=0` switches the post-render
+  watching off.
+
+`DIRECTOR_MODEL` picks the model (default `google/gemini-3.8-flash`, which
+has video and audio input on OpenRouter — checked live against
+`/api/v1/models`). A model without video input still works from the words.
+
+**The studio** (Create → Studio, `POST /api/studio/generate`) makes stills,
+motion and music to order on OpenRouter — all models are swappable
+(`IMAGE_MODEL`, `VIDEO_MODEL`, `MUSIC_MODEL`). Everything lands in the shared
+libraries like an upload does, described by the harness on arrival, so it is
+reusable in any project and pickable by content. *Animate a still* turns a
+library image into the first frame of a 5–15 s video — the way to build your
+own motion assets from generated art. Videos render on the provider for
+minutes; `GET /api/studio/jobs` polls, and a job the Director started fills
+its cutaway in when it completes.
 
 Timing is source seconds everywhere; `creator-timeline.ts` (server, and a verbatim
 client port) owns the source↔output clock and the numeric camera, and
@@ -444,6 +494,7 @@ syllable costs retention, a missing comma doesn't.
 ```bash
 bun run validate:mining <url> [genreId]   # mine a real video, assert the contract
 bun run creator:validate                  # beat plan sanitiser, clock mapping, camera expressions, Director post-processing
+bun run harness:validate                  # the harness's parsers (sense, review, catalogue), taste prompt, studio prompt framing
 bun run effects:validate                  # every effect through ffmpeg: parses, gates to its span, stacks
 bun run cutaways:validate                 # cutaway graphs on synthetic media: fits, transitions, untouched picture between
 bun run soundtrack:validate               # the mix graph, then ffmpeg on synthetic beds: in/out, offset, the dip under speech

@@ -6,3 +6,4 @@ export { captionStyleRoutes } from "./caption-style.routes";
 export { audioLibraryRoutes } from "./audio.routes";
 export { effectRoutes } from "./effects.routes";
 export { mediaLibraryRoutes, stockRoutes, transitionRoutes } from "./media.routes";
+export { studioRoutes } from "./studio.routes";

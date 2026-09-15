@@ -15,6 +15,7 @@ import {
   mediaLibraryRoutes,
   stockRoutes,
   transitionRoutes,
+  studioRoutes,
 } from "./routes";
 import { assertRedisReady } from "./queue/queues";
 import { startWorkers } from "./queue/workers";
@@ -26,6 +27,8 @@ import {
 } from "./services/storage-custody.service";
 import { loadSharedAudioLibrary, sweepOrphanedAudio } from "./services/soundtrack.service";
 import { sweepUnreferencedStock } from "./services/media-library.service";
+import { sweepSenseProxies } from "./services/sense.service";
+import { resumeGenerationJobs } from "./services/ai-assets.service";
 import { loadSharedOutroLibrary, sweepOrphanedOutros } from "./services/outro.service";
 import { initializeStorage, sweepProcessingDir } from "./utils";
 import { getErrorMessage } from "./types";
@@ -51,6 +54,9 @@ function runCustodySweep(label: string): void {
     sweepOrphanedAudio(),
     sweepOrphanedOutros(),
     sweepUnreferencedStock(),
+    sweepSenseProxies(),
+    // Videos the studio submitted before a restart are polled again.
+    resumeGenerationJobs(),
   ]).catch((error: unknown) => {
     console.error(`⚠️  Storage sweep (${label}) failed: ${getErrorMessage(error)}`);
   });
@@ -162,7 +168,8 @@ const app = new Elysia({
   .use(effectRoutes)
   .use(mediaLibraryRoutes)
   .use(stockRoutes)
-  .use(transitionRoutes);
+  .use(transitionRoutes)
+  .use(studioRoutes);
 
 // Nothing in this process listens for a rejected promise, so a stray one from a
 // background worker surfaces only as a default warning from the runtime, if at

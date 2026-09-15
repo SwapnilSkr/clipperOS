@@ -33,7 +33,9 @@ import {
   type CaptionScene,
   type CaptionStyleInfo,
   type CreatorPlan,
-  type DirectorLane,
+  type DirectInput,
+  type ClipSense,
+  type RenderReview,
   type PauseCandidate,
   type PauseCut,
   type Soundtrack,
@@ -73,6 +75,8 @@ import { MediaPicker } from "./MediaPicker";
 import { cn, timecode } from "@/lib/utils";
 import type { BeatSelection } from "./BeatTimeline";
 import { DirectorPanel } from "./DirectorPanel";
+import { StudioPanel } from "./StudioPanel";
+import { MAX_MUSIC_BEDS, musicBeds, newBedId } from "@/lib/music-beds";
 import { LANES } from "./lanes";
 import { audition, rememberSfx, SfxPicker } from "./SfxPicker";
 import { ColorControl, Panel, SegmentedButton, Slider, TimestampInput } from "./editor-controls";
@@ -142,7 +146,19 @@ export interface CreatorDeskProps {
   /** Upload a file into the shared library; the editor refreshes `audioLibrary`. */
   onUploadAudio: (file: File, kind: "music" | "sfx") => Promise<void>;
   /** Flush the draft, run the Director, adopt its plan. Rejects with a message. */
-  onDirect: (input: { notes?: string; keep: DirectorLane[] }) => Promise<{ warnings: string[] }>;
+  onDirect: (input: DirectInput) => Promise<{ warnings: string[]; pending: string[] }>;
+  /** A thumbs up / down on the last pass, learned. */
+  onDirectorFeedback: (verdict: "up" | "down", note?: string) => Promise<void>;
+  /** The harness watches the window / the last render on demand. */
+  onSense: () => Promise<void>;
+  onReview: () => Promise<void>;
+  /** What the harness saw and its critique of the last render. */
+  sense?: ClipSense;
+  review?: RenderReview;
+  /** The clip has a render to watch. */
+  rendered: boolean;
+  /** The audio library changed: reload it. */
+  onAudioChanged: () => Promise<void> | void;
 }
 
 function round3(value: number): number {
@@ -189,6 +205,13 @@ export function CreatorDesk({
   outroSec = 0,
   onUploadAudio,
   onDirect,
+  onDirectorFeedback,
+  onSense,
+  onReview,
+  sense,
+  review,
+  rendered,
+  onAudioChanged,
 }: CreatorDeskProps) {
   const [detecting, setDetecting] = useState(false);
   const [detectNote, setDetectNote] = useState<string | null>(null);
@@ -1339,7 +1362,27 @@ export function CreatorDesk({
           director={plan.director}
           hasPlan={Boolean(plan.director?.generatedAt)}
           disabled={!sourceReady}
+          stock={stockSources.length > 0}
+          sense={sense}
+          review={review}
+          rendered={rendered}
           onDirect={onDirect}
+          onFeedback={onDirectorFeedback}
+          onSense={onSense}
+          onReview={onReview}
+        />
+      ) : null}
+
+      {tab === "studio" ? (
+        <StudioPanel
+          mediaLibrary={mediaLibrary}
+          audioLibrary={library}
+          onMediaChanged={onMediaChanged}
+          onAudioChanged={onAudioChanged}
+          onPlaceCutaway={onPlaceCutaway}
+          onAddBed={(assetId) =>
+            onSoundtrackChange({ ...soundtrack, beds: [...musicBeds(soundtrack), { id: newBedId(), assetId }].slice(0, MAX_MUSIC_BEDS) })
+          }
         />
       ) : null}
 
@@ -1602,14 +1645,14 @@ export function CreatorDesk({
 
 // ---- rail tabs ----
 
-type RailTab = "edit" | "clip" | "director";
+type RailTab = "edit" | "clip" | "director" | "studio";
 
 const RAIL_TAB_KEY = "clipperos.createTab";
 
 function readRailTab(): RailTab {
   try {
     const saved = window.localStorage.getItem(RAIL_TAB_KEY);
-    return saved === "clip" || saved === "director" ? saved : "edit";
+    return saved === "clip" || saved === "director" || saved === "studio" ? saved : "edit";
   } catch {
     return "edit";
   }
@@ -1626,7 +1669,8 @@ function rememberRailTab(tab: RailTab): void {
 const RAIL_TABS: { id: RailTab; label: string; icon: typeof Plus; hint: string }[] = [
   { id: "edit", label: "Add & edit", icon: Plus, hint: "Add beats at the playhead, edit the one selected on the timeline" },
   { id: "clip", label: "Whole clip", icon: SlidersHorizontal, hint: "Settings for the whole clip: camera follow, dead air, music" },
-  { id: "director", label: "AI Director", icon: Clapperboard, hint: "Let the AI build or change the plan from a note" },
+  { id: "director", label: "Director", icon: Clapperboard, hint: "Let the AI watch the clip and build or change the plan from a note" },
+  { id: "studio", label: "Studio", icon: Sparkles, hint: "Make stills, motion and music to order; see what the Director has learned" },
 ];
 
 /** Three places, one at a time: what you are adding or editing, the clip as a whole, the Director. */
@@ -1640,7 +1684,7 @@ function RailTabs({
   anchorRef: RefObject<HTMLDivElement | null>;
 }) {
   return (
-    <div ref={anchorRef} role="tablist" aria-label="Create" className="sticky top-0 z-10 grid grid-cols-3 gap-1 rounded-xl border border-border bg-panel p-1">
+    <div ref={anchorRef} role="tablist" aria-label="Create" className="sticky top-0 z-10 grid grid-cols-4 gap-1 rounded-xl border border-border bg-panel p-1">
       {RAIL_TABS.map((item) => (
         <button
           key={item.id}

@@ -1,8 +1,8 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { cp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { config } from "../config";
-import type { MusicBed, Soundtrack, SoundtrackHit } from "../types/clip.types";
+import type { AssetSense, MusicBed, Soundtrack, SoundtrackHit } from "../types/clip.types";
 import { getErrorMessage } from "../types";
 import { containedPath, ensureDir, fileExists, getFileSize, projectAudioDir } from "../utils/file.utils";
 import { runCommand } from "../utils/process.utils";
@@ -35,6 +35,11 @@ export interface AudioAsset {
   label: string;
   /** How long the file actually is. Music loops to the clip. */
   durationSec: number;
+  /** Uploads are "upload"; the studio's are "ai" with their prompt. Built-ins carry neither. */
+  source?: "upload" | "ai";
+  prompt?: string;
+  /** What it sounds like, as the harness heard it (sense.service). */
+  sense?: AssetSense;
 }
 
 const LIBRARY_DIR = resolve(import.meta.dir, "../../assets/audio");
@@ -61,7 +66,15 @@ const BUILTIN: AudioAsset[] = [
 const BUILTIN_IDS = new Set(BUILTIN.map((asset) => asset.id));
 
 export function listBuiltinAudio(): AudioAsset[] {
-  return BUILTIN.filter((asset) => existsSync(join(LIBRARY_DIR, `${asset.id}.m4a`)));
+  return BUILTIN.filter((asset) => existsSync(join(LIBRARY_DIR, `${asset.id}.m4a`))).map((asset) => {
+    const path = builtinSensePath(asset.id);
+    if (!existsSync(path)) return { ...asset };
+    try {
+      return { ...asset, sense: JSON.parse(readFileSync(path, "utf-8")) as AssetSense };
+    } catch {
+      return { ...asset };
+    }
+  });
 }
 
 export function builtinAudioPath(id: string): string | undefined {
@@ -111,6 +124,42 @@ interface CustomMeta {
   kind: AudioKind;
   name: string;
   durationSec: number;
+  source?: "upload" | "ai";
+  prompt?: string;
+  sense?: AssetSense;
+}
+
+/** Built-ins have no sidecar of their own; their descriptions live here. */
+function builtinSensePath(id: string): string {
+  return join(config.audioPath, "sense", `${id}.json`);
+}
+
+async function builtinSense(id: string): Promise<AssetSense | undefined> {
+  const raw = await readFile(builtinSensePath(id), "utf-8").catch(() => "");
+  if (!raw) return undefined;
+  try {
+    return JSON.parse(raw) as AssetSense;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Store what the harness heard in a sound (built-in or custom). */
+export async function updateAudioSense(assetId: string, sense: AssetSense): Promise<void> {
+  const fileId = customAssetFileId(assetId);
+  if (!fileId) {
+    if (!BUILTIN_IDS.has(assetId)) throw new Error("Unknown audio file");
+    await ensureDir(join(config.audioPath, "sense"));
+    await writeFile(builtinSensePath(assetId), JSON.stringify(sense, null, 2));
+    return;
+  }
+  await loadSharedAudioLibrary();
+  const path = join(sharedAudioDir(), `${fileId}.json`);
+  const raw = await readFile(path, "utf-8").catch(() => "");
+  if (!raw) throw new Error("Unknown audio file");
+  const meta = JSON.parse(raw) as CustomMeta;
+  meta.sense = sense;
+  await writeFile(path, JSON.stringify(meta, null, 2));
 }
 
 async function listAudioInDir(dir: string): Promise<AudioAsset[]> {
@@ -131,6 +180,9 @@ async function listAudioInDir(dir: string): Promise<AudioAsset[]> {
         kind: meta.kind,
         label: String(meta.name || "Upload").slice(0, 80),
         durationSec: Number(meta.durationSec) || 0,
+        source: meta.source === "ai" ? "ai" : "upload",
+        ...(meta.prompt ? { prompt: meta.prompt } : {}),
+        ...(meta.sense ? { sense: meta.sense } : {}),
       });
     } catch {
       // Skip a corrupt sidecar.
@@ -196,7 +248,8 @@ export async function ingestCustomAudio(
   _projectId: string,
   kind: AudioKind,
   sourcePath: string,
-  originalName: string
+  originalName: string,
+  origin: { source: "upload" | "ai"; prompt?: string; model?: string } = { source: "upload" }
 ): Promise<AudioAsset> {
   await loadSharedAudioLibrary();
   const existing = await listAudioInDir(sharedAudioDir());
@@ -229,10 +282,12 @@ export async function ingestCustomAudio(
     kind,
     label: originalName.replace(/\.[a-z0-9]+$/i, "").slice(0, 80) || "Upload",
     durationSec,
+    source: origin.source,
+    ...(origin.prompt ? { prompt: origin.prompt } : {}),
   };
   await writeFile(
     join(dir, `${fileId}.json`),
-    JSON.stringify({ id: asset.id, kind, name: asset.label, durationSec }, null, 2)
+    JSON.stringify({ id: asset.id, kind, name: asset.label, durationSec, source: origin.source, ...(origin.prompt ? { prompt: origin.prompt } : {}), ...(origin.model ? { model: origin.model } : {}) }, null, 2)
   );
   return asset;
 }
