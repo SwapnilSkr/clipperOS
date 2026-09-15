@@ -355,6 +355,8 @@ export const DirectClipBody = t.Object({
   music: t.Optional(t.Boolean()),
   /** Attach the clip so the model watches it (default true). */
   see: t.Optional(t.Boolean()),
+  /** Plan first: propose and ask, apply nothing. */
+  plan: t.Optional(t.Boolean()),
 });
 
 export const DirectorFeedbackBody = t.Object({

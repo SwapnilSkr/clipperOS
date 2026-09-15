@@ -283,6 +283,8 @@ const creatorPlanSchema = new Schema(
                   notes: { type: String, maxlength: 600 },
                   summary: { type: String, maxlength: 1200 },
                   at: { type: String, maxlength: 40 },
+                  kind: { type: String, enum: ["pass", "plan"] },
+                  questions: { type: [String], default: undefined },
                 },
                 { _id: false }
               ),

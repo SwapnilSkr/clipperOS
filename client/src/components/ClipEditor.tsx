@@ -1003,7 +1003,7 @@ export function ClipEditor({
     return { url: result.url, durationSec: result.durationSec };
   }
 
-  async function directClip(input: DirectInput): Promise<{ warnings: string[]; pending: string[] }> {
+  async function directClip(input: DirectInput): Promise<{ warnings: string[]; pending: string[]; questions?: string[]; planned?: boolean }> {
     await onSave(buildDraft());
     setSaved(snapshot());
     const result = await api.directClip(clip.id, input);
@@ -1024,7 +1024,7 @@ export function ClipEditor({
     if ((result.clip.edit?.soundtrack?.beds ?? []).some((bed) => !audioLibrary.some((asset) => asset.id === bed.assetId))) {
       void refreshAudioLibrary();
     }
-    return { warnings: result.warnings ?? [], pending: result.pending ?? [] };
+    return { warnings: result.warnings ?? [], pending: result.pending ?? [], questions: result.questions, planned: result.planned };
   }
 
   async function directorFeedback(verdict: "up" | "down", note?: string): Promise<void> {

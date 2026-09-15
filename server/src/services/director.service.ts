@@ -46,7 +46,7 @@ import { buildWordTimeline } from "./mining.service";
 import { expandWordTimings } from "./transcript.service";
 import { detectClipPauses, type PauseCandidate } from "./pause-detect.service";
 import { faceAnchorAt, headTravel, sourceToOutput, windowsFor } from "./creator-timeline";
-import { sanitizeCreatorPlan } from "./creator-plan.service";
+import { plainCreatorPlan, sanitizeCreatorPlan } from "./creator-plan.service";
 import { DEFAULT_BED_DIP, DEFAULT_BED_GAIN, listBuiltinAudio, listCustomAudio, MAX_MUSIC_BEDS, MAX_SOUNDTRACK_HITS, musicBeds, type AudioAsset } from "./soundtrack.service";
 import { generateImageNow, generateMusicNow, startGeneration } from "./ai-assets.service";
 import { fileDataUrl, chat, type ChatPart } from "./openrouter.service";
@@ -98,6 +98,13 @@ export interface DirectInput {
   music?: boolean;
   /** Attach the clip itself so the model watches it (default true). */
   see?: boolean;
+  /**
+   * Plan first: the Director says what it would do, lane by lane, and asks
+   * up to three questions it cannot settle from the brief. Nothing is
+   * applied; the proposal and the questions are kept as a turn, and the next
+   * pass (with the answers in its notes) carries them.
+   */
+  plan?: boolean;
 }
 
 export interface DirectResult {
@@ -110,6 +117,9 @@ export interface DirectResult {
   pending: string[];
   /** What the harness saw, for the panel. */
   sense?: ClipSense;
+  /** A plan turn: what it asked, and that nothing was applied. */
+  questions?: string[];
+  planned?: boolean;
 }
 
 /** Cap on the word grid handed to the model; a 60 s clip is ~180 words. */
@@ -370,8 +380,8 @@ export function buildDirectorPrompt(brief: DirectorBrief): string {
   const described = describeCurrentPlan(brief.current, brief.currentSfx, brief.trimStart, mediaLabels, brief.currentBeds ?? []);
   const current = described ? `\nCURRENT PLAN (clip-relative seconds):\n${described.slice(0, 6000)}` : "";
   const turns = brief.turns?.length
-    ? `\nEARLIER PASSES ON THIS CLIP (oldest first). This pass builds on them: keep what earlier notes asked for unless the new notes change it.\n${brief.turns
-        .map((turn, index) => `${index + 1}. creator: ${turn.notes ? `"${turn.notes}"` : "(no notes)"} → you: ${turn.summary.slice(0, 400)}`)
+    ? `\nEARLIER TURNS ON THIS CLIP (oldest first). This pass builds on them: keep what earlier notes asked for unless the new notes change it. A turn marked PROPOSED is a plan you laid out and questions you asked without cutting; the creator's notes after it are the answers — apply that plan with those answers now.\n${brief.turns
+        .map((turn, index) => `${index + 1}. creator: ${turn.notes ? `"${turn.notes}"` : "(no notes)"} → you${turn.kind === "plan" ? " PROPOSED" : ""}: ${turn.summary.slice(0, 700)}${turn.questions?.length ? ` You asked: ${turn.questions.join(" | ")}` : ""}`)
         .join("\n")}\n`
     : "";
   const notes = brief.notes
@@ -494,6 +504,27 @@ Return ONLY JSON, no prose, with this shape (all times clip-relative source seco
   "music": [{ "asset": "warm", "level": 0.22, "dip": 0.65, "in": 0, "out": null, "offset": 0 }]
 }
 (A cutaway from the library carries "asset": "<library id>" in place of "query" and "kind"; a generated one carries "generate". A bed's "out" is null for the end of the clip.)`;
+}
+
+/** In plan mode the same brief ends here instead of with the plan's JSON shape. */
+export const PLAN_MODE_INSTRUCTION = `
+
+PLAN FIRST — do NOT write the plan yet. Read the brief, then answer as the editor talking to the creator before touching the timeline:
+Return ONLY JSON: { "proposal": "6–10 short lines, one per lane you would touch, each saying WHAT you would do and WHERE (clip-relative seconds or the words) and why — cuts, camera, captions, title, SFX, music, B-roll, effects, speed. Concrete, an editor's voice, no hedging.", "questions": ["up to 3 questions whose answers would change the cut — only what you genuinely cannot decide from the brief (a tone call, whether to use a specific asset, how hard to push). Ask nothing if the brief settles it."] }`;
+
+/** The brief with the plan's JSON shape replaced by the proposal's: the rules stay, the answer changes. */
+export function planPrompt(fullPrompt: string): string {
+  const cut = fullPrompt.indexOf("Return ONLY JSON, no prose, with this shape");
+  return (cut > 0 ? fullPrompt.slice(0, cut) : fullPrompt) + PLAN_MODE_INSTRUCTION;
+}
+
+export function parsePlanProposal(text: string): { proposal: string; questions: string[] } | null {
+  const raw = extractJson(text) as unknown as Record<string, unknown> | null;
+  if (!raw || typeof raw.proposal !== "string" || !raw.proposal.trim()) return null;
+  const questions = Array.isArray(raw.questions)
+    ? (raw.questions as unknown[]).filter((q): q is string => typeof q === "string" && q.trim().length > 0).map((q) => q.trim().slice(0, 300)).slice(0, 3)
+    : [];
+  return { proposal: raw.proposal.trim().slice(0, 1200), questions };
 }
 
 const CUTAWAY_MOTIONS: Cutaway["motion"][] = ["none", "in", "out", "left", "right", "up", "down"];
@@ -1038,6 +1069,7 @@ export async function directClip(clipId: string, input: DirectInput = {}): Promi
     ...(turn.notes ? { notes: turn.notes } : {}),
     summary: turn.summary,
     at: turn.at,
+    ...(turn.kind === "plan" ? { kind: "plan" as const, ...(turn.questions?.length ? { questions: turn.questions } : {}) } : {}),
   }));
 
   const brief: DirectorBrief = {
@@ -1097,20 +1129,48 @@ export async function directClip(clipId: string, input: DirectInput = {}): Promi
 
   const model = directorModel();
   const startedAt = Date.now();
+  const planFirst = input.plan === true;
   let text: string;
   try {
     // The model gets the clip itself alongside the brief when it can watch,
     // so a beat can land on something it saw, not only on a word.
-    const parts: ChatPart[] = [{ type: "text", text: buildDirectorPrompt(brief) }];
+    const parts: ChatPart[] = [{ type: "text", text: planFirst ? planPrompt(buildDirectorPrompt(brief)) : buildDirectorPrompt(brief) }];
     if (see && sense) {
       const proxy = await proxyClip(await ensureProjectMedia(String(project._id)), trimStart, trimEnd);
       parts.push({ type: "video_url", video_url: { url: await fileDataUrl(proxy, "video/mp4") } });
     }
-    const result = await chat({ model, parts, temperature: 0.45, maxTokens: 9000, reasoning: "medium", label: "director" });
+    const result = await chat({ model, parts, temperature: 0.45, maxTokens: planFirst ? 3000 : 9000, reasoning: "medium", label: "director" });
     text = result.text ?? "";
   } catch (error: unknown) {
     throw new Error(`The Director could not reach the model: ${getErrorMessage(error)}`);
   }
+
+  if (planFirst) {
+    // Nothing is cut: the proposal and its questions become a turn the next pass reads.
+    const proposal = parsePlanProposal(text);
+    if (!proposal) {
+      console.warn(`Director plan mode: no proposal in the answer — ${text.slice(0, 300).replace(/\s+/g, " ")}`);
+      throw new Error("The Director returned something that was not a proposal. Try again.");
+    }
+    const notes = input.notes?.trim() || undefined;
+    const at = new Date().toISOString();
+    const summary = proposal.proposal;
+    // Field by field off a plain copy: the stored plan is a mongoose subdocument.
+    const plain = current ? plainCreatorPlan(current as unknown as Record<string, unknown>) : undefined;
+    const director = {
+      ...(plain?.director?.summary ? { summary: plain.director.summary } : {}),
+      ...(plain?.director?.generatedAt ? { generatedAt: plain.director.generatedAt } : {}),
+      notes,
+      model,
+      turns: [...previousTurns, { ...(notes ? { notes } : {}), summary, at, kind: "plan" as const, ...(proposal.questions.length ? { questions: proposal.questions } : {}) }].slice(-MAX_DIRECTOR_TURNS),
+    };
+    const updated = await updateClipEdit(clipId, {
+      edit: { creator: { ...(plain ?? { enabled: false, version: 1 as const }), director } },
+    });
+    console.log(`🎬 Planned clip ${clip.rank} of ${project._id} in ${((Date.now() - startedAt) / 1000).toFixed(1)}s (${model}): ${proposal.questions.length} question(s)`);
+    return { clip: updated, summary, model, warnings, pending: [], sense, questions: proposal.questions, planned: true };
+  }
+
   const answer = extractJson(text);
   if (!answer) throw new Error("The Director returned something that was not a plan. Try again.");
 
@@ -1210,7 +1270,7 @@ export async function directClip(clipId: string, input: DirectInput = {}): Promi
     summary,
     model,
     generatedAt: at,
-    turns: [...previousTurns, { ...(notes ? { notes } : {}), summary: summary || "(no summary)", at }].slice(-MAX_DIRECTOR_TURNS),
+    turns: [...previousTurns, { ...(notes ? { notes } : {}), summary: summary || "(no summary)", at, kind: "pass" as const }].slice(-MAX_DIRECTOR_TURNS),
   };
 
   const updated = await updateClipEdit(clipId, {

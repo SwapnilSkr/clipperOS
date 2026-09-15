@@ -242,6 +242,9 @@ export interface DirectorTurn {
   notes?: string;
   summary: string;
   at: string;
+  /** A "plan" turn proposed and asked; nothing was applied. */
+  kind?: "pass" | "plan";
+  questions?: string[];
 }
 
 export interface DirectorNotes {
@@ -292,6 +295,8 @@ export interface DirectInput {
   music?: boolean;
   /** Attach the clip so the model watches it (default true). */
   see?: boolean;
+  /** Plan first: propose and ask, apply nothing; the next pass carries the answers. */
+  plan?: boolean;
 }
 
 /** What the harness saw and heard in the clip window (server ClipSense). */
@@ -922,7 +927,7 @@ export const api = {
 
   /** One Director pass: writes a beat plan (SFX hits and music beds too) for the clip. */
   directClip: (id: string, input: DirectInput = {}) =>
-    request<{ clip: ClipPayload; summary: string; model: string; warnings?: string[]; pending?: string[]; sense?: ClipSense }>(`/clips/${id}/direct`, {
+    request<{ clip: ClipPayload; summary: string; model: string; warnings?: string[]; pending?: string[]; sense?: ClipSense; questions?: string[]; planned?: boolean }>(`/clips/${id}/direct`, {
       method: "POST",
       body: JSON.stringify(input),
     }),

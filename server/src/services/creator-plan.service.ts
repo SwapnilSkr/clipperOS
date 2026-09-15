@@ -433,6 +433,10 @@ export function sanitizeCreatorPlan(raw: unknown): CreatorPlan {
           ...(typeof turn.notes === "string" && turn.notes.trim() ? { notes: turn.notes.trim().slice(0, 600) } : {}),
           summary: String(turn.summary).trim().slice(0, 1200),
           at: typeof turn.at === "string" ? turn.at.slice(0, 40) : "",
+          ...(turn.kind === "plan" ? { kind: "plan" as const } : {}),
+          ...(turn.kind === "plan" && Array.isArray(turn.questions)
+            ? { questions: (turn.questions as unknown[]).filter((q): q is string => typeof q === "string" && q.trim().length > 0).map((q) => q.trim().slice(0, 300)).slice(0, 3) }
+            : {}),
         }))
         .slice(-MAX_DIRECTOR_TURNS);
       if (turns.length > 0) out.turns = turns;

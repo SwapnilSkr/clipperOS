@@ -564,11 +564,18 @@ export interface BehindTitle {
   box?: { color: string; opacity: number };
 }
 
-/** One Director pass: what the creator asked, what the Director said it did. */
+/**
+ * One Director turn: what the creator asked, and either what the Director did
+ * (a pass) or what it proposes and wants to know first (a plan — nothing
+ * applied yet; the next pass carries the answers).
+ */
 export interface DirectorTurn {
   notes?: string;
   summary: string;
   at: string;
+  kind?: "pass" | "plan";
+  /** Plan turns: what it needs answered before it cuts. */
+  questions?: string[];
 }
 
 export interface DirectorNotes {

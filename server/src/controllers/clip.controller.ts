@@ -264,8 +264,8 @@ export async function streamClipMatte({ params, set }: Ctx) {
 /** POST /api/clips/:id/direct — one Director pass; writes the plan and returns the clip. */
 export async function directClipRoute({ params, body, set }: Ctx) {
   try {
-    const input = (body ?? {}) as { notes?: string; keep?: DirectorLane[]; assets?: DirectorAssetMode; music?: boolean; see?: boolean };
-    const result = await directClip(params.id, { notes: input.notes, keep: input.keep, assets: input.assets, music: input.music, see: input.see });
+    const input = (body ?? {}) as { notes?: string; keep?: DirectorLane[]; assets?: DirectorAssetMode; music?: boolean; see?: boolean; plan?: boolean };
+    const result = await directClip(params.id, { notes: input.notes, keep: input.keep, assets: input.assets, music: input.music, see: input.see, plan: input.plan });
     return ok({
       clip: serializeClip(result.clip),
       summary: result.summary,
@@ -273,6 +273,8 @@ export async function directClipRoute({ params, body, set }: Ctx) {
       warnings: result.warnings,
       pending: result.pending,
       sense: result.sense,
+      questions: result.questions,
+      planned: result.planned,
     });
   } catch (error: unknown) {
     const message = getErrorMessage(error);

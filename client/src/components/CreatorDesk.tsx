@@ -146,7 +146,7 @@ export interface CreatorDeskProps {
   /** Upload a file into the shared library; the editor refreshes `audioLibrary`. */
   onUploadAudio: (file: File, kind: "music" | "sfx") => Promise<void>;
   /** Flush the draft, run the Director, adopt its plan. Rejects with a message. */
-  onDirect: (input: DirectInput) => Promise<{ warnings: string[]; pending: string[] }>;
+  onDirect: (input: DirectInput) => Promise<{ warnings: string[]; pending: string[]; questions?: string[]; planned?: boolean }>;
   /** A thumbs up / down on the last pass, learned. */
   onDirectorFeedback: (verdict: "up" | "down", note?: string) => Promise<void>;
   /** The harness watches the window / the last render on demand. */

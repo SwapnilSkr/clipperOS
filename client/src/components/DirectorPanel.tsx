@@ -45,10 +45,12 @@ interface Options {
   assets: DirectorAssetMode;
   music: boolean;
   see: boolean;
+  /** "auto" cuts at once; "plan" proposes and asks first, then cuts on your answer. */
+  mode: "auto" | "plan";
 }
 
 function readOptions(stock: boolean): Options {
-  const fallback: Options = { assets: stock ? "stock" : "library", music: true, see: true };
+  const fallback: Options = { assets: stock ? "stock" : "library", music: true, see: true, mode: "auto" };
   try {
     const raw = window.localStorage.getItem(OPTIONS_KEY);
     if (!raw) return fallback;
@@ -57,6 +59,7 @@ function readOptions(stock: boolean): Options {
       assets: parsed.assets && ASSET_MODES.some((mode) => mode.id === parsed.assets) ? parsed.assets : fallback.assets,
       music: parsed.music ?? true,
       see: parsed.see ?? true,
+      mode: parsed.mode === "plan" ? "plan" : "auto",
     };
   } catch {
     return fallback;
@@ -76,7 +79,7 @@ export interface DirectorPanelProps {
   review?: RenderReview;
   /** The clip has a render the harness could watch. */
   rendered: boolean;
-  onDirect: (input: DirectInput) => Promise<{ warnings: string[]; pending: string[] }>;
+  onDirect: (input: DirectInput) => Promise<{ warnings: string[]; pending: string[]; questions?: string[]; planned?: boolean }>;
   onFeedback: (verdict: "up" | "down", note?: string) => Promise<void>;
   onReview: () => Promise<void>;
   onSense: () => Promise<void>;
@@ -107,7 +110,18 @@ export function DirectorPanel({ director, hasPlan, disabled, stock, sense, revie
     });
   }
 
-  async function run() {
+  // Plans directed before turns existed only carry the last notes and summary.
+  const turns: DirectorTurn[] = director?.turns?.length
+    ? director.turns
+    : director?.summary
+      ? [{ notes: director.notes, summary: director.summary, at: director.generatedAt ?? "" }]
+      : [];
+  const latest = turns[turns.length - 1];
+  const earlier = turns.slice(0, -1);
+  // A proposal is waiting for an answer: the next run cuts, whatever the mode says.
+  const answering = latest?.kind === "plan";
+
+  async function run(planFirst: boolean) {
     setBusy(true);
     setError(null);
     setWarnings([]);
@@ -115,7 +129,7 @@ export function DirectorPanel({ director, hasPlan, disabled, stock, sense, revie
     setThanked(null);
     setVerdict(null);
     try {
-      const result = await onDirect({ notes: notes.trim() || undefined, keep, assets: options.assets, music: options.music, see: options.see });
+      const result = await onDirect({ notes: notes.trim() || undefined, keep, assets: options.assets, music: options.music, see: options.see, plan: planFirst });
       setWarnings(result.warnings);
       setPending(result.pending);
       // The note now lives in the conversation below.
@@ -156,14 +170,7 @@ export function DirectorPanel({ director, hasPlan, disabled, stock, sense, revie
     setKeep((prev) => (prev.includes(lane) ? prev.filter((item) => item !== lane) : [...prev, lane]));
   }
 
-  // Plans directed before turns existed only carry the last notes and summary.
-  const turns: DirectorTurn[] = director?.turns?.length
-    ? director.turns
-    : director?.summary
-      ? [{ notes: director.notes, summary: director.summary, at: director.generatedAt ?? "" }]
-      : [];
-  const latest = turns[turns.length - 1];
-  const earlier = turns.slice(0, -1);
+  const planFirst = options.mode === "plan" && !answering;
 
   return (
     <Panel title="AI Director" icon={Clapperboard}>
@@ -173,18 +180,43 @@ export function DirectorPanel({ director, hasPlan, disabled, stock, sense, revie
         rows={2}
         maxLength={600}
         placeholder={
-          hasPlan
-            ? "Slow-mo the last line, VHS on the hook, a dragon on “dragon”, a darker bed…"
-            : "Notes (optional) — harder hook, a freeze on the punchline, B-roll of…"
+          answering
+            ? "Answer its questions, change anything in the proposal — or just say go."
+            : hasPlan
+              ? "Slow-mo the last line, VHS on the hook, a dragon on “dragon”, a darker bed…"
+              : "Notes (optional) — harder hook, a freeze on the punchline, B-roll of…"
         }
         aria-label="Notes for the Director"
         onKeyDown={(event) => {
-          if (event.key === "Enter" && (event.metaKey || event.ctrlKey) && !busy && !disabled) void run();
+          if (event.key === "Enter" && (event.metaKey || event.ctrlKey) && !busy && !disabled) void run(planFirst);
         }}
         className="text-ui w-full resize-y rounded-md border border-control bg-panel-2 px-2 py-2 outline-none focus:border-accent"
       />
 
       <div className="mt-2 flex flex-wrap items-center gap-1.5">
+        <span className="text-micro mr-1 text-muted">Mode</span>
+        {(
+          [
+            { id: "auto", label: "Auto", hint: "Reads the brief, watches the clip, cuts. One pass." },
+            { id: "plan", label: "Plan first", hint: "Proposes the cut lane by lane and asks what it cannot decide; cuts on your answer." },
+          ] as const
+        ).map((mode) => (
+          <button
+            key={mode.id}
+            type="button"
+            aria-pressed={options.mode === mode.id}
+            title={mode.hint}
+            onClick={() => setOption("mode", mode.id)}
+            className={cn(
+              "press text-micro rounded-full border px-2 py-0.5 font-semibold",
+              options.mode === mode.id ? "border-accent bg-accent/15 text-accent" : "border-border text-muted hover:border-control"
+            )}
+          >
+            {mode.label}
+          </button>
+        ))}
+      </div>
+      <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
         <span className="text-micro mr-1 text-muted">B-roll</span>
         {ASSET_MODES.map((mode) => {
           const off = mode.needsStock && !stock;
@@ -243,20 +275,45 @@ export function DirectorPanel({ director, hasPlan, disabled, stock, sense, revie
           ))}
         </div>
       ) : null}
-      <button
-        type="button"
-        disabled={busy || disabled}
-        onClick={() => void run()}
-        title="⌘↵"
-        className="press text-ui mt-2 inline-flex h-10 w-full items-center justify-center gap-1.5 rounded-lg bg-accent px-3 font-semibold text-accent-fg hover:opacity-90 disabled:opacity-50"
-      >
-        {busy ? (
-          <Loader2 className="size-4 animate-spin" aria-hidden="true" />
-        ) : (
-          <Clapperboard className="size-4" aria-hidden="true" />
-        )}
-        {busy ? (options.see ? "Watching and directing…" : "Directing…") : hasPlan ? "Redirect" : "Direct this clip"}
-      </button>
+      <div className="mt-2 flex gap-2">
+        <button
+          type="button"
+          disabled={busy || disabled}
+          onClick={() => void run(planFirst)}
+          title="⌘↵"
+          className="press text-ui inline-flex h-10 flex-1 items-center justify-center gap-1.5 rounded-lg bg-accent px-3 font-semibold text-accent-fg hover:opacity-90 disabled:opacity-50"
+        >
+          {busy ? (
+            <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+          ) : (
+            <Clapperboard className="size-4" aria-hidden="true" />
+          )}
+          {busy
+            ? planFirst
+              ? "Thinking it through…"
+              : options.see
+                ? "Watching and directing…"
+                : "Directing…"
+            : answering
+              ? "Go ahead and cut"
+              : planFirst
+                ? "Propose a cut"
+                : hasPlan
+                  ? "Redirect"
+                  : "Direct this clip"}
+        </button>
+        {answering && !busy ? (
+          <button
+            type="button"
+            disabled={disabled}
+            onClick={() => void run(true)}
+            title="Ask it to rethink the proposal with your notes, without cutting yet"
+            className="press text-ui inline-flex h-10 items-center justify-center rounded-lg border border-border px-3 font-semibold text-muted hover:border-control hover:text-fg disabled:opacity-50"
+          >
+            Rethink
+          </button>
+        ) : null}
+      </div>
       {busy && (options.assets === "ai" || options.assets === "both") ? (
         <p className="text-meta mt-1 text-muted">Made-to-order pictures and beds add 10–40 s each.</p>
       ) : null}
@@ -437,16 +494,28 @@ export function DirectorPanel({ director, hasPlan, disabled, stock, sense, revie
 }
 
 function TurnView({ turn, compact, model }: { turn: DirectorTurn; compact?: boolean; model?: string }) {
+  const plan = turn.kind === "plan";
   return (
     <div className="space-y-1">
       <p className="text-meta text-fg">
         <span className="text-micro mr-1.5 font-semibold uppercase tracking-wide text-muted">You</span>
         {turn.notes ? `“${turn.notes}”` : <span className="text-muted">No notes</span>}
       </p>
-      <p className={cn("text-meta leading-relaxed text-muted", compact && "line-clamp-2")} title={model}>
-        <span className="text-micro mr-1.5 font-semibold uppercase tracking-wide text-accent">Director</span>
+      <p className={cn("text-meta whitespace-pre-line leading-relaxed text-muted", compact && "line-clamp-2")} title={model}>
+        <span className="text-micro mr-1.5 font-semibold uppercase tracking-wide text-accent">{plan ? "Director proposes" : "Director"}</span>
         {turn.summary}
       </p>
+      {plan && !compact && turn.questions?.length ? (
+        <ul className="text-meta space-y-0.5 rounded-md border border-accent/40 bg-accent/5 px-2 py-1.5 text-fg">
+          {turn.questions.map((question, index) => (
+            <li key={question}>
+              <span className="num mr-1 text-accent">{index + 1}.</span>
+              {question}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+      {plan && !compact ? <p className="text-micro text-muted">Nothing is cut yet. Answer above and press Go ahead — or just Go ahead.</p> : null}
     </div>
   );
 }
