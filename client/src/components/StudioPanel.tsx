@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Brain, Clapperboard, Image as ImageIcon, Loader2, Music, Sparkles, Trash2 } from "lucide-react";
+import { Brain, Clapperboard, Image as ImageIcon, Loader2, Music, Sparkles, Trash2, Zap } from "lucide-react";
 import { api, mediaThumbUrl, type AudioAsset, type DirectorLesson, type GenerationJob, type GenerationKind, type MediaAsset } from "@/api";
 import { cn } from "@/lib/utils";
 import { Panel } from "./editor-controls";
@@ -25,6 +25,7 @@ const KINDS: { id: GenerationKind; label: string; icon: typeof ImageIcon; hint: 
   { id: "image", label: "Still", icon: ImageIcon, hint: "A picture for a cutaway; ~10 s" },
   { id: "video", label: "Motion", icon: Clapperboard, hint: "5–15 s of video from a prompt or a still; minutes" },
   { id: "music", label: "Music", icon: Music, hint: "A bed to sit under the voice; ~20 s" },
+  { id: "sfx", label: "SFX", icon: Zap, hint: "A one-shot hit at a set length, on fal.ai (needs FAL_KEY); ~10 s, about two cents" },
 ];
 
 export function StudioPanel({
@@ -34,6 +35,7 @@ export function StudioPanel({
   onAudioChanged,
   onPlaceCutaway,
   onAddBed,
+  onPlaceHit,
 }: {
   mediaLibrary: MediaAsset[];
   audioLibrary: AudioAsset[];
@@ -43,11 +45,14 @@ export function StudioPanel({
   onPlaceCutaway: (assetId: string) => void;
   /** Lay this track as a bed on the clip. */
   onAddBed: (assetId: string) => void;
+  /** Drop this sound as a hit at the playhead. */
+  onPlaceHit: (assetId: string) => void;
 }) {
   const [kind, setKind] = useState<GenerationKind>("image");
   const [prompt, setPrompt] = useState("");
   const [aspect, setAspect] = useState("9:16");
   const [duration, setDuration] = useState(6);
+  const [hitLength, setHitLength] = useState(1.5);
   const [fromAssetId, setFromAssetId] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -102,8 +107,8 @@ export function StudioPanel({
       await api.generateAsset({
         kind,
         prompt: prompt.trim(),
-        aspectRatio: kind === "music" ? undefined : aspect,
-        durationSec: kind === "video" ? duration : undefined,
+        aspectRatio: kind === "music" || kind === "sfx" ? undefined : aspect,
+        durationSec: kind === "video" ? duration : kind === "sfx" ? hitLength : undefined,
         fromAssetId: kind === "video" && fromAssetId ? fromAssetId : undefined,
       });
       setPrompt("");
@@ -153,7 +158,7 @@ export function StudioPanel({
   return (
     <>
       <Panel title="Studio" icon={Sparkles}>
-        <div className="grid grid-cols-3 gap-1 rounded-lg border border-border bg-panel-2/60 p-1">
+        <div className="grid grid-cols-4 gap-1 rounded-lg border border-border bg-panel-2/60 p-1">
           {KINDS.map((item) => (
             <button
               key={item.id}
@@ -178,7 +183,9 @@ export function StudioPanel({
           maxLength={2000}
           aria-label="What to make"
           placeholder={
-            kind === "music"
+            kind === "sfx"
+              ? "A deep cinematic sub boom with a short tail… / a fast airy whoosh… / a glassy UI tick…"
+              : kind === "music"
               ? "A warm lo-fi bed, soft keys and vinyl crackle, 84 BPM, calm confidence…"
               : kind === "video"
                 ? "Slow push over a dim server room, blue rack lights, haze…"
@@ -189,7 +196,19 @@ export function StudioPanel({
           }}
           className="text-ui mt-2 w-full resize-y rounded-md border border-control bg-panel-2 px-2 py-2 outline-none focus:border-accent"
         />
-        {kind !== "music" ? (
+        {kind === "sfx" ? (
+          <label className="mt-2 block">
+            <span className="text-micro text-muted">Length</span>
+            <select value={hitLength} onChange={(event) => setHitLength(Number(event.target.value))} className={FIELD} aria-label="Hit length">
+              {[0.5, 1, 1.5, 2, 3, 4, 6].map((sec) => (
+                <option key={sec} value={sec}>
+                  {sec} s
+                </option>
+              ))}
+            </select>
+          </label>
+        ) : null}
+        {kind !== "music" && kind !== "sfx" ? (
           <div className="mt-2 grid grid-cols-2 gap-2">
             <label className="block">
               <span className="text-micro text-muted">Shape</span>
@@ -234,10 +253,12 @@ export function StudioPanel({
           className="press text-ui mt-2 inline-flex h-10 w-full items-center justify-center gap-1.5 rounded-lg bg-accent px-3 font-semibold text-accent-fg hover:opacity-90 disabled:opacity-50"
         >
           {busy ? <Loader2 className="size-4 animate-spin" aria-hidden="true" /> : <Sparkles className="size-4" aria-hidden="true" />}
-          {busy ? (kind === "video" ? "Submitting…" : "Making…") : kind === "video" ? "Render motion" : kind === "music" ? "Compose a bed" : "Make a still"}
+          {busy ? (kind === "video" ? "Submitting…" : "Making…") : kind === "video" ? "Render motion" : kind === "music" ? "Compose a bed" : kind === "sfx" ? "Make a hit" : "Make a still"}
         </button>
         <p className="text-meta mt-1 text-muted">
-          {kind === "video"
+          {kind === "sfx"
+            ? "Made on fal.ai (Stable Audio SFX, ~2¢; needs FAL_KEY), trimmed and levelled like the bundled hits. Lands in the SFX list."
+            : kind === "video"
             ? "Motion renders on the provider for a few minutes; it lands in the library when done."
             : kind === "music"
               ? "Instrumental unless you ask for vocals. Lands in the Sound desk's music list."
@@ -260,6 +281,8 @@ export function StudioPanel({
                         <Loader2 className="size-4 animate-spin" aria-hidden="true" />
                       ) : job.kind === "music" ? (
                         <Music className="size-4" aria-hidden="true" />
+                      ) : job.kind === "sfx" ? (
+                        <Zap className="size-4" aria-hidden="true" />
                       ) : (
                         <Clapperboard className="size-4" aria-hidden="true" />
                       )}
@@ -285,6 +308,10 @@ export function StudioPanel({
                     job.kind === "music" ? (
                       <button type="button" onClick={() => onAddBed(job.assetId!)} className="press text-micro rounded-md border border-border px-2 py-1 font-semibold text-muted hover:border-accent hover:text-fg">
                         Lay as bed
+                      </button>
+                    ) : job.kind === "sfx" ? (
+                      <button type="button" onClick={() => onPlaceHit(job.assetId!)} className="press text-micro rounded-md border border-border px-2 py-1 font-semibold text-muted hover:border-accent hover:text-fg">
+                        Drop at playhead
                       </button>
                     ) : (
                       <button type="button" onClick={() => onPlaceCutaway(job.assetId!)} className="press text-micro rounded-md border border-border px-2 py-1 font-semibold text-muted hover:border-accent hover:text-fg">

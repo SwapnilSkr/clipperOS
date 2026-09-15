@@ -1380,6 +1380,7 @@ export function CreatorDesk({
           onMediaChanged={onMediaChanged}
           onAudioChanged={onAudioChanged}
           onPlaceCutaway={onPlaceCutaway}
+          onPlaceHit={(assetId) => onAdd("sfx", assetId)}
           onAddBed={(assetId) =>
             onSoundtrackChange({ ...soundtrack, beds: [...musicBeds(soundtrack), { id: newBedId(), assetId }].slice(0, MAX_MUSIC_BEDS) })
           }

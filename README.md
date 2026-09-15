@@ -360,7 +360,11 @@ has video and audio input on OpenRouter — checked live against
 
 **The studio** (Create → Studio, `POST /api/studio/generate`) makes stills,
 motion and music to order on OpenRouter — all models are swappable
-(`IMAGE_MODEL`, `VIDEO_MODEL`, `MUSIC_MODEL`). Everything lands in the shared
+(`IMAGE_MODEL`, `VIDEO_MODEL`, `MUSIC_MODEL`) — and sound effects on fal.ai
+(`FAL_KEY`, `SFX_MODEL`; OpenRouter has no SFX model — its audio-output
+models are music and speech only. Stable Audio 3 Small SFX is ~2¢ an
+effect, ElevenLabs' SFX through fal $0.002 a second). A hit is trimmed of
+silence and levelled like the bundled ones. Everything lands in the shared
 libraries like an upload does, described by the harness on arrival, so it is
 reusable in any project and pickable by content. *Animate a still* turns a
 library image into the first frame of a 5–15 s video — the way to build your

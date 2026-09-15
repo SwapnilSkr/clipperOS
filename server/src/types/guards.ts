@@ -373,10 +373,10 @@ export const LessonBody = t.Object({
 });
 
 export const GenerateAssetBody = t.Object({
-  kind: t.Union([t.Literal("image"), t.Literal("video"), t.Literal("music")]),
+  kind: t.Union([t.Literal("image"), t.Literal("video"), t.Literal("music"), t.Literal("sfx")]),
   prompt: t.String({ minLength: 3, maxLength: 2000 }),
   aspectRatio: t.Optional(t.String({ pattern: "^\\d+:\\d+$" })),
-  durationSec: t.Optional(t.Number({ minimum: 1, maximum: 30 })),
+  durationSec: t.Optional(t.Number({ minimum: 0.3, maximum: 30 })),
   /** Video from a library still. */
   fromAssetId: t.Optional(t.String({ pattern: "^[0-9a-f-]{36}$" })),
   label: t.Optional(t.String({ maxLength: 80 })),

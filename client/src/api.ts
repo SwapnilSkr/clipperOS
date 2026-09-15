@@ -334,7 +334,7 @@ export interface DirectorLesson {
   at: string;
 }
 
-export type GenerationKind = "image" | "video" | "music";
+export type GenerationKind = "image" | "video" | "music" | "sfx";
 export interface GenerationJob {
   id: string;
   kind: GenerationKind;

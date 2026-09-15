@@ -10,7 +10,7 @@ import { Schema, model, type Document } from "mongoose";
 // started may also name the cutaway or bed it should fill in when done.
 // ============================================
 
-export type GenerationKind = "image" | "video" | "music";
+export type GenerationKind = "image" | "video" | "music" | "sfx";
 export type GenerationStatus = "queued" | "running" | "done" | "failed";
 
 export interface IGenerationJob extends Document {
@@ -38,7 +38,7 @@ export interface IGenerationJob extends Document {
 
 const schema = new Schema<IGenerationJob>(
   {
-    kind: { type: String, enum: ["image", "video", "music"], required: true },
+    kind: { type: String, enum: ["image", "video", "music", "sfx"], required: true },
     status: { type: String, enum: ["queued", "running", "done", "failed"], required: true, index: true },
     prompt: { type: String, required: true, maxlength: 2000 },
     modelId: { type: String, required: true },

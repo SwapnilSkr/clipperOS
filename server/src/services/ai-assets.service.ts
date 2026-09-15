@@ -1,12 +1,14 @@
 import { rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { config } from "../config";
-import { imageModel, musicModel, videoModel } from "../config/models";
+import { runCommand } from "../utils/process.utils";
+import { imageModel, musicModel, sfxModel, videoModel } from "../config/models";
 import { Clip, GenerationJob, type GenerationKind, type IGenerationJob } from "../models";
 import { USABLE_STILL, type MediaAsset } from "../types/clip.types";
 import { getErrorMessage } from "../types";
 import { ingestMediaFile, resolveMediaFile } from "./media-library.service";
 import { awaitVideo, downloadVideo, fileDataUrl, generateImage, generateMusic, startVideo } from "./openrouter.service";
+import { falGenerateAudio } from "./fal.service";
 import { ingestCustomAudio, listCustomAudio, type AudioAsset } from "./soundtrack.service";
 import { senseAudio, senseMedia } from "./sense.service";
 
@@ -25,6 +27,9 @@ import { senseAudio, senseMedia } from "./sense.service";
 //          turns an AI image into a motion asset.
 //   music  google/lyria-3-pro-preview (default): a bed, instrumental unless
 //          asked otherwise; ingested as a looping custom track.
+//   sfx    fal.ai (FAL_KEY; Stable Audio 3 Small SFX by default): a one-shot
+//          at a set length — OpenRouter has no sound-effect model. Trimmed
+//          of leading silence and levelled like the bundled hits.
 //
 // Jobs are rows in GenerationJob. Images and music run to completion inside
 // the request that starts them (seconds); a video is submitted and polled
@@ -35,6 +40,8 @@ import { senseAudio, senseMedia } from "./sense.service";
 export const VIDEO_BUDGET_MS = 12 * 60 * 1000;
 export const MAX_VIDEO_SEC = 15;
 export const MIN_VIDEO_SEC = 5;
+export const MAX_SFX_SEC = 6;
+export const MIN_SFX_SEC = 0.3;
 
 export interface GenerationRequest {
   kind: GenerationKind;
@@ -93,16 +100,20 @@ export function jobInfo(doc: IGenerationJob): GenerationJobInfo {
 function labelFor(request: GenerationRequest): string {
   if (request.label?.trim()) return request.label.trim().slice(0, 80);
   const words = request.prompt.replace(/\s+/g, " ").trim().split(" ").slice(0, 7).join(" ");
-  return `${request.kind === "music" ? "♪ " : "✦ "}${words}`.slice(0, 80);
+  return `${request.kind === "music" ? "♪ " : request.kind === "sfx" ? "⚡ " : "✦ "}${words}`.slice(0, 80);
 }
 
 function modelFor(kind: GenerationKind): string {
-  return kind === "image" ? imageModel() : kind === "video" ? videoModel() : musicModel();
+  return kind === "image" ? imageModel() : kind === "video" ? videoModel() : kind === "sfx" ? sfxModel() : musicModel();
 }
 
 /** The prompt the generator gets: the request, framed for a vertical short. */
 export function framePrompt(request: GenerationRequest): string {
   const prompt = request.prompt.trim();
+  if (request.kind === "sfx") {
+    // One event, dry, done: nothing a mix would have to trim around.
+    return `A single sound effect, one event only: ${prompt}. Clean, dry, close-miked, no music, no melody, no rhythm, no voice, no background ambience, silence after it ends.`;
+  }
   if (request.kind === "music") {
     // Beds sit under speech: no vocals unless the creator asked.
     const wantsVocals = /\b(vocal|vocals|sing|singer|lyrics|rap)\b/i.test(prompt);
@@ -124,7 +135,12 @@ export async function startGeneration(request: GenerationRequest): Promise<Gener
   if (!prompt) throw new Error("A prompt is needed");
   const model = modelFor(request.kind);
   const aspectRatio = request.aspectRatio && /^\d+:\d+$/.test(request.aspectRatio) ? request.aspectRatio : "9:16";
-  const durationSec = request.kind === "video" ? Math.max(MIN_VIDEO_SEC, Math.min(MAX_VIDEO_SEC, Math.round(request.durationSec ?? 6))) : undefined;
+  const durationSec =
+    request.kind === "video"
+      ? Math.max(MIN_VIDEO_SEC, Math.min(MAX_VIDEO_SEC, Math.round(request.durationSec ?? 6)))
+      : request.kind === "sfx"
+        ? Math.max(MIN_SFX_SEC, Math.min(MAX_SFX_SEC, Math.round((request.durationSec ?? 1.5) * 10) / 10))
+        : undefined;
   const job = await GenerationJob.create({
     kind: request.kind,
     status: "running",
@@ -142,6 +158,8 @@ export async function startGeneration(request: GenerationRequest): Promise<Gener
       await runImage(job, framed, label, request.judge === true);
     } else if (request.kind === "music") {
       await runMusic(job, framed, label);
+    } else if (request.kind === "sfx") {
+      await runSfx(job, framed, label);
     } else {
       // Submitted now, finished in the background.
       const firstFrame = request.fromAssetId ? await stillDataUrl(request.fromAssetId) : undefined;
@@ -190,6 +208,37 @@ async function runMusic(job: IGenerationJob, prompt: string, label: string): Pro
     void describeAudio(asset);
   } finally {
     await rm(tmp, { force: true }).catch(() => undefined);
+  }
+}
+
+async function runSfx(job: IGenerationJob, prompt: string, label: string): Promise<void> {
+  const result = await falGenerateAudio({
+    model: job.modelId,
+    prompt,
+    durationSec: job.durationSec ?? 1.5,
+    negativePrompt: "music, melody, drums, rhythm, voice, speech, singing, ambience, reverb tail, noise floor",
+  });
+  const ext = result.contentType.includes("mpeg") || result.contentType.includes("mp3") ? "mp3" : result.contentType.includes("ogg") ? "ogg" : "wav";
+  const raw = join(config.processingPath, `gen-${job._id}.${ext}`);
+  const trimmed = join(config.processingPath, `gen-${job._id}.hit.wav`);
+  try {
+    await writeFile(raw, result.bytes);
+    // Leading silence off, the tail's silence off, the peak at −1 dBTP like the bundled hits.
+    await runCommand(
+      config.ffmpegPath,
+      [
+        "-y", "-hide_banner", "-loglevel", "error", "-i", raw,
+        "-af", "silenceremove=start_periods=1:start_threshold=-45dB:detection=peak,areverse,silenceremove=start_periods=1:start_threshold=-45dB:detection=peak,areverse,alimiter=limit=0.891:level=true",
+        trimmed,
+      ],
+      { label: "sfx trim" }
+    );
+    const asset = await ingestCustomAudio("none", "sfx", trimmed, `${label}.wav`, { source: "ai", prompt: job.prompt, model: job.modelId });
+    await finish(job, asset.id, undefined);
+    void describeAudio(asset);
+  } finally {
+    await rm(raw, { force: true }).catch(() => undefined);
+    await rm(trimmed, { force: true }).catch(() => undefined);
   }
 }
 

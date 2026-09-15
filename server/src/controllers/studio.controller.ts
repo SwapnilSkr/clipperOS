@@ -14,7 +14,7 @@ type Ctx = ApiContext;
 /** POST /api/studio/generate — a still, a video or a bed, made on OpenRouter into the library. */
 export async function generateAssetRoute({ body, set }: Ctx) {
   try {
-    const input = body as { kind: "image" | "video" | "music"; prompt: string; aspectRatio?: string; durationSec?: number; fromAssetId?: string; label?: string };
+    const input = body as { kind: "image" | "video" | "music" | "sfx"; prompt: string; aspectRatio?: string; durationSec?: number; fromAssetId?: string; label?: string };
     const job = await startGeneration(input);
     if (job.status === "failed") {
       set.status = 502;

@@ -80,3 +80,12 @@ export function videoModel(): string {
 export function musicModel(): string {
   return process.env.MUSIC_MODEL?.trim() || "google/lyria-3-pro-preview";
 }
+
+/**
+ * One-shot sound effects, on fal.ai (`FAL_KEY`) — OpenRouter has no SFX
+ * model. Stable Audio 3 Small SFX is ~$0.02 an effect; ElevenLabs' SFX v2
+ * through fal (`fal-ai/elevenlabs/sound-effects/v2`) is $0.002 a second.
+ */
+export function sfxModel(): string {
+  return process.env.SFX_MODEL?.trim() || "fal-ai/stable-audio-3/small/sfx/text-to-audio";
+}
