@@ -153,6 +153,7 @@ export async function epidemicSfxForQuery(query: string, options: { maxSec?: num
     try {
       const asset = await pickEpidemic(result);
       const sense = asset.sense ?? (await senseAudio(asset));
+      if (sense) asset.sense = sense;
       if (!sense || sense.quality === undefined || sense.quality >= USABLE_RECORDING) return asset;
       reasons.push(`${result.title}: ${sense.flaws?.join(", ") || `quality ${sense.quality}/5`}`);
     } catch (error: unknown) {

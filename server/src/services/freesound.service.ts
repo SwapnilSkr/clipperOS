@@ -133,6 +133,7 @@ export async function sfxForQuery(query: string, options: { maxSec?: number } = 
     try {
       const asset = await pickFreesound(candidate);
       const sense = asset.sense ?? (await senseAudio(asset));
+      if (sense) asset.sense = sense;
       if (!sense || sense.quality === undefined || sense.quality >= USABLE_RECORDING) return asset;
       reasons.push(`${candidate.name}: ${sense.flaws?.join(", ") || `quality ${sense.quality}/5`}`);
     } catch (error: unknown) {
