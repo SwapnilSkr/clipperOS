@@ -23,9 +23,8 @@ export const DIP_FLOOR = 0.08;
 /** The compressor's ballistics, in ms — the preview's envelope uses the same. */
 export const DIP_ATTACK_MS = 30;
 export const DIP_RELEASE_MS = 280;
-export const MAX_CUSTOM_AUDIO = 24;
-/** Uploads plus installed packs. */
-export const MAX_LIBRARY_AUDIO = 2000;
+/** Uploads, generated hits and picks together. */
+export const MAX_CUSTOM_AUDIO = 200;
 export const MAX_CUSTOM_AUDIO_BYTES = 8 * 1024 * 1024;
 export const SHARED_AUDIO_OWNER = "shared";
 
@@ -38,10 +37,8 @@ export interface AudioAsset {
   /** How long the file actually is. Music loops to the clip. */
   durationSec: number;
   /** Uploads are "upload"; the studio's are "ai" with their prompt; Freesound picks carry their credit. Built-ins carry neither. */
-  source?: "upload" | "ai" | "freesound" | "epidemic" | "pack";
+  source?: "upload" | "ai" | "freesound";
   prompt?: string;
-  /** Pack sounds: which pack (sound-packs.service), so pickers can fold them away until searched for. */
-  pack?: string;
   /** Credit line the licence asks for (CC-BY), and the sound's page. */
   attribution?: string;
   sourceUrl?: string;
@@ -132,18 +129,17 @@ interface CustomMeta {
   kind: AudioKind;
   name: string;
   durationSec: number;
-  source?: "upload" | "ai" | "freesound" | "epidemic" | "pack";
+  source?: "upload" | "ai" | "freesound";
   prompt?: string;
-  pack?: string;
   attribution?: string;
   sourceUrl?: string;
-  /** The provider's own id, so a Freesound or Epidemic pick is downloaded once. */
+  /** The provider's own id, so a Freesound pick is downloaded once. */
   sourceId?: string;
   sense?: AssetSense;
 }
 
 /** The library track that came from this provider item, if it was picked before. */
-export async function findAudioBySource(source: "freesound" | "epidemic", sourceId: string): Promise<AudioAsset | undefined> {
+export async function findAudioBySource(source: "freesound", sourceId: string): Promise<AudioAsset | undefined> {
   return (await listCustomAudio()).find((asset) => asset.source === source && asset.sourceId === sourceId);
 }
 
@@ -198,9 +194,8 @@ async function listAudioInDir(dir: string): Promise<AudioAsset[]> {
         kind: meta.kind,
         label: String(meta.name || "Upload").slice(0, 80),
         durationSec: Number(meta.durationSec) || 0,
-        source: meta.source === "ai" || meta.source === "freesound" || meta.source === "epidemic" || meta.source === "pack" ? meta.source : "upload",
+        source: meta.source === "ai" || meta.source === "freesound" ? meta.source : "upload",
         ...(meta.prompt ? { prompt: meta.prompt } : {}),
-        ...(meta.pack ? { pack: meta.pack } : {}),
         ...(meta.attribution ? { attribution: meta.attribution } : {}),
         ...(meta.sourceUrl ? { sourceUrl: meta.sourceUrl } : {}),
         ...(meta.sourceId ? { sourceId: meta.sourceId } : {}),
@@ -271,17 +266,12 @@ export async function ingestCustomAudio(
   kind: AudioKind,
   sourcePath: string,
   originalName: string,
-  origin: { source: "upload" | "ai" | "freesound" | "epidemic" | "pack"; prompt?: string; model?: string; pack?: string; attribution?: string; sourceUrl?: string; sourceId?: string } = { source: "upload" }
+  origin: { source: "upload" | "ai" | "freesound"; prompt?: string; model?: string; attribution?: string; sourceUrl?: string; sourceId?: string } = { source: "upload" }
 ): Promise<AudioAsset> {
   await loadSharedAudioLibrary();
   const existing = await listAudioInDir(sharedAudioDir());
-  // The cap is on what the creator adds by hand; installed packs sit beside it.
-  const own = existing.filter((asset) => asset.source !== "pack").length;
-  if (origin.source !== "pack" && own >= MAX_CUSTOM_AUDIO) {
-    throw new Error(`The audio library can hold ${MAX_CUSTOM_AUDIO} uploads`);
-  }
-  if (origin.source === "pack" && existing.length >= MAX_LIBRARY_AUDIO) {
-    throw new Error(`The audio library can hold ${MAX_LIBRARY_AUDIO} sounds`);
+  if (existing.length >= MAX_CUSTOM_AUDIO) {
+    throw new Error(`The audio library can hold ${MAX_CUSTOM_AUDIO} sounds`);
   }
   const size = await getFileSize(sourcePath);
   if (size > MAX_CUSTOM_AUDIO_BYTES) {
@@ -311,7 +301,6 @@ export async function ingestCustomAudio(
     durationSec,
     source: origin.source,
     ...(origin.prompt ? { prompt: origin.prompt } : {}),
-    ...(origin.pack ? { pack: origin.pack } : {}),
     ...(origin.attribution ? { attribution: origin.attribution } : {}),
     ...(origin.sourceUrl ? { sourceUrl: origin.sourceUrl } : {}),
     ...(origin.sourceId ? { sourceId: origin.sourceId } : {}),
@@ -327,7 +316,6 @@ export async function ingestCustomAudio(
         source: origin.source,
         ...(origin.prompt ? { prompt: origin.prompt } : {}),
         ...(origin.model ? { model: origin.model } : {}),
-        ...(origin.pack ? { pack: origin.pack } : {}),
         ...(origin.attribution ? { attribution: origin.attribution } : {}),
         ...(origin.sourceUrl ? { sourceUrl: origin.sourceUrl } : {}),
         ...(origin.sourceId ? { sourceId: origin.sourceId } : {}),

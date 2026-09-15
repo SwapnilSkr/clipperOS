@@ -6,8 +6,8 @@ import type { AudioAsset } from "./soundtrack.service";
 //
 // Instant and free: the Studio's "My library" search and the pickers' filter
 // use it over built-ins, uploads, generated hits and picks. The Director's
-// own lookups go to Freesound (or Epidemic Sound) so a fresh recording is
-// found for each sound the plan asks for.
+// own lookups go to Freesound so a fresh recording is found for each sound
+// the plan asks for.
 // ============================================
 
 const STOP = new Set(["the", "a", "an", "of", "and", "sound", "sfx", "effect", "noise", "hit", "with"]);
@@ -37,7 +37,7 @@ export function searchLocalSounds(query: string, assets: AudioAsset[], options: 
     .filter((asset) => !options.kind || asset.kind === options.kind)
     .map((asset) => {
       const sense: AssetSense | undefined = asset.sense;
-      const name = new Set(tokens(`${asset.label} ${asset.pack ?? ""}`).map(stem));
+      const name = new Set(tokens(asset.label).map(stem));
       const described = new Set(tokens(`${sense?.line ?? ""} ${(sense?.tags ?? []).join(" ")} ${(sense?.suits ?? []).join(" ")}`).map(stem));
       let score = 0;
       for (const word of wanted) {

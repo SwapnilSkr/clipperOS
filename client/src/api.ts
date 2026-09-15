@@ -531,10 +531,8 @@ export interface AudioAsset {
   kind: "music" | "sfx";
   label: string;
   durationSec: number;
-  source?: "upload" | "ai" | "freesound" | "epidemic" | "pack";
+  source?: "upload" | "ai" | "freesound";
   prompt?: string;
-  /** Pack sounds: which pack, so pickers fold them away until searched for. */
-  pack?: string;
   attribution?: string;
   sourceUrl?: string;
   sense?: AssetSense;
@@ -557,23 +555,7 @@ export interface SoundResult {
   tags: string[];
 }
 
-/** An Epidemic Sound result: a sound effect, or a track with its musical facts. */
-export interface EpidemicResult {
-  source: "epidemic";
-  kind: "sfx" | "music";
-  id: string;
-  title: string;
-  lengthSec: number;
-  artists?: string[];
-  bpm?: number;
-  moods?: string[];
-  genres?: string[];
-  hasVocals?: boolean;
-  previewOnly?: boolean;
-  /** Empty until asked for (signed, expiring). */
-  previewUrl: string;
-}
-export type LibrarySoundResult = SoundResult | EpidemicResult;
+export type LibrarySoundResult = SoundResult;
 
 
 /**
@@ -986,19 +968,10 @@ export const api = {
     request<GenerationJob>("/studio/generate", { method: "POST", body: JSON.stringify(input) }),
   listGenerationJobs: () => request<GenerationJob[]>("/studio/jobs"),
   senseLibrary: () => request<{ described: number; failed: number; audio: number; media: number }>("/studio/sense-library", { method: "POST" }),
-  studioSources: () => request<{ freesound: boolean; epidemic: boolean; fal: boolean }>("/studio/sources"),
+  studioSources: () => request<{ freesound: boolean; fal: boolean }>("/studio/sources"),
   searchLocalSounds: (q: string, kind?: "sfx" | "music") => request<AudioAsset[]>(`/studio/sounds/local?q=${encodeURIComponent(q)}${kind ? `&kind=${kind}` : ""}`),
-  searchSounds: (q: string, options: { source?: "freesound" | "epidemic"; kind?: "sfx" | "music"; maxSec?: number } = {}) => {
-    const params = new URLSearchParams({ q, maxSec: String(options.maxSec ?? 8) });
-    if (options.source) params.set("source", options.source);
-    if (options.kind) params.set("kind", options.kind);
-    return request<LibrarySoundResult[]>(`/studio/sounds/search?${params.toString()}`);
-  },
-  previewSound: (kind: "sfx" | "music", id: string) => request<{ url: string; expires: string }>(`/studio/sounds/preview?kind=${kind}&id=${encodeURIComponent(id)}`),
-  pickSound: (result: LibrarySoundResult) =>
-    result.source === "epidemic"
-      ? request<AudioAsset>("/studio/sounds/pick-epidemic", { method: "POST", body: JSON.stringify(result) })
-      : request<AudioAsset>("/studio/sounds/pick", { method: "POST", body: JSON.stringify({ ...result, kind: "sfx" }) }),
+  searchSounds: (q: string, maxSec = 8) => request<LibrarySoundResult[]>(`/studio/sounds/search?q=${encodeURIComponent(q)}&maxSec=${maxSec}`),
+  pickSound: (result: LibrarySoundResult) => request<AudioAsset>("/studio/sounds/pick", { method: "POST", body: JSON.stringify({ ...result, kind: "sfx" }) }),
 
   /** Build (or confirm) the person matte behind-subject titles need in the preview. */
   buildClipMatte: (id: string) =>

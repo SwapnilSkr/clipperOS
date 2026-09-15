@@ -370,13 +370,7 @@ and Attribution licences (the credit is kept with the file), with a preview
 to play before taking one. The Director may ask for a sound the catalogue
 lacks (`{ "query": "glass shatter" }` on a hit): the rated matches are
 taken in turn and each is listened to — only a recording the harness scores
-clean is placed, at most three lookups a pass. With an **Epidemic Sound**
-partner key (`EPIDEMIC_SOUND_API_KEY`) the same search and the Director's
-lookups go to its licensed library instead — 250k effects and 55k tracks,
-with music too: the Director may ask for a bed by query and BPM window
-(`{ "query": "lo-fi chill laid back", "bpmMin": 70, "bpmMax": 95 }`) and an
-instrumental match is downloaded at 320 kbps with its credit. Exports that
-carry Epidemic audio are reported to its usage endpoint. Everything lands in the shared
+clean is placed, at most three lookups a pass. Everything lands in the shared
 libraries like an upload does, described by the harness on arrival, so it is
 reusable in any project and pickable by content. *Animate a still* turns a
 library image into the first frame of a 5–15 s video — the way to build your

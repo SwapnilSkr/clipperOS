@@ -7,16 +7,12 @@ import {
   listGenerationJobsRoute,
   searchLocalSoundsRoute,
   listLessonsRoute,
-  pickEpidemicRoute,
   pickSoundRoute,
-  previewSoundRoute,
   searchSoundsRoute,
   senseLibraryRoute,
   studioSourcesRoute,
 } from "../controllers/studio.controller";
 import {
-  EpidemicPickBody,
-  EpidemicPreviewQuery,
   GenerateAssetBody,
   GenerationJobParams,
   LessonBody,
@@ -36,8 +32,6 @@ export const studioRoutes = new Elysia({ prefix: "/api/studio" })
   .get("/sounds/local", searchLocalSoundsRoute, { query: LocalSoundSearchQuery })
   .get("/sounds/search", searchSoundsRoute, { query: SoundSearchQuery })
   .post("/sounds/pick", pickSoundRoute, { body: SoundPickBody })
-  .get("/sounds/preview", previewSoundRoute, { query: EpidemicPreviewQuery })
-  .post("/sounds/pick-epidemic", pickEpidemicRoute, { body: EpidemicPickBody })
   .get("/lessons", listLessonsRoute)
   .post("/lessons", addLessonRoute, { body: LessonBody })
   .delete("/lessons/:id", deleteLessonRoute, { params: LessonParams });

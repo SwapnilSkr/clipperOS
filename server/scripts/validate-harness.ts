@@ -74,10 +74,10 @@ check("a picture is asked to match the footage's look", framePrompt({ kind: "ima
 
 // ---- local sound search ----
 const shelf = [
-  { id: "custom:1", kind: "sfx" as const, label: "Impact glass heavy 000", durationSec: 0.8, source: "pack" as const, pack: "impact-sounds" },
-  { id: "custom:2", kind: "sfx" as const, label: "Impact wood light 001", durationSec: 0.4, source: "pack" as const, pack: "impact-sounds" },
+  { id: "custom:1", kind: "sfx" as const, label: "Impact glass heavy 000", durationSec: 0.8, source: "upload" as const },
+  { id: "custom:2", kind: "sfx" as const, label: "Impact wood light 001", durationSec: 0.4, source: "upload" as const },
   { id: "custom:3", kind: "sfx" as const, label: "Whoosh", durationSec: 0.5, sense: { line: "a fast airy whoosh with a glassy tail", tags: ["whoosh", "transition"], model: "m", at: "t" } },
-  { id: "custom:4", kind: "sfx" as const, label: "Impact glass light 002", durationSec: 0.5, source: "pack" as const, pack: "impact-sounds", sense: { line: "a small glass tap", tags: ["glass"], quality: 2, flaws: ["hiss or noise floor"], model: "m", at: "t" } },
+  { id: "custom:4", kind: "sfx" as const, label: "Impact glass light 002", durationSec: 0.5, source: "freesound" as const, sense: { line: "a small glass tap", tags: ["glass"], quality: 2, flaws: ["hiss or noise floor"], model: "m", at: "t" } },
 ];
 const glass = searchLocalSounds("glass shattering", shelf, { kind: "sfx" });
 check("local search: a clean name match leads, a described sound is found, a flawed one sinks below it", glass[0]!.id === "custom:1" && glass.some((a) => a.id === "custom:3") && glass.findIndex((a) => a.id === "custom:4") > 0, glass.map((a) => a.id).join(","));

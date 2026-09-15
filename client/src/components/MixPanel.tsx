@@ -139,15 +139,12 @@ export function MixPanel({
   );
   const [sfxFilter, setSfxFilter] = useState("");
   const allSfx = useMemo(() => [...library, ...custom].filter((asset) => asset.kind === "sfx"), [library, custom]);
-  // Installed packs are hundreds of sounds: chips show them only when searched for.
+  // Past a glance's worth of chips, a filter over names and the harness's descriptions.
   const sfxTracks = useMemo(() => {
     const query = sfxFilter.trim().toLowerCase();
-    if (!query) return allSfx.filter((asset) => asset.source !== "pack");
-    return allSfx
-      .filter((asset) => `${asset.label} ${asset.pack ?? ""} ${asset.sense?.line ?? ""} ${(asset.sense?.tags ?? []).join(" ")}`.toLowerCase().includes(query))
-      .slice(0, 40);
+    if (!query) return allSfx;
+    return allSfx.filter((asset) => `${asset.label} ${asset.sense?.line ?? ""} ${(asset.sense?.tags ?? []).join(" ")}`.toLowerCase().includes(query)).slice(0, 40);
   }, [allSfx, sfxFilter]);
-  const packCount = useMemo(() => allSfx.filter((asset) => asset.source === "pack").length, [allSfx]);
   const labels = useMemo(() => {
     const map = new Map<string, string>();
     for (const asset of [...library, ...custom]) map.set(asset.id, asset.label);
@@ -259,11 +256,11 @@ export function MixPanel({
       <p className="eyebrow mt-4 text-muted">
         {outroSec > 0 ? "Hits at playhead — clip or sting" : "Hits at playhead"}
       </p>
-      {packCount > 0 ? (
+      {allSfx.length > 24 ? (
         <input
           value={sfxFilter}
           onChange={(event) => setSfxFilter(event.target.value)}
-          placeholder={`Search ${allSfx.length} sounds (${packCount} in packs)…`}
+          placeholder={`Search ${allSfx.length} sounds…`}
           aria-label="Search sound effects"
           className="text-ui mt-1.5 h-9 w-full rounded-md border border-control bg-panel-2 px-2 outline-none focus:border-accent"
         />

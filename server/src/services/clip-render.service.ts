@@ -51,20 +51,8 @@ import { resolveReframe } from "./reframe.service";
 import { holdCropUntilCuts } from "./speaker-reframe.service";
 import { cdnUrlFor, deleteKey, isS3Configured, uploadFileAtKey } from "./s3.service";
 import { recomputeProjectStorage } from "./clip.service";
-import { listCustomAudio, mixSoundtrackOntoClip, musicBeds, soundtrackNeedsMix, soundtrackSpansOutro } from "./soundtrack.service";
-import type { Soundtrack } from "../types/clip.types";
+import { mixSoundtrackOntoClip, soundtrackNeedsMix, soundtrackSpansOutro } from "./soundtrack.service";
 import { learnFromRender } from "./taste.service";
-import { epidemicConfigured, reportEpidemicUsage } from "./epidemic.service";
-
-/** Epidemic Sound asks to hear about exports that carry its audio. */
-async function reportEpidemicForClip(soundtrack: Soundtrack | undefined): Promise<void> {
-  if (!soundtrack || !epidemicConfigured()) return;
-  const used = new Set([...musicBeds(soundtrack).map((bed) => bed.assetId), ...(soundtrack.sfx ?? []).map((hit) => hit.assetId)]);
-  if (used.size === 0) return;
-  const library = await listCustomAudio();
-  const ids = library.filter((asset) => used.has(asset.id) && asset.source === "epidemic" && asset.sourceId).map((asset) => asset.sourceId!);
-  await reportEpidemicUsage(ids, "LOCAL");
-}
 import { appendOutroToClip, loadSharedOutroLibrary, overlaySharedOutroLibrary, pickProjectOutro } from "./outro.service";
 import { creatorPlanActive } from "./creator-plan.service";
 import {
@@ -833,7 +821,6 @@ export async function renderClip(clipId: string, options: RenderClipOptions = {}
     await learnFromRender(clipId, outputPath).catch((error: unknown) => console.warn(`Learning skipped: ${getErrorMessage(error)}`));
 
     const delivered = await deliverArtifact(clip, project, outputPath, revision);
-    void reportEpidemicForClip(soundtrack).catch((error: unknown) => console.warn(`Epidemic Sound usage report skipped: ${getErrorMessage(error)}`));
 
     await persistOutput(clipId, revision, delivered);
     await recomputeProjectStorage(String(project._id));

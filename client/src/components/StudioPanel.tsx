@@ -62,8 +62,8 @@ export function StudioPanel({
   const [rule, setRule] = useState("");
   const [describing, setDescribing] = useState(false);
   const [described, setDescribed] = useState<string | null>(null);
-  const [sources, setSources] = useState<{ freesound: boolean; epidemic: boolean; fal: boolean }>({ freesound: false, epidemic: false, fal: false });
-  const [soundSource, setSoundSource] = useState<"library" | "epidemic" | "freesound" | null>(null);
+  const [sources, setSources] = useState<{ freesound: boolean; fal: boolean }>({ freesound: false, fal: false });
+  const [soundSource, setSoundSource] = useState<"library" | "freesound" | null>(null);
   const [localHits, setLocalHits] = useState<AudioAsset[]>([]);
   const [soundKind, setSoundKind] = useState<"sfx" | "music">("sfx");
   const [soundQuery, setSoundQuery] = useState("");
@@ -71,7 +71,6 @@ export function StudioPanel({
   const [searching, setSearching] = useState(false);
   const [picking, setPicking] = useState<string | null>(null);
   const [picked, setPicked] = useState<Record<string, string>>({});
-  const [previews, setPreviews] = useState<Record<string, string>>({});
   const activeSource = soundSource ?? "library";
   const soundsOn = true;
 
@@ -117,7 +116,7 @@ export function StudioPanel({
         setSounds([]);
       } else {
         setLocalHits([]);
-        setSounds(await api.searchSounds(q, { source: activeSource, kind: activeSource === "epidemic" ? soundKind : "sfx" }));
+        setSounds(await api.searchSounds(q));
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -137,19 +136,6 @@ export function StudioPanel({
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setPicking(null);
-    }
-  }
-
-  /** Epidemic previews are signed URLs fetched when the player is first used. */
-  async function preview(result: LibrarySoundResult, element: HTMLAudioElement) {
-    if (result.source !== "epidemic" || previews[result.id] || element.getAttribute("src")) return;
-    try {
-      const { url } = await api.previewSound(result.kind, result.id);
-      setPreviews((prev) => ({ ...prev, [result.id]: url }));
-      element.src = url;
-      await element.play().catch(() => undefined);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
     }
   }
 
@@ -390,13 +376,11 @@ export function StudioPanel({
       <Panel title="Find a sound" icon={Search}>
         <p className="text-meta text-muted">
           Your library first — built-ins, uploads, picks — by name and by what the harness heard.
-          {sources.epidemic ? " Epidemic Sound's licensed library too." : ""}
-          {sources.freesound ? " And freesound.org (CC0 / Attribution, credit kept with the file)." : ""}
-          {!sources.epidemic && !sources.freesound ? " Freesound (free) needs FREESOUND_API_KEY: any placeholder works for its callback field, token search never uses it." : ""}
+          {sources.freesound ? " And freesound.org (CC0 / Attribution, credit kept with the file)." : " Freesound (free) needs FREESOUND_API_KEY: any placeholder works for its callback field, token search never uses it."}
         </p>
         <div className="mt-2 flex flex-wrap items-center gap-1.5">
-          {(["library", "epidemic", "freesound"] as const)
-            .filter((source) => source === "library" || (source === "epidemic" ? sources.epidemic : sources.freesound))
+          {(["library", "freesound"] as const)
+            .filter((source) => source === "library" || sources.freesound)
             .map((source) => (
               <button
                 key={source}
@@ -409,11 +393,11 @@ export function StudioPanel({
                 }}
                 className={cn("press text-micro rounded-full border px-2 py-0.5 font-semibold", activeSource === source ? "border-accent bg-accent/15 text-accent" : "border-border text-muted hover:border-control")}
               >
-                {source === "library" ? "My library" : source === "epidemic" ? "Epidemic Sound" : "Freesound"}
+                {source === "library" ? "My library" : "Freesound"}
               </button>
             ))}
         </div>
-        {activeSource === "library" || (activeSource === "epidemic" && sources.epidemic) ? (
+        {activeSource === "library" ? (
           <div className="mt-2 flex flex-wrap items-center gap-1.5">
             {(["sfx", "music"] as const).map((kindOption) => (
               <button
@@ -436,7 +420,7 @@ export function StudioPanel({
             value={soundQuery}
             onChange={(event) => setSoundQuery(event.target.value)}
             maxLength={120}
-            placeholder={activeSource === "epidemic" && soundKind === "music" ? "lo-fi chill laid back, cinematic tension, upbeat funk…" : "glass shatter, crowd gasp, cash register…"}
+            placeholder={activeSource === "library" && soundKind === "music" ? "a bed by name or mood…" : "glass shatter, crowd gasp, cash register…"}
             aria-label="Search sounds"
             disabled={!soundsOn}
             onKeyDown={(event) => {
@@ -464,7 +448,7 @@ export function StudioPanel({
                 <div className="min-w-0 flex-1">
                   <p className="text-ui truncate">{asset.label}</p>
                   <p className="text-micro truncate text-muted">
-                    {asset.durationSec.toFixed(1)} s{asset.pack ? ` · ${asset.pack}` : asset.source ? ` · ${asset.source}` : ""}
+                    {asset.durationSec.toFixed(1)} s{asset.source ? ` · ${asset.source}` : ""}
                     {asset.sense?.line ? ` · ${asset.sense.line}` : ""}
                   </p>
                 </div>
@@ -487,25 +471,17 @@ export function StudioPanel({
               <li key={result.id} className="rounded-lg border border-border bg-panel-2/50 p-1.5">
                 <div className="flex items-center gap-2">
                   <div className="min-w-0 flex-1">
-                    <p className="text-ui truncate" title={result.source === "epidemic" ? result.title : result.name}>
-                      {result.source === "epidemic" ? result.title : result.name}
+                    <p className="text-ui truncate" title={result.name}>
+                      {result.name}
                     </p>
                     <p className="text-micro text-muted">
-                      {result.source === "epidemic"
-                        ? `${result.lengthSec}s${result.kind === "music" ? ` · ${result.artists?.join(", ") || "Epidemic Sound"}${result.bpm ? ` · ${result.bpm} BPM` : ""}${result.hasVocals ? " · vocals" : " · instrumental"}${result.moods?.length ? ` · ${result.moods.slice(0, 2).join(", ")}` : ""}${result.previewOnly ? " · preview tier" : ""}` : " · Epidemic Sound"}`
-                        : `${result.durationSec.toFixed(1)} s · ${result.ratings > 0 ? `${result.rating.toFixed(1)}★ (${result.ratings})` : "unrated"} · ${result.needsCredit ? "credit" : "CC0"} · ${result.username}`}
+                      {result.durationSec.toFixed(1)} s · {result.ratings > 0 ? `${result.rating.toFixed(1)}★ (${result.ratings})` : "unrated"} · {result.needsCredit ? "credit" : "CC0"} · {result.username}
                     </p>
                   </div>
                   {picked[result.id] ? (
-                    result.kind === "music" ? (
-                      <button type="button" onClick={() => onAddBed(picked[result.id]!)} className="press text-micro rounded-md border border-accent px-2 py-1 font-semibold text-accent">
-                        Lay as bed
-                      </button>
-                    ) : (
-                      <button type="button" onClick={() => onPlaceHit(picked[result.id]!)} className="press text-micro rounded-md border border-accent px-2 py-1 font-semibold text-accent">
-                        Drop at playhead
-                      </button>
-                    )
+                    <button type="button" onClick={() => onPlaceHit(picked[result.id]!)} className="press text-micro rounded-md border border-accent px-2 py-1 font-semibold text-accent">
+                      Drop at playhead
+                    </button>
                   ) : (
                     <button
                       type="button"
@@ -520,10 +496,9 @@ export function StudioPanel({
                 <audio
                   controls
                   preload="none"
-                  src={result.source === "epidemic" ? previews[result.id] || undefined : result.previewUrl}
-                  onPointerDown={(event) => void preview(result, event.currentTarget)}
+                  src={result.previewUrl}
                   className="mt-1 h-8 w-full"
-                  aria-label={`Preview of ${result.source === "epidemic" ? result.title : result.name}`}
+                  aria-label={`Preview of ${result.name}`}
                 />
               </li>
             ))}

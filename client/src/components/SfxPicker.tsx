@@ -82,29 +82,22 @@ export function SfxPicker({
     audio.onended = () => setPlaying((prev) => (prev === assetId ? null : prev));
   }
 
-  // Installed packs are hundreds of sounds: folded away until a search names them.
+  // A library that has grown past a glance gets a filter over names and the harness's descriptions.
   const query = filter.trim().toLowerCase();
   const matches = (asset: AudioAsset) =>
-    !query ||
-    `${asset.label} ${asset.pack ?? ""} ${asset.sense?.line ?? ""} ${(asset.sense?.tags ?? []).join(" ")}`.toLowerCase().includes(query);
-  const packSounds = assets.filter((asset) => asset.source === "pack");
-  const custom = assets.filter((asset) => asset.id.startsWith("custom:") && asset.source !== "pack").filter(matches);
+    !query || `${asset.label} ${asset.sense?.line ?? ""} ${(asset.sense?.tags ?? []).join(" ")}`.toLowerCase().includes(query);
+  const custom = assets.filter((asset) => asset.id.startsWith("custom:")).filter(matches);
   const builtin = assets.filter((asset) => !asset.id.startsWith("custom:")).filter(matches);
-  const fromPacks = query ? packSounds.filter(matches).slice(0, 40) : [];
-  const groups: [string, AudioAsset[]][] = [
-    ...(custom.length > 0 ? ([["Yours", custom]] as [string, AudioAsset[]][]) : []),
-    [custom.length > 0 || fromPacks.length > 0 ? "Built in" : "", builtin],
-    ...(fromPacks.length > 0 ? ([["Packs", fromPacks]] as [string, AudioAsset[]][]) : []),
-  ];
+  const groups: [string, AudioAsset[]][] = custom.length > 0 ? [["Yours", custom], ["Built in", builtin]] : [["", builtin]];
   let index = 0;
 
   return (
     <div className="max-h-64 overflow-y-auto pr-0.5" role="listbox" aria-label="Sound effects">
-      {packSounds.length > 0 || assets.length > 12 ? (
+      {assets.length > 12 ? (
         <input
           value={filter}
           onChange={(event) => setFilter(event.target.value)}
-          placeholder={packSounds.length > 0 ? `Search ${assets.length} sounds (${packSounds.length} in packs)…` : "Search sounds…"}
+          placeholder={`Search ${assets.length} sounds…`}
           aria-label="Search sound effects"
           className="text-ui mb-1.5 h-8 w-full rounded-md border border-control bg-panel-2 px-2 outline-none focus:border-accent"
         />
@@ -154,7 +147,7 @@ export function SfxPicker({
         </div>
       ))}
       {assets.length === 0 ? <p className="text-meta text-muted">No sound effects yet.</p> : null}
-      {assets.length > 0 && custom.length + builtin.length + fromPacks.length === 0 ? <p className="text-meta text-muted">Nothing matches "{filter.trim()}".</p> : null}
+      {assets.length > 0 && custom.length + builtin.length === 0 ? <p className="text-meta text-muted">Nothing matches "{filter.trim()}".</p> : null}
     </div>
   );
 }
