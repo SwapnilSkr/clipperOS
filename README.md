@@ -285,18 +285,27 @@ off) renders exactly as before.
 | Lane | What it is | How it burns |
 |---|---|---|
 | **Cuts** | Dead air to remove. *Find dead air* intersects word-onset gaps with ffmpeg `silencedetect`; each candidate is a toggle. | The trim becomes N kept windows, concatenated in one graph (the merge path). The player skips the gaps. |
-| **Camera** | *Ride the speaker* (the crop follows the tracked face by a tightness; optional persistent punch-in) and **moves**: `punch` (jump in, hold, release), `push` (slow creep), `pull` (open tight, settle). Anchor on the face, the centre, or a point. | `scale … eval=frame` + `crop` with piecewise expressions of `t` — the same technique as the pan — so the preview's zoom is the burn's zoom. Zoom is capped at 1.5×; the UI warns past 1.35× on 1080p. |
+| **Camera** | *Ride the speaker* (the crop follows the tracked face by a tightness; optional persistent punch-in and *lead room* toward where the head faces) and **moves**: `punch` (jump in, hold, release), `push` (slow creep), `pull` (open tight, settle), `frame` (ramp to a framing you drag in the Framing widget — zoom from/to, so a zoom *out* too, and a pan of the 9:16 window over the source — and hold it), `hold` (lock the camera off: the follow stops riding the head for the span, then glides back over 0.35 s; it ends at a shot cut). Anchor on the face, the centre, a point, or `look` (ahead of the face, from the analyser's head yaw). | `scale … eval=frame` + `crop` with piecewise expressions of `t` — the same technique as the pan — so the preview's zoom is the burn's zoom. The pan is a flat-sum term on the base crop. A hold rewrites the camera path both sides frame from (`cameraTrackFor`: smoothing, then the holds) into a flagged plateau the renderer's de-duplication keeps. Zoom is capped at 1.5× (0.75× of the follow zoom for a zoom out); the UI warns past 1.35× on 1080p. |
+| **Speed** | Slow motion (0.2–0.9×, optionally motion-interpolated), fast (1.1–3×) and freeze spans. The voice fades out through slow motion and freezes; music and hits keep the output clock. | The span becomes its own window with a rate: `setpts` (+ `minterpolate`), `loop`+`trim` for a freeze, `afade`+`apad` (or `atempo` when fast) on the voice. The player drives `playbackRate` and mutes the voice. |
+| **FX** | 31 stackable looks (`config/effects.ts`, served at `GET /api/effects`): colour (B&W, duotone, thermal…), texture (grain, VHS, old film…), motion (echo, shake, zoom pulse…), glitch (RGB split, broken TV, strobe…), frame (bars, vignette, bloom, fades). | Filter fragments gated to the span with `enable` (RGB-space and temporal filters on a split/overlay branch, so frames outside the span are untouched), after the camera, before the captions. The preview is a CSS/canvas approximation (the picker's tiles show each look live on the clip's own crop, at the span's amount); *Render this span* (`POST /api/clips/:id/preview-span`) is exact. |
+| **B-roll** | Cutaways from the media library — uploads (or drop a file on the lane) and Pexels/Pixabay stock (`PEXELS_API_KEY` / `PIXABAY_API_KEY`, either optional; HD files, portrait first) — with cover or blurred fit, a Ken Burns drift, and one of 15 transitions in and out (`GET /api/transitions`: dissolve, dips, slides, wipes, soft wipe, iris, pixelize, zoom). The voice runs on underneath. Stock downloads no clip uses are swept after a day; uploads are kept. | Each is an extra input, fitted and drifted, transitioned with `xfade` against the cutaway's own frames at alpha 0 (so no transition dips darker; dips go through their colour; a dissolve is an alpha `fade`), then overlaid for its span under the captions. The clip's clock and audio are untouched. |
 | **Captions** | Scenes with their own look: preset, font, size, colours, box, words-per-caption, and *colour the spoken word* (karaoke). A group never crosses a scene boundary. | One ASS style pair per scene; karaoke writes one line per word span with the active word in the accent. |
 | **Titles** | Free-placed hook text, *behind* the speaker or in front, with pop / fade / rise entrances. | A behind-title is composited between the background and the speaker's cutout from a **person matte** (RobustVideoMatting on onnxruntime, in the vision venv), built only over the title's span and cached per clip under `storage/media/<project>/matte/`. Without the matte the title burns in front and the render says so. |
 | **SFX** | The Sound desk's hits, on the output clock, drawn as pins. | `mixSoundtrackOntoClip`, unchanged. |
 
 **The AI Director** (`POST /api/clips/:id/direct`) writes the whole plan in one
-call from what the pipeline already knows — every word onset, the mined peak,
-shot changes, where the face sits, the dead air, the catalogue of looks and
-sounds — and saves it through the same sanitiser as the editor. It is on demand:
-*Direct this clip*, then *Redirect* with notes, locking any lane you want kept.
-A malformed answer leaves the stored plan untouched. `DIRECTOR_MODEL` picks the
-model (default `google/gemini-2.5-flash`).
+call from what the pipeline already knows — every word onset and caption line,
+the mined peak, shot changes, where the face sits and which way it looks, the
+dead air, the catalogue of looks, effects, transitions, sounds and library
+media — and saves it through the same sanitiser as the editor. It is on demand:
+*Direct this clip*, then *Redirect* with notes ("slow-mo the last line, VHS on
+the hook, cut to a server room on *compute*"), locking any lane you want kept.
+The last six passes are kept as a conversation and handed back to the model, so
+notes build on each other; a lane the answer leaves out stays as it is. A
+cutaway may name a library asset or a stock query — the server searches, takes
+the first portrait result and downloads it; one that finds nothing is left out
+with a warning, never the render. A malformed answer leaves the stored plan
+untouched. `DIRECTOR_MODEL` picks the model (default `google/gemini-2.5-flash`).
 
 Timing is source seconds everywhere; `creator-timeline.ts` (server, and a verbatim
 client port) owns the source↔output clock and the numeric camera, and
@@ -424,6 +433,8 @@ syllable costs retention, a missing comma doesn't.
 ```bash
 bun run validate:mining <url> [genreId]   # mine a real video, assert the contract
 bun run creator:validate                  # beat plan sanitiser, clock mapping, camera expressions, Director post-processing
+bun run effects:validate                  # every effect through ffmpeg: parses, gates to its span, stacks
+bun run cutaways:validate                 # cutaway graphs on synthetic media: fits, transitions, untouched picture between
 bun run reframe:validate                  # speaker-tracking decision logic, no Python needed
 bun run vision:install                    # venv + OpenCV + YuNet (for tracking and cleanup)
 bun run typecheck
@@ -457,7 +468,13 @@ server/src/
   services/pause-detect.service.ts dead-air candidates (word gaps ∩ silencedetect)
   services/matte.service.ts        the person matte behind titles (RVM via python/person_matte.py)
   services/title.service.ts        title ASS layers
-  services/director.service.ts     the AI Director: brief → plan
+  services/director.service.ts     the AI Director: brief → plan (stock queries resolved before it is applied)
+  config/effects.ts                the effects registry (filter fragments + preview hints)
+  config/transitions.ts            cutaway transitions
+  services/effects.service.ts      the FX lane as one filter chain per window
+  services/cutaway.service.ts      cutaway inputs, fits, Ken Burns, xfade transitions
+  services/media-library.service.ts  shared stills and videos (uploads + stock picks)
+  services/stock.service.ts        Pexels + Pixabay behind one search
   services/clip-render.service.ts  the single-pass render (and the concat paths)
   services/clip.service.ts         edit specs, merges, delete, storage accounting
   services/storage-custody.service.ts  orphan sweeps + S3 reconciliation
@@ -474,6 +491,11 @@ client/src/
   components/ClipEditor.tsx        the editor page (trim, live captions, cleanup, merge parts)
   components/BeatTimeline.tsx      creator mode's lane timeline
   components/CreatorDesk.tsx       creator mode's right rail (Director, add-at-playhead, inspector)
+  components/DirectorPanel.tsx     notes, lane locks, and the conversation with the Director
+  components/FramingWidget.tsx     drag the 9:16 window and zoom anchor over the source
+  components/CutawayLayer.tsx      cutaways over the preview, transitions as CSS
+  components/MediaPicker.tsx       library + stock search for B-roll
+  lib/fx-preview.ts                the FX lane's CSS/canvas approximation
   lib/creator-timeline.ts          port of the server's creator timeline
   components/CleanupLayer.tsx      draw/move/resize watermark regions
   components/CaptionOverlay.tsx    captions drawn like the burn, at any player size
@@ -483,7 +505,7 @@ client/src/
 
 ## Not in v1
 
-Music-drop alignment, b-roll cutaways, loudness normalisation, publishing,
+Music-drop alignment, loudness normalisation, publishing,
 auth/billing. Audio/visual peak detection (see Known
 limits). A generated headline hook-card is also deferred — `hookText` is shown on
 the board but not burned, since a duplicate of the opening captions is worse than

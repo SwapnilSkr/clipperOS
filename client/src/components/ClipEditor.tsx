@@ -37,6 +37,9 @@ import {
   type CreatorPlan,
   type DirectorLane,
   type AudioAsset,
+  type EffectInfo,
+  type MediaAsset,
+  type TransitionInfo,
   type ClipEdit,
   type ClipPayload,
   type ClipSegment,
@@ -70,21 +73,29 @@ import {
 import { checkSceneCuts, sceneCutsInWindow } from "@/lib/cut-check";
 import {
   cameraStateAt,
+  followLead,
   followSigma,
   followTightness,
   followTightnessX,
   headTravel,
+  panPxAt,
   nextKeptTime,
   outputDuration,
   outputToSource,
   smoothedTrack,
+  heldTrack,
+  holdSpans,
   sourceToOutput,
+  windowIndexAt,
   windowsFor,
 } from "@/lib/creator-timeline";
 import { useLiveSoundtrack } from "@/lib/live-soundtrack";
 import { addBeat, enablePlan, removeBeat, type BeatLane } from "@/lib/beat-plan";
 import { rememberSfx } from "./SfxPicker";
-import { cropTransformFor, holdCropUntilCuts, paintCropPreview, sourceTimeOnTrack } from "@/lib/reframe";
+import { lastEffect } from "./EffectPicker";
+import { CutawayLayer } from "./CutawayLayer";
+import { activeEffectsAt, cssFilterFor, paintFxLayers } from "@/lib/fx-preview";
+import { cropTransformFor, holdCropUntilCuts, paintCropPreview, sourceTimeOnTrack, type Framing } from "@/lib/reframe";
 import { DEFAULT_VIDEO_EFFECTS, SHORT_FORM_TEMPLATES, resolveVideoEffects } from "@/lib/edit-templates";
 import { cn, formatBytes, timecode } from "@/lib/utils";
 import { CaptionSectionField, ColorControl, Panel, SegmentedButton, Slider, TimestampInput } from "./editor-controls";
@@ -192,6 +203,12 @@ export function ClipEditor({
   const matteRef = useRef<HTMLVideoElement>(null);
   const [beatSelection, setBeatSelection] = useState<BeatSelection | null>(null);
   const [audioLibrary, setAudioLibrary] = useState<AudioAsset[]>([]);
+  /** The effects pack, served once; labels for the lane, previews for the player. */
+  const [effectsRegistry, setEffectsRegistry] = useState<EffectInfo[]>([]);
+  /** Stills and videos for cutaways, plus which stock providers are configured. */
+  const [mediaLibrary, setMediaLibrary] = useState<MediaAsset[]>([]);
+  const [stockSources, setStockSources] = useState<("pexels" | "pixabay")[]>([]);
+  const [transitions, setTransitions] = useState<TransitionInfo[]>([]);
   const [trimStart, setTrimStart] = useState(clip.edit?.trimStartSec ?? clip.startSec);
   const [trimEnd, setTrimEnd] = useState(clip.edit?.trimEndSec ?? clip.endSec);
   const [segments, setSegments] = useState<ClipSegment[]>(
@@ -242,6 +259,12 @@ export function ClipEditor({
   const handingToOutroRef = useRef(false);
   const beginOutroRef = useRef<() => void>(() => undefined);
   const outroPlaythroughRef = useRef(false);
+  /** The freeze window the decoder is parked in, and when it entered. */
+  const freezeRef = useRef<{ startSec: number; endSec: number; enteredAt: number } | null>(null);
+  // Slow motion and a freeze fade the voice out, as the burn does. Decided on
+  // the decoder's clock (the playback timer), not on the presented-frame
+  // state, which lags it.
+  const [voiceDucked, setVoiceDucked] = useState(false);
   const titleId = useRef(`clip-editor-${clip.id}`).current;
   const migratedWordsFor = useRef<string | null>(null);
 
@@ -275,9 +298,9 @@ export function ClipEditor({
   const creatorWindows = useMemo(
     () =>
       creator.enabled && !isMerge
-        ? windowsFor(trimStart, trimEnd, creator.cuts)
+        ? windowsFor(trimStart, trimEnd, creator.cuts, creator.speed)
         : [{ startSec: trimStart, endSec: trimEnd }],
-    [creator.enabled, creator.cuts, isMerge, trimStart, trimEnd]
+    [creator.enabled, creator.cuts, creator.speed, isMerge, trimStart, trimEnd]
   );
   const creatorOutputSec = outputDuration(creatorWindows);
 
@@ -777,6 +800,33 @@ export function ClipEditor({
     void refreshAudioLibrary();
   }, [desk, project.id, audioLibrary.length]);
 
+  useEffect(() => {
+    if (effectsRegistry.length > 0 || (desk !== "create" && !creator.effects?.length)) return;
+    api
+      .listEffects()
+      .then(setEffectsRegistry)
+      .catch(() => undefined);
+  }, [desk, creator.effects?.length, effectsRegistry.length]);
+  const effectLabels = useMemo(() => new Map(effectsRegistry.map((item) => [item.id, item.label])), [effectsRegistry]);
+
+  const refreshMediaLibrary = useCallback(
+    () =>
+      api
+        .listMediaLibrary()
+        .then((result) => {
+          setMediaLibrary(result.assets);
+          setStockSources(result.stock);
+        })
+        .catch(() => undefined),
+    []
+  );
+  useEffect(() => {
+    if (desk !== "create" && !creator.cutaways?.length) return;
+    if (mediaLibrary.length === 0) void refreshMediaLibrary();
+    if (transitions.length === 0) api.listTransitions().then(setTransitions).catch(() => undefined);
+  }, [desk, creator.cutaways?.length, mediaLibrary.length, transitions.length, refreshMediaLibrary]);
+  const mediaLabels = useMemo(() => new Map(mediaLibrary.map((item) => [item.id, item.label])), [mediaLibrary]);
+
   function refreshAudioLibrary(): Promise<void> {
     return api
       .listAudioLibrary(project.id)
@@ -855,18 +905,47 @@ export function ClipEditor({
           ...prev,
           camera: { ...prev.camera, moves: patchSpan(prev.camera?.moves) },
         };
+      if (lane === "speed") return { ...prev, speed: patchSpan(prev.speed) };
+      if (lane === "fx") return { ...prev, effects: patchSpan(prev.effects) };
+      if (lane === "cutaways") return { ...prev, cutaways: patchSpan(prev.cutaways) };
       if (lane === "captions") return { ...prev, captionScenes: patchSpan(prev.captionScenes) };
       return { ...prev, titles: patchSpan(prev.titles) };
     });
   }
 
+  /**
+   * A file dropped on the B-roll lane: into the media library, then a cutaway
+   * at the drop point. Placed through a ref after the upload so the plan it
+   * adds to is the one on screen then, not the one from before the await.
+   */
+  async function dropMediaOnLane(file: File, sourceSec: number): Promise<void> {
+    if (!/^(image|video)\//.test(file.type) && !/\.(jpe?g|png|webp|gif|heic|mp4|mov|m4v|webm|mkv)$/i.test(file.name)) {
+      setActionError("Drop an image or a video on the B-roll lane.");
+      return;
+    }
+    setActionError(null);
+    try {
+      const asset = await api.uploadMedia(file);
+      await refreshMediaLibrary();
+      addBeatRef.current("cutaways", undefined, asset.id, sourceSec);
+    } catch (error: unknown) {
+      setActionError(messageOf(error));
+    }
+  }
+
   /** A lane's "+": the default beat at the playhead, selected for editing. Turns the plan on. */
-  function addBeatAtPlayhead(lane: BeatLane, sfx?: string) {
+  function addBeatAtPlayhead(lane: BeatLane, sfx?: string, assetId?: string, at = time) {
     const plan = enablePlan(creator, resolvedEffects, trimStart, trimEnd, clip.peakSec);
+    // A cutaway needs a picture: the newest in the library unless one was chosen.
+    const cutawayAsset = assetId ?? mediaLibrary[0]?.id;
+    if (lane === "cutaways" && !cutawayAsset) {
+      setActionError("Upload a still or video, or pick a stock shot, before placing a cutaway.");
+      return;
+    }
     const next = addBeat(
       lane,
       { plan, sfx: soundtrack.sfx ?? [] },
-      { at: time, trimStart, trimEnd, windows: creatorWindows, sfx }
+      { at, trimStart, trimEnd, windows: creatorWindows, sfx, effectId: lastEffect(), assetId: cutawayAsset }
     );
     if (!next) return;
     if (next.plan !== creator) setCreator(next.plan);
@@ -876,6 +955,12 @@ export function ClipEditor({
     }
     setBeatSelection({ lane, id: next.id });
   }
+
+  // The latest addBeatAtPlayhead, for work that resumes after an await.
+  const addBeatRef = useRef(addBeatAtPlayhead);
+  useEffect(() => {
+    addBeatRef.current = addBeatAtPlayhead;
+  });
 
   function removeBeatById(lane: BeatLane, id: string) {
     const next = removeBeat(lane, id, {
@@ -891,7 +976,17 @@ export function ClipEditor({
    * The Director writes the plan on the server from the STORED edit, so the
    * draft is flushed first; its answer then replaces the local plan and hits.
    */
-  async function directClip(input: { notes?: string; keep: DirectorLane[] }): Promise<void> {
+  /** Render a span exactly, with the draft flushed first so the burn sees what the desk shows. */
+  async function previewSpan(startSec: number, endSec: number): Promise<{ url: string; durationSec: number }> {
+    if (dirty) {
+      await onSave(buildDraft());
+      setSaved(snapshot());
+    }
+    const result = await api.previewClipSpan(clip.id, startSec, endSec);
+    return { url: result.url, durationSec: result.durationSec };
+  }
+
+  async function directClip(input: { notes?: string; keep: DirectorLane[] }): Promise<{ warnings: string[] }> {
     await onSave(buildDraft());
     setSaved(snapshot());
     const result = await api.directClip(clip.id, input);
@@ -903,6 +998,11 @@ export function ClipEditor({
     }));
     setBeatSelection(null);
     onClipUpdated?.(result.clip);
+    // A cutaway the Director found on stock is a new library asset.
+    if (next?.cutaways?.some((cutaway) => !mediaLibrary.some((asset) => asset.id === cutaway.assetId))) {
+      void refreshMediaLibrary();
+    }
+    return { warnings: result.warnings ?? [] };
   }
 
   async function prepareSource(): Promise<void> {
@@ -1051,17 +1151,31 @@ export function ClipEditor({
 
   const rawTrack = reframeMode === "smart" ? previewTrack : undefined;
   const tightness = isMerge ? 0 : followTightnessX(creator);
-  // A following camera rides the smoothed face path, as the burn does — by the plan's response.
+  // A following camera rides the smoothed face path, as the burn does — by the plan's response —
+  // and holds lock it off on top. Smoothing is memoised apart: it is the slow half.
   const following = !isMerge && followTightness(creator) > 0;
   const sigma = followSigma(creator);
-  const track = useMemo(
+  const smoothed = useMemo(
     () => (rawTrack && following ? smoothedTrack(rawTrack, sigma) : rawTrack),
     [rawTrack, following, sigma]
+  );
+  const holds = isMerge ? [] : holdSpans(creator);
+  const holdsKey = holds.map((hold) => `${hold.startSec}-${hold.endSec}`).join(",");
+  const track = useMemo(
+    () => (smoothed && holdsKey ? heldTrack(smoothed, holds) : smoothed),
+    // `holds` is keyed by value: a fresh array each render must not recompute.
+    [smoothed, holdsKey]
   );
   const travel = useMemo(() => headTravel(rawTrack), [rawTrack]);
   // Crop times are on the analysis origin, not the saved trim. Using the saved
   // in-point here is what brought the cut-flash back after Save.
   const cropOrigin = track?.originSec ?? trimStart;
+  // Lead room and a move's pan sit on top of the track, as in the burn.
+  const lead = isMerge ? 0 : followLead(creator);
+  const framingAt = useCallback(
+    (sourceSec: number): Framing => ({ lead, pan: isMerge ? { x: 0, y: 0 } : panPxAt(creator, track, sourceSec) }),
+    [lead, isMerge, creator, track]
+  );
   const transform = cropTransformFor(
     track,
     time - cropOrigin,
@@ -1069,7 +1183,8 @@ export function ClipEditor({
     sourceSize.h,
     frameWidth,
     frameHeight,
-    tightness
+    tightness,
+    framingAt(time)
   );
   // WYSIWYG only when the crop is showing: in "fit" the whole source is visible,
   // so a caption at the burned-in position would sit in the wrong place.
@@ -1096,6 +1211,7 @@ export function ClipEditor({
   useLiveSoundtrack({
     enabled: (desk === "mix" || desk === "create") && mode === "source",
     playing,
+    voiceDucked,
     localTime: playheadLocal,
     clipEndSec: clipWindowDur,
     outroSec: outroPlaythrough ? outroDur : 0,
@@ -1111,8 +1227,9 @@ export function ClipEditor({
   // motion keeps its CSS scale.
   const creatorCamera = creator.enabled && !isMerge;
   const previewZoom = creatorCamera ? 1 : motionZoom(resolvedEffects, localPreviewTime, peakAt);
+  const looksCss = creatorCamera ? cssFilterFor(activeEffectsAt(creator, effectsRegistry, time)) : "";
   const picturePreviewStyle = {
-    filter: previewFilter(resolvedEffects),
+    filter: `${previewFilter(resolvedEffects)} ${looksCss}`.replace(/\bnone\b ?/, "").trim() || "none",
     transform: `scale(${previewZoom})`,
     transformOrigin: "center",
   };
@@ -1131,6 +1248,7 @@ export function ClipEditor({
         const want = sourceSec - matte.originSec;
         if (Math.abs(matteVideo.currentTime - want) > 0.08 && !matteVideo.seeking) matteVideo.currentTime = want;
       }
+      const looks = creatorPaint ? activeEffectsAt(creator, effectsRegistry, sourceSec) : [];
       paintCropPreview(
         video,
         canvas,
@@ -1142,6 +1260,7 @@ export function ClipEditor({
         creatorPaint
           ? {
               camera: cameraStateAt(creator, track, sourceSec),
+              framing: framingAt(sourceSec),
               titles: creator.titles,
               sourceSec,
               matte:
@@ -1161,8 +1280,32 @@ export function ClipEditor({
             }
           : {}
       );
+      // Looks on top of the crop, on the kept window's clock (the burn's `t`).
+      if (looks.length > 0) {
+        const index = windowIndexAt(creatorWindows, sourceSec);
+        const windowStart = index >= 0 ? creatorWindows[index]!.startSec : trimStart;
+        paintFxLayers(canvas, looks, sourceSec - windowStart, (span) => ({
+          a: Math.max(0, span.startSec - windowStart),
+          b: span.endSec - windowStart,
+        }));
+      }
     },
-    [cropPreview, track, cropOrigin, sourceSize.w, sourceSize.h, tightness, creatorPaint, creator, matte, fontChoices]
+    [
+      cropPreview,
+      track,
+      cropOrigin,
+      sourceSize.w,
+      sourceSize.h,
+      tightness,
+      creatorPaint,
+      creator,
+      matte,
+      fontChoices,
+      framingAt,
+      effectsRegistry,
+      creatorWindows,
+      trimStart,
+    ]
   );
 
   // Paint only when the browser has presented a decoded video frame. An rAF can
@@ -1178,6 +1321,8 @@ export function ClipEditor({
     let raf = 0;
 
     const present = (mediaTime: number) => {
+      // While a freeze holds the picture, the clock is the freeze timer's.
+      if (freezeRef.current) return;
       setTime(mediaTime);
       paintPreview(mediaTime);
       if (!video.paused && mediaTime >= active.endSec - 0.03) {
@@ -1219,21 +1364,62 @@ export function ClipEditor({
   // runs on a timer rather than the frame callback (a heavy 4K source presents
   // frames sparsely at the start of playback) or rAF (frozen in a background
   // tab): the skip has to land on the clock, not on the next painted picture.
+  //
+  // Speed spans ride the same timer: the decoder's playbackRate follows the
+  // window's rate, and a freeze parks the decoder (at the slowest rate the
+  // browser allows, so it never pauses) while this timer runs the clock 1:1
+  // on the held frame, as the burn's freezeframe does.
+  const retimed = creatorWindows.some((window) => (window.rate ?? 1) !== 1);
   useEffect(() => {
-    if (!playing || creatorWindows.length <= 1) return;
     const video = videoRef.current;
     if (!video) return;
+    if (!playing || (creatorWindows.length <= 1 && !retimed)) {
+      freezeRef.current = null;
+      video.playbackRate = 1;
+      setVoiceDucked(false);
+      return;
+    }
     const tick = () => {
       if (video.paused || video.seeking) return;
+      const frozen = freezeRef.current;
+      if (frozen) {
+        const elapsed = (performance.now() - frozen.enteredAt) / 1000;
+        if (elapsed >= frozen.endSec - frozen.startSec) {
+          freezeRef.current = null;
+          video.currentTime = Math.min(active.endSec - 0.02, frozen.endSec + 0.001);
+          video.playbackRate = 1;
+        } else {
+          setTime(frozen.startSec + elapsed);
+        }
+        return;
+      }
       const now = video.currentTime;
       const kept = nextKeptTime(creatorWindows, now);
       if (kept > now + 0.02 && kept < active.endSec - 0.03) {
         video.currentTime = kept;
+        return;
       }
+      const index = windowIndexAt(creatorWindows, now);
+      const window_ = index >= 0 ? creatorWindows[index]! : undefined;
+      const rate = window_?.rate ?? 1;
+      setVoiceDucked(rate < 1);
+      if (window_ && rate === 0) {
+        freezeRef.current = { startSec: window_.startSec, endSec: window_.endSec, enteredAt: performance.now() };
+        video.playbackRate = MIN_BROWSER_RATE;
+        paintPreview(window_.startSec);
+        return;
+      }
+      const wanted = Math.max(MIN_BROWSER_RATE, Math.min(16, rate));
+      if (Math.abs(video.playbackRate - wanted) > 1e-3) video.playbackRate = wanted;
     };
     const timer = window.setInterval(tick, 33);
-    return () => window.clearInterval(timer);
-  }, [playing, creatorWindows, active.endSec]);
+    return () => {
+      window.clearInterval(timer);
+      freezeRef.current = null;
+      video.playbackRate = 1;
+      setVoiceDucked(false);
+    };
+  }, [playing, creatorWindows, retimed, active.endSec, paintPreview]);
 
   useEffect(() => {
     if (playing) return;
@@ -1666,6 +1852,9 @@ export function ClipEditor({
                   className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_center,transparent_52%,rgba(0,0,0,0.32)_100%)]"
                 />
               ) : null}
+              {cropPreview && creatorCamera && creator.cutaways?.length ? (
+                <CutawayLayer plan={creator} assets={mediaLibrary} sourceSec={time} playing={playing} />
+              ) : null}
               {positioningCaptions ? (
                 <div
                   aria-hidden="true"
@@ -1957,6 +2146,8 @@ export function ClipEditor({
               sfx={soundtrack.sfx ?? []}
               sfxLabels={sfxLabelMap}
               sfxAssets={sfxAssets}
+              effectLabels={effectLabels}
+              mediaLabels={mediaLabels}
               sceneCuts={sceneCuts}
               peakSec={clip.peakSec}
               playhead={time}
@@ -1970,6 +2161,7 @@ export function ClipEditor({
               onAdd={(lane) => addBeatAtPlayhead(lane)}
               onAddSfx={(assetId) => addBeatAtPlayhead("sfx", assetId)}
               onRemove={removeBeatById}
+              onDropMedia={dropMediaOnLane}
               dimmed={!creator.enabled}
             />
           </div>
@@ -2015,6 +2207,16 @@ export function ClipEditor({
               onSelect={setBeatSelection}
               hasFaceTrack={Boolean(track?.keyframes.some((keyframe) => keyframe.fx != null))}
               headTravel={travel}
+              videoRef={videoRef}
+              track={track}
+              cropOrigin={cropOrigin}
+              effects={effectsRegistry}
+              onPreviewSpan={previewSpan}
+              mediaLibrary={mediaLibrary}
+              stockSources={stockSources}
+              transitions={transitions}
+              onMediaChanged={refreshMediaLibrary}
+              onPlaceCutaway={(assetId) => addBeatAtPlayhead("cutaways", undefined, assetId)}
               audioLibrary={audioLibrary}
               onUploadAudio={uploadAudio}
               onDirect={directClip}
@@ -2873,6 +3075,9 @@ function motionZoom(effects: Required<VideoEffects>, localTime: number, peakAt: 
   }
   return 1;
 }
+
+/** The slowest rate browsers accept for playbackRate; below it they throw. */
+const MIN_BROWSER_RATE = 0.0625;
 
 function previewFilter(effects: Required<VideoEffects>): string {
   const grade = {

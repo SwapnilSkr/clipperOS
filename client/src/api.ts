@@ -39,9 +39,103 @@ export interface PauseCut {
   source: "director" | "user";
 }
 
-export type CameraMoveKind = "punch" | "push" | "pull";
+export type SpeedKind = "slow" | "fast" | "freeze";
+
+export interface SpeedSpan {
+  id: string;
+  startSec: number;
+  endSec: number;
+  kind: SpeedKind;
+  rate: number;
+  smooth?: boolean;
+  captions?: boolean;
+}
+
+export type CutawayMotion = "none" | "in" | "out" | "left" | "right" | "up" | "down";
+
+export interface Cutaway {
+  id: string;
+  startSec: number;
+  endSec: number;
+  assetId: string;
+  fit: "cover" | "blur";
+  motion: CutawayMotion;
+  in: { transitionId: string; sec: number };
+  out: { transitionId: string; sec: number };
+  offsetSec?: number;
+}
+
+export interface MediaAsset {
+  id: string;
+  kind: "image" | "video";
+  source: "upload" | "pexels" | "pixabay";
+  label: string;
+  width: number;
+  height: number;
+  durationSec?: number;
+  attribution?: string;
+  sourceUrl?: string;
+}
+
+export interface TransitionInfo {
+  id: string;
+  label: string;
+  summary: string;
+}
+
+export interface StockResult {
+  source: "pexels" | "pixabay";
+  id: string;
+  kind: "image" | "video";
+  label: string;
+  width: number;
+  height: number;
+  durationSec?: number;
+  thumbUrl: string;
+  attribution: string;
+  sourceUrl: string;
+}
+
+export interface EffectSpan {
+  id: string;
+  effectId: string;
+  startSec: number;
+  endSec: number;
+  amount: number;
+  variant?: string;
+}
+
+export type EffectGroup = "colour" | "texture" | "motion" | "glitch" | "frame";
+export type CssPreview = Partial<
+  Record<"grayscale" | "sepia" | "saturate" | "contrast" | "brightness" | "invert" | "blur" | "hue-rotate", [number, number]>
+>;
+export type PreviewLayer =
+  | "grain"
+  | "scanlines"
+  | "rgbsplit"
+  | "flicker"
+  | "strobe"
+  | "bars"
+  | "vignette"
+  | "pixelate"
+  | "shake"
+  | "pulse"
+  | "glitch"
+  | "fadeblack"
+  | "fadewhite"
+  | "posterize";
+export interface EffectInfo {
+  id: string;
+  label: string;
+  group: EffectGroup;
+  summary: string;
+  variants?: { id: string; label: string }[];
+  preview: { css?: CssPreview; layers?: PreviewLayer[] };
+}
+
+export type CameraMoveKind = "punch" | "push" | "pull" | "frame" | "hold";
 export type CameraEase = "cut" | "out" | "in_out";
-export type CameraAnchor = "face" | "center" | { x: number; y: number };
+export type CameraAnchor = "face" | "center" | "look" | { x: number; y: number };
 
 export interface CameraMove {
   id: string;
@@ -49,6 +143,9 @@ export interface CameraMove {
   startSec: number;
   endSec: number;
   zoom: number;
+  zoomFrom?: number;
+  pan?: { x: number; y: number };
+  rampSec?: number;
   anchor: CameraAnchor;
   ease: CameraEase;
 }
@@ -62,6 +159,7 @@ export interface CameraFollow {
   zoom?: number;
   response?: FollowResponse;
   axis?: FollowAxis;
+  lead?: number;
 }
 
 export interface CameraPlan {
@@ -95,11 +193,20 @@ export interface BehindTitle {
   depth: "behind" | "front";
 }
 
+/** One Director pass: what the creator asked, what the Director said it did. */
+export interface DirectorTurn {
+  notes?: string;
+  summary: string;
+  at: string;
+}
+
 export interface DirectorNotes {
   notes?: string;
   summary?: string;
   generatedAt?: string;
   model?: string;
+  /** The last passes, oldest first. */
+  turns?: DirectorTurn[];
 }
 
 export interface CreatorPlan {
@@ -109,17 +216,27 @@ export interface CreatorPlan {
   camera?: CameraPlan;
   captionScenes?: CaptionScene[];
   titles?: BehindTitle[];
+  speed?: SpeedSpan[];
+  effects?: EffectSpan[];
+  cutaways?: Cutaway[];
   director?: DirectorNotes;
 }
 
 export const MAX_PAUSE_CUTS = 40;
+export const MAX_SPEED_SPANS = 12;
+export const MAX_EFFECT_SPANS = 24;
+export const MAX_CUTAWAYS = 8;
+export const MAX_TRANSITION_SEC = 1.5;
+export const MIN_SPEED_RATE = 0.2;
+export const MAX_SPEED_RATE = 3;
 export const MAX_CAMERA_MOVES = 24;
 export const MAX_CAPTION_SCENES = 12;
 export const MAX_TITLES = 6;
 export const MAX_CAMERA_ZOOM = 1.5;
+export const MIN_CAMERA_ZOOM = 0.75;
 export const MAX_FOLLOW_ZOOM = 1.3;
 
-export type DirectorLane = "cuts" | "camera" | "captions" | "titles" | "sfx";
+export type DirectorLane = "cuts" | "camera" | "speed" | "fx" | "cutaways" | "captions" | "titles" | "sfx";
 
 export interface MatteInfo {
   ready: boolean;
@@ -297,6 +414,9 @@ export interface CropKeyframe {
   fx?: number;
   fy?: number;
   fw?: number;
+  fyaw?: number;
+  /** Pins a creator-mode hold's plateau (never from the analyser). */
+  held?: boolean;
 }
 
 /** The framing the renderer will use, so the preview can reproduce it exactly. */
@@ -662,7 +782,7 @@ export const api = {
 
   /** One Director pass: writes a beat plan (and SFX hits) for the clip. */
   directClip: (id: string, input: { notes?: string; keep?: DirectorLane[] } = {}) =>
-    request<{ clip: ClipPayload; summary: string; model: string }>(`/clips/${id}/direct`, {
+    request<{ clip: ClipPayload; summary: string; model: string; warnings?: string[] }>(`/clips/${id}/direct`, {
       method: "POST",
       body: JSON.stringify(input),
     }),
@@ -670,6 +790,38 @@ export const api = {
   /** Build (or confirm) the person matte behind-subject titles need in the preview. */
   buildClipMatte: (id: string) =>
     request<MatteInfo>(`/clips/${id}/matte`, { method: "POST" }),
+
+  /** The effects pack: served, so the desk, the preview and the burn agree. */
+  listEffects: () => request<EffectInfo[]>("/effects"),
+
+  /** How a cutaway may arrive and leave. */
+  listTransitions: () => request<TransitionInfo[]>("/transitions"),
+
+  /** Stills and videos for cutaways, newest first, and which stock providers have a key. */
+  listMediaLibrary: () => request<{ assets: MediaAsset[]; stock: ("pexels" | "pixabay")[] }>("/media-library"),
+
+  uploadMedia: (file: File) => {
+    const form = new FormData();
+    form.append("file", file);
+    return request<MediaAsset>("/media-library", { method: "POST", body: form });
+  },
+
+  deleteMedia: (id: string) => request<{ deleted: boolean }>(`/media-library/${id}`, { method: "DELETE" }),
+
+  searchStock: (q: string, kind: "image" | "video") =>
+    request<{ results: StockResult[]; sources: ("pexels" | "pixabay")[] }>(
+      `/stock/search?q=${encodeURIComponent(q)}&kind=${kind}`
+    ),
+
+  pickStock: (input: { source: "pexels" | "pixabay"; id: string; kind: "image" | "video"; query: string }) =>
+    request<MediaAsset>("/stock/pick", { method: "POST", body: JSON.stringify(input) }),
+
+  /** Render [startSec, endSec] exactly, with the stored plan; the URL streams the file. */
+  previewClipSpan: (id: string, startSec: number, endSec: number) =>
+    request<{ key: string; durationSec: number; url: string }>(`/clips/${id}/preview-span`, {
+      method: "POST",
+      body: JSON.stringify({ startSec, endSec }),
+    }),
 
   /** The available caption looks. Served, not hardcoded. */
   listCaptionStyles: () => request<CaptionStyleInfo[]>("/caption-styles"),
@@ -762,6 +914,14 @@ export function clipDownloadUrl(
 
 export function clipMatteUrl(clipId: string, bust: string): string {
   return `${BASE}/clips/${clipId}/matte?v=${encodeURIComponent(bust)}`;
+}
+
+export function mediaFileUrl(id: string): string {
+  return `${BASE}/media-library/${id}/file`;
+}
+
+export function mediaThumbUrl(id: string): string {
+  return `${BASE}/media-library/${id}/thumb`;
 }
 
 export function builtinAudioUrl(id: string): string {

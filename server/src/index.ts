@@ -4,7 +4,18 @@ import { cors } from "@elysiajs/cors";
 import "./config/ffmpeg-bootstrap";
 import { config, validateConfig } from "./config";
 import { connectDatabase } from "./db";
-import { captionStyleRoutes, clipRoutes, genreRoutes, projectRoutes, uploadRoutes, audioLibraryRoutes } from "./routes";
+import {
+  captionStyleRoutes,
+  clipRoutes,
+  genreRoutes,
+  projectRoutes,
+  uploadRoutes,
+  audioLibraryRoutes,
+  effectRoutes,
+  mediaLibraryRoutes,
+  stockRoutes,
+  transitionRoutes,
+} from "./routes";
 import { assertRedisReady } from "./queue/queues";
 import { startWorkers } from "./queue/workers";
 import {
@@ -14,6 +25,7 @@ import {
   sweepUnownedLocalOutputs,
 } from "./services/storage-custody.service";
 import { loadSharedAudioLibrary, sweepOrphanedAudio } from "./services/soundtrack.service";
+import { sweepUnreferencedStock } from "./services/media-library.service";
 import { loadSharedOutroLibrary, sweepOrphanedOutros } from "./services/outro.service";
 import { initializeStorage, sweepProcessingDir } from "./utils";
 import { getErrorMessage } from "./types";
@@ -38,6 +50,7 @@ function runCustodySweep(label: string): void {
     sweepMediaFragments(),
     sweepOrphanedAudio(),
     sweepOrphanedOutros(),
+    sweepUnreferencedStock(),
   ]).catch((error: unknown) => {
     console.error(`⚠️  Storage sweep (${label}) failed: ${getErrorMessage(error)}`);
   });
@@ -145,7 +158,11 @@ const app = new Elysia({
   .use(uploadRoutes)
   .use(genreRoutes)
   .use(captionStyleRoutes)
-  .use(audioLibraryRoutes);
+  .use(audioLibraryRoutes)
+  .use(effectRoutes)
+  .use(mediaLibraryRoutes)
+  .use(stockRoutes)
+  .use(transitionRoutes);
 
 // Nothing in this process listens for a rejected promise, so a stray one from a
 // background worker surfaces only as a default warning from the runtime, if at

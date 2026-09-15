@@ -11,6 +11,8 @@ import {
   directClipRoute,
   mergeClips,
   previewClipReframe,
+  previewClipSpan,
+  streamClipSpanPreview,
   renderClips,
   updateClip,
   writeClipShareCopy,
@@ -24,6 +26,8 @@ import {
   DirectClipBody,
   MergeClipsBody,
   PreviewReframeBody,
+  PreviewSpanBody,
+  ClipSpanPreviewParams,
   RenderClipsBody,
   ShareCopyBody,
   UpdateClipBody,
@@ -48,4 +52,6 @@ export const clipRoutes = new Elysia({ prefix: "/api/clips" })
   .post("/:id/reframe/preview", previewClipReframe, {
     params: ClipParams,
     body: PreviewReframeBody,
-  });
+  })
+  .post("/:id/preview-span", previewClipSpan, { params: ClipParams, body: PreviewSpanBody })
+  .get("/:id/preview-span/:key", streamClipSpanPreview, { params: ClipSpanPreviewParams });

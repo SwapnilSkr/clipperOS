@@ -2,14 +2,20 @@ import {
   MAX_CAMERA_MOVES,
   MAX_CAMERA_ZOOM,
   MAX_CAPTION_SCENES,
+  MAX_CUTAWAYS,
+  MAX_EFFECT_SPANS,
   MAX_PAUSE_CUTS,
+  MAX_SPEED_SPANS,
   MAX_TITLES,
   type BehindTitle,
   type CameraMove,
   type CaptionScene,
   type CreatorPlan,
+  type Cutaway,
+  type EffectSpan,
   type PauseCut,
   type SoundtrackHit,
+  type SpeedSpan,
   type VideoEffects,
 } from "@/api";
 import { sourceToOutput, type TimeWindow } from "./creator-timeline";
@@ -20,12 +26,13 @@ import { sourceToOutput, type TimeWindow } from "./creator-timeline";
 // React state; callers spread the result into their draft.
 // ============================================================
 
-export type BeatLane = "cuts" | "camera" | "captions" | "titles" | "sfx";
+export type BeatLane = "cuts" | "camera" | "speed" | "fx" | "cutaways" | "captions" | "titles" | "sfx";
 
 export const MAX_SOUNDTRACK_HITS = 16;
 
 /** The default sound a new SFX pin carries until the inspector changes it. */
 export const DEFAULT_SFX = "whoosh";
+export const DEFAULT_EFFECT = "bw";
 
 export interface BeatContext {
   /** Playhead, source seconds. */
@@ -35,6 +42,10 @@ export interface BeatContext {
   windows: TimeWindow[];
   /** The sound for a new SFX hit; the built-in whoosh when absent. */
   sfx?: string;
+  /** The effect for a new FX span; black & white when absent. */
+  effectId?: string;
+  /** The media asset for a new cutaway (required for that lane). */
+  assetId?: string;
 }
 
 export interface BeatState {
@@ -56,6 +67,12 @@ export function laneFull(lane: BeatLane, plan: CreatorPlan, sfx: SoundtrackHit[]
       return (plan.cuts?.length ?? 0) >= MAX_PAUSE_CUTS;
     case "camera":
       return (plan.camera?.moves.length ?? 0) >= MAX_CAMERA_MOVES;
+    case "speed":
+      return (plan.speed?.length ?? 0) >= MAX_SPEED_SPANS;
+    case "fx":
+      return (plan.effects?.length ?? 0) >= MAX_EFFECT_SPANS;
+    case "cutaways":
+      return (plan.cutaways?.length ?? 0) >= MAX_CUTAWAYS;
     case "captions":
       return (plan.captionScenes?.length ?? 0) >= MAX_CAPTION_SCENES;
     case "titles":
@@ -108,6 +125,36 @@ export function addBeat(lane: BeatLane, state: BeatState, ctx: BeatContext): (Be
         sfx,
         id: move.id,
       };
+    }
+    case "speed": {
+      // Half speed for a second: the classic slow-motion beat.
+      const span: SpeedSpan = { id: newId("speed"), startSec: at, endSec: until(1), kind: "slow", rate: 0.5 };
+      return { plan: { ...plan, speed: [...(plan.speed ?? []), span] }, sfx, id: span.id };
+    }
+    case "fx": {
+      const span: EffectSpan = {
+        id: newId("fx"),
+        effectId: ctx.effectId ?? DEFAULT_EFFECT,
+        startSec: at,
+        endSec: until(2),
+        amount: 0.7,
+      };
+      return { plan: { ...plan, effects: [...(plan.effects ?? []), span] }, sfx, id: span.id };
+    }
+    case "cutaways": {
+      if (!ctx.assetId) return null;
+      // Two seconds of B-roll with a soft dissolve either side, drifting in.
+      const cutaway: Cutaway = {
+        id: newId("cut"),
+        startSec: at,
+        endSec: until(2),
+        assetId: ctx.assetId,
+        fit: "cover",
+        motion: "in",
+        in: { transitionId: "dissolve", sec: 0.3 },
+        out: { transitionId: "dissolve", sec: 0.3 },
+      };
+      return { plan: { ...plan, cutaways: [...(plan.cutaways ?? []), cutaway] }, sfx, id: cutaway.id };
     }
     case "captions": {
       const scenes = plan.captionScenes ?? [];
@@ -178,6 +225,12 @@ export function removeBeat(lane: BeatLane, id: string, state: BeatState): BeatSt
         },
         sfx,
       };
+    case "speed":
+      return { plan: { ...plan, speed: (plan.speed ?? []).filter((span) => span.id !== id) }, sfx };
+    case "fx":
+      return { plan: { ...plan, effects: (plan.effects ?? []).filter((span) => span.id !== id) }, sfx };
+    case "cutaways":
+      return { plan: { ...plan, cutaways: (plan.cutaways ?? []).filter((item) => item.id !== id) }, sfx };
     case "captions":
       return {
         plan: {

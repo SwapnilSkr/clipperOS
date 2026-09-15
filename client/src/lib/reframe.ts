@@ -1,5 +1,5 @@
 import type { BehindTitle, CropKeyframe, ReframeTrack } from "@/api";
-import { followCx, type CameraState } from "@/lib/creator-timeline";
+import { followCx, type CameraState, type PanPx } from "@/lib/creator-timeline";
 import { activeTitles, titleEntranceAt, titleFontPx, wrapTitle, TITLE_DEFAULT_FONT } from "@/lib/titles";
 
 // ============================================================
@@ -51,13 +51,34 @@ export function centreCrop(sourceWidth: number, sourceHeight: number): CropKeyfr
  * Falls back to a centred 9:16 window when no track is stored, which is what
  * fixes the framing of a clip that has never been analysed or rendered.
  */
+/** Creator-mode framing on top of the track: follow lead room and a camera pan. */
+export interface Framing {
+  lead?: number;
+  /** Source pixels, from creator-timeline panPxAt. */
+  pan?: PanPx;
+}
+
 export function cropAtTime(
   track: ReframeTrack | undefined,
   seconds: number,
   sourceWidth: number,
   sourceHeight: number,
   /** Creator mode's follow: blend the seat crop toward the recorded face. */
-  tightness = 0
+  tightness = 0,
+  framing: Framing = {}
+): CropKeyframe {
+  const panned = (keyframe: CropKeyframe): CropKeyframe =>
+    framing.pan ? { ...keyframe, cx: keyframe.cx + framing.pan.x, cy: keyframe.cy + framing.pan.y } : keyframe;
+  return panned(trackedCropAtTime(track, seconds, sourceWidth, sourceHeight, tightness, framing.lead ?? 0));
+}
+
+function trackedCropAtTime(
+  track: ReframeTrack | undefined,
+  seconds: number,
+  sourceWidth: number,
+  sourceHeight: number,
+  tightness: number,
+  lead: number
 ): CropKeyframe {
   const fallback = centreCrop(sourceWidth, sourceHeight);
   if (!track || track.keyframes.length === 0) return fallback;
@@ -76,9 +97,9 @@ export function cropAtTime(
       break;
     }
   }
-  const previous = { ...previousKey, cx: followCx(previousKey, tightness, sourceWidth) };
+  const previous = { ...previousKey, cx: followCx(previousKey, tightness, sourceWidth, lead) };
   if (!upcomingKey) return previous;
-  const upcoming = { ...upcomingKey, cx: followCx(upcomingKey, tightness, sourceWidth) };
+  const upcoming = { ...upcomingKey, cx: followCx(upcomingKey, tightness, sourceWidth, lead) };
 
   // Across a camera cut the crop holds then snaps. Interpolating here is what
   // makes the next speaker's head slide in from the side of the 9:16 window.
@@ -146,10 +167,11 @@ export function cropTransformFor(
   sourceHeight: number,
   frameWidth: number,
   frameHeight: number,
-  tightness = 0
+  tightness = 0,
+  framing: Framing = {}
 ): CropTransform {
   return cropLayoutFor(
-    cropAtTime(track, seconds, sourceWidth, sourceHeight, tightness),
+    cropAtTime(track, seconds, sourceWidth, sourceHeight, tightness, framing),
     sourceWidth,
     sourceHeight,
     frameWidth,
@@ -209,6 +231,8 @@ export interface PaintExtras {
   matte?: { video: HTMLVideoElement; width: number; height: number } | null;
   /** CSS font stack + weight for a title's family. */
   fontFor?: (family: string) => { stack: string; weight: number };
+  /** Lead room and pan on the crop, as the burn applies them. */
+  framing?: Framing;
 }
 
 /** The part of the crop box that survives a zoom converging on (ax, ay). */
@@ -318,7 +342,11 @@ export function paintCropPreview(
   if (video.readyState < 2 || sourceWidth < 2 || sourceHeight < 2) return;
   const ctx = canvas.getContext("2d");
   if (!ctx || canvas.width < 2 || canvas.height < 2) return;
-  const crop = cropBoxFor(cropAtTime(track, clipTime, sourceWidth, sourceHeight, tightness), sourceWidth, sourceHeight);
+  const crop = cropBoxFor(
+    cropAtTime(track, clipTime, sourceWidth, sourceHeight, tightness, extras.framing),
+    sourceWidth,
+    sourceHeight
+  );
   const box = zoomedBox(crop, extras.camera);
   ctx.drawImage(video, box.x, box.y, box.width, box.height, 0, 0, canvas.width, canvas.height);
 

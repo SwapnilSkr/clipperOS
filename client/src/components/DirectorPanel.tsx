@@ -1,20 +1,25 @@
 import { useState } from "react";
 import { Clapperboard, Loader2 } from "lucide-react";
-import type { DirectorLane, DirectorNotes } from "@/api";
+import type { DirectorLane, DirectorNotes, DirectorTurn } from "@/api";
 import { cn } from "@/lib/utils";
 import { Panel } from "./editor-controls";
 
 // ============================================================
-// DIRECTOR PANEL — the one-click plan, and the notes to redirect it.
+// DIRECTOR PANEL — the one-click plan, and a short conversation to redirect it.
 //
 // Nothing here changes the plan directly: the editor flushes its draft, asks
-// the server for a pass, then adopts the returned plan. "Keep" locks are how
-// a second pass iterates instead of reshuffling.
+// the server for a pass, then adopts the returned plan. Each pass is kept as
+// a turn (the note, and what the Director said it did), and the server hands
+// the last few back to the model, so a note builds on the ones before it.
+// "Lock" chips are how a pass leaves a lane alone.
 // ============================================================
 
 const LANES: { id: DirectorLane; label: string }[] = [
   { id: "cuts", label: "Cuts" },
   { id: "camera", label: "Camera" },
+  { id: "speed", label: "Speed" },
+  { id: "fx", label: "FX" },
+  { id: "cutaways", label: "B-roll" },
   { id: "captions", label: "Captions" },
   { id: "titles", label: "Titles" },
   { id: "sfx", label: "SFX" },
@@ -25,20 +30,25 @@ export interface DirectorPanelProps {
   /** True once a plan exists, so the button reads as a redirect. */
   hasPlan: boolean;
   disabled?: boolean;
-  onDirect: (input: { notes?: string; keep: DirectorLane[] }) => Promise<void>;
+  onDirect: (input: { notes?: string; keep: DirectorLane[] }) => Promise<{ warnings: string[] }>;
 }
 
 export function DirectorPanel({ director, hasPlan, disabled, onDirect }: DirectorPanelProps) {
-  const [notes, setNotes] = useState(director?.notes ?? "");
+  const [notes, setNotes] = useState("");
   const [keep, setKeep] = useState<DirectorLane[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [warnings, setWarnings] = useState<string[]>([]);
 
   async function run() {
     setBusy(true);
     setError(null);
+    setWarnings([]);
     try {
-      await onDirect({ notes: notes.trim() || undefined, keep });
+      const result = await onDirect({ notes: notes.trim() || undefined, keep });
+      setWarnings(result.warnings);
+      // The note now lives in the conversation below.
+      setNotes("");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -50,6 +60,15 @@ export function DirectorPanel({ director, hasPlan, disabled, onDirect }: Directo
     setKeep((prev) => (prev.includes(lane) ? prev.filter((item) => item !== lane) : [...prev, lane]));
   }
 
+  // Plans directed before turns existed only carry the last notes and summary.
+  const turns: DirectorTurn[] = director?.turns?.length
+    ? director.turns
+    : director?.summary
+      ? [{ notes: director.notes, summary: director.summary, at: director.generatedAt ?? "" }]
+      : [];
+  const latest = turns[turns.length - 1];
+  const earlier = turns.slice(0, -1);
+
   return (
     <Panel title="AI Director" icon={Clapperboard}>
       <textarea
@@ -57,7 +76,11 @@ export function DirectorPanel({ director, hasPlan, disabled, onDirect }: Directo
         onChange={(event) => setNotes(event.target.value)}
         rows={2}
         maxLength={600}
-        placeholder={hasPlan ? "Notes — harder hook, fewer zooms, calmer captions…" : "Notes (optional)"}
+        placeholder={
+          hasPlan
+            ? "Slow-mo the last line, VHS on the hook, cut to a server room on “compute”…"
+            : "Notes (optional) — harder hook, a freeze on the punchline, B-roll of…"
+        }
         aria-label="Notes for the Director"
         onKeyDown={(event) => {
           if (event.key === "Enter" && (event.metaKey || event.ctrlKey) && !busy && !disabled) void run();
@@ -100,14 +123,47 @@ export function DirectorPanel({ director, hasPlan, disabled, onDirect }: Directo
         {busy ? "Directing…" : hasPlan ? "Redirect" : "Direct this clip"}
       </button>
       {error ? <p className="text-meta mt-2 text-bad">{error}</p> : null}
-      {director?.summary ? (
-        <details className="mt-2">
-          <summary className="text-micro cursor-pointer text-muted hover:text-fg">Why the Director chose this</summary>
-          <p className="text-meta mt-1.5 leading-relaxed text-muted" title={director.model}>
-            {director.summary}
-          </p>
-        </details>
+      {warnings.length > 0 ? (
+        <ul className="mt-2 space-y-1">
+          {warnings.map((warning) => (
+            <li key={warning} className="text-meta text-warn">
+              {warning}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+      {latest ? (
+        <div className="mt-3 space-y-2 border-t border-border pt-2">
+          {earlier.length > 0 ? (
+            <details>
+              <summary className="text-micro cursor-pointer text-muted hover:text-fg">
+                Earlier passes ({earlier.length})
+              </summary>
+              <div className="mt-1.5 space-y-2">
+                {earlier.map((turn, index) => (
+                  <TurnView key={`${turn.at}-${index}`} turn={turn} compact />
+                ))}
+              </div>
+            </details>
+          ) : null}
+          <TurnView turn={latest} model={director?.model} />
+        </div>
       ) : null}
     </Panel>
+  );
+}
+
+function TurnView({ turn, compact, model }: { turn: DirectorTurn; compact?: boolean; model?: string }) {
+  return (
+    <div className="space-y-1">
+      <p className="text-meta text-fg">
+        <span className="text-micro mr-1.5 font-semibold uppercase tracking-wide text-muted">You</span>
+        {turn.notes ? `“${turn.notes}”` : <span className="text-muted">No notes</span>}
+      </p>
+      <p className={cn("text-meta leading-relaxed text-muted", compact && "line-clamp-2")} title={model}>
+        <span className="text-micro mr-1.5 font-semibold uppercase tracking-wide text-accent">Director</span>
+        {turn.summary}
+      </p>
+    </div>
   );
 }

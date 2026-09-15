@@ -116,6 +116,50 @@ const captionOverridesSchema = new Schema(
 );
 
 // ---- creator mode: the beat plan ----
+const speedSpanSchema = new Schema(
+  {
+    id: { type: String, required: true, trim: true, maxlength: 64 },
+    startSec: { type: Number, required: true, min: 0 },
+    endSec: { type: Number, required: true, min: 0 },
+    kind: { type: String, enum: ["slow", "fast", "freeze"], required: true },
+    rate: { type: Number, required: true, min: 0, max: 3 },
+    smooth: { type: Boolean },
+    captions: { type: Boolean },
+  },
+  { _id: false }
+);
+
+const effectSpanSchema = new Schema(
+  {
+    id: { type: String, required: true, trim: true, maxlength: 64 },
+    effectId: { type: String, required: true, trim: true, maxlength: 40 },
+    startSec: { type: Number, required: true, min: 0 },
+    endSec: { type: Number, required: true, min: 0 },
+    amount: { type: Number, required: true, min: 0, max: 1 },
+    variant: { type: String, trim: true, maxlength: 20 },
+  },
+  { _id: false }
+);
+
+const cutawayEdgeSchema = new Schema(
+  { transitionId: { type: String, required: true, maxlength: 24 }, sec: { type: Number, required: true, min: 0, max: 1.5 } },
+  { _id: false }
+);
+const cutawaySchema = new Schema(
+  {
+    id: { type: String, required: true, trim: true, maxlength: 64 },
+    startSec: { type: Number, required: true, min: 0 },
+    endSec: { type: Number, required: true, min: 0 },
+    assetId: { type: String, required: true, maxlength: 64 },
+    fit: { type: String, enum: ["cover", "blur"], required: true },
+    motion: { type: String, enum: ["none", "in", "out", "left", "right", "up", "down"], required: true },
+    in: { type: cutawayEdgeSchema, required: true },
+    out: { type: cutawayEdgeSchema, required: true },
+    offsetSec: { type: Number, min: 0 },
+  },
+  { _id: false }
+);
+
 const pauseCutSchema = new Schema(
   {
     id: { type: String, required: true, trim: true, maxlength: 64 },
@@ -130,11 +174,14 @@ const pauseCutSchema = new Schema(
 const cameraMoveSchema = new Schema(
   {
     id: { type: String, required: true, trim: true, maxlength: 64 },
-    kind: { type: String, enum: ["punch", "push", "pull"], required: true },
+    kind: { type: String, enum: ["punch", "push", "pull", "frame", "hold"], required: true },
     startSec: { type: Number, required: true, min: 0 },
     endSec: { type: Number, required: true, min: 0 },
-    zoom: { type: Number, required: true, min: 1, max: 1.5 },
-    // "face" | "center" | { x, y } — a union, so Mixed.
+    zoom: { type: Number, required: true, min: 0.75, max: 1.5 },
+    zoomFrom: { type: Number, min: 0.75, max: 1.5 },
+    pan: { type: new Schema({ x: { type: Number, required: true }, y: { type: Number, required: true } }, { _id: false }) },
+    rampSec: { type: Number, min: 0, max: 10 },
+    // "face" | "center" | "look" | { x, y } — a union, so Mixed.
     anchor: { type: Schema.Types.Mixed, required: true },
     ease: { type: String, enum: ["cut", "out", "in_out"], required: true },
   },
@@ -187,6 +234,7 @@ const creatorPlanSchema = new Schema(
                 zoom: { type: Number, min: 1, max: 1.3 },
                 response: { type: String, enum: ["snappy", "natural", "smooth"] },
                 axis: { type: String, enum: ["both", "x", "y"] },
+                lead: { type: Number, min: 0, max: 1 },
               },
               { _id: false }
             ),
@@ -198,6 +246,9 @@ const creatorPlanSchema = new Schema(
     },
     captionScenes: { type: [captionSceneSchema], default: undefined },
     titles: { type: [behindTitleSchema], default: undefined },
+    speed: { type: [speedSpanSchema], default: undefined },
+    effects: { type: [effectSpanSchema], default: undefined },
+    cutaways: { type: [cutawaySchema], default: undefined },
     director: {
       type: new Schema(
         {
@@ -205,6 +256,19 @@ const creatorPlanSchema = new Schema(
           summary: { type: String, maxlength: 1200 },
           generatedAt: { type: String },
           model: { type: String, maxlength: 80 },
+          turns: {
+            type: [
+              new Schema(
+                {
+                  notes: { type: String, maxlength: 600 },
+                  summary: { type: String, maxlength: 1200 },
+                  at: { type: String, maxlength: 40 },
+                },
+                { _id: false }
+              ),
+            ],
+            default: undefined,
+          },
         },
         { _id: false }
       ),

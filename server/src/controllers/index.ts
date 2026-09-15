@@ -40,6 +40,8 @@ export {
   mergeClips,
   getClipWords,
   previewClipReframe,
+  previewClipSpan,
+  streamClipSpanPreview,
   writeClipShareCopy,
   cleanClipCaptionsRoute,
   getClipPauses,

@@ -16,7 +16,11 @@ import type { ApiContext } from "../types/api.types";
 import { getErrorMessage } from "../types";
 import { fileExists, projectOutputDir, serveLocalVideo } from "../utils";
 import { fail, ok } from "../utils/response.utils";
-import { previewClipReframe as runPreviewClipReframe } from "../services/clip-render.service";
+import {
+  previewClipReframe as runPreviewClipReframe,
+  renderSpanPreview,
+  spanPreviewPath,
+} from "../services/clip-render.service";
 import { generateClipShareCopy } from "../services/share-copy.service";
 import { cleanClipCaptions } from "../services/caption-clean.service";
 import { detectClipPauses } from "../services/pause-detect.service";
@@ -258,7 +262,7 @@ export async function directClipRoute({ params, body, set }: Ctx) {
   try {
     const input = (body ?? {}) as { notes?: string; keep?: DirectorLane[] };
     const result = await directClip(params.id, { notes: input.notes, keep: input.keep });
-    return ok({ clip: serializeClip(result.clip), summary: result.summary, model: result.model });
+    return ok({ clip: serializeClip(result.clip), summary: result.summary, model: result.model, warnings: result.warnings });
   } catch (error: unknown) {
     const message = getErrorMessage(error);
     set.status = message === "Clip not found" ? 404 : 500;
@@ -292,6 +296,43 @@ export async function writeClipShareCopy({ params, body, set }: Ctx) {
     const message = getErrorMessage(error);
     set.status = message === "Clip not found" ? 404 : 500;
     return fail(message);
+  }
+}
+
+/** POST /api/clips/:id/preview-span — render [startSec, endSec] with the stored plan, exactly. */
+export async function previewClipSpan({ params, body, set }: Ctx) {
+  try {
+    const input = body as { startSec: number; endSec: number };
+    const preview = await renderSpanPreview(params.id, input.startSec, input.endSec);
+    return ok({
+      key: preview.key,
+      durationSec: preview.durationSec,
+      url: `/api/clips/${params.id}/preview-span/${preview.key}`,
+    });
+  } catch (error: unknown) {
+    const message = getErrorMessage(error);
+    set.status = message.startsWith("Clip not found") ? 404 : 400;
+    return fail(message);
+  }
+}
+
+/** GET /api/clips/:id/preview-span/:key — stream a span preview. */
+export async function streamClipSpanPreview({ params, set }: Ctx & { params: { id: string; key: string } }) {
+  try {
+    const clip = await Clip.findById(params.id).select("projectId").lean();
+    if (!clip) {
+      set.status = 404;
+      return fail("Clip not found");
+    }
+    const path = spanPreviewPath(String(clip.projectId), params.id, params.key);
+    if (!(await fileExists(path))) {
+      set.status = 404;
+      return fail("That preview has expired; render it again");
+    }
+    return serveLocalVideo(set, path, { "cache-control": "private, max-age=3600" });
+  } catch (error: unknown) {
+    set.status = 500;
+    return fail(getErrorMessage(error));
   }
 }
 

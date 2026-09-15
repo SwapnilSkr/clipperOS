@@ -2,18 +2,32 @@ import {
   MAX_CAMERA_MOVES,
   MAX_CAMERA_ZOOM,
   MAX_CAPTION_SCENES,
+  MAX_CUTAWAYS,
+  MAX_DIRECTOR_TURNS,
+  MAX_EFFECT_SPANS,
   MAX_FOLLOW_ZOOM,
   MAX_PAUSE_CUTS,
+  MAX_SPEED_RATE,
+  MAX_SPEED_SPANS,
   MAX_TITLES,
+  MAX_TRANSITION_SEC,
+  MIN_CAMERA_ZOOM,
+  MIN_SPEED_RATE,
   type BehindTitle,
   type CameraAnchor,
   type CameraMove,
   type CaptionOverrides,
   type CaptionScene,
   type CreatorPlan,
+  type Cutaway,
+  type EffectSpan,
   type PauseCut,
+  type SpeedKind,
+  type SpeedSpan,
 } from "../types/clip.types";
 import { resolveCaptionFont } from "../config/caption-fonts";
+import { EFFECTS_BY_ID, isEffectId } from "../config/effects";
+import { isTransitionId } from "../config/transitions";
 
 // ============================================
 // CREATOR PLAN — sanitising and normalising the beat plan.
@@ -118,8 +132,81 @@ function sanitizeCut(raw: unknown, index: number): PauseCut {
   };
 }
 
+function sanitizeSpeed(raw: unknown, index: number): SpeedSpan {
+  if (typeof raw !== "object" || raw === null) throw new Error(`Speed span ${index + 1} is invalid`);
+  const source = raw as Record<string, unknown>;
+  const kind: SpeedKind = source.kind === "fast" || source.kind === "freeze" ? source.kind : "slow";
+  const fallback = kind === "fast" ? 1.5 : kind === "freeze" ? 0 : 0.5;
+  const raw_rate = source.rate === undefined ? fallback : clampNumber(source.rate, 0, MAX_SPEED_RATE, "speed rate");
+  // The kind decides the side of 1 the rate sits on; a freeze has no rate.
+  const rate =
+    kind === "freeze"
+      ? 0
+      : kind === "fast"
+        ? round3(Math.max(1.1, Math.min(MAX_SPEED_RATE, raw_rate)))
+        : round3(Math.max(MIN_SPEED_RATE, Math.min(0.9, raw_rate)));
+  const span: SpeedSpan = {
+    id: idOf(source.id, `speed${index + 1}`),
+    startSec: round3(clampNumber(source.startSec, 0, MAX_SEC, "speed startSec")),
+    endSec: round3(clampNumber(source.endSec, 0, MAX_SEC, "speed endSec")),
+    kind,
+    rate,
+  };
+  if (source.smooth === true && kind === "slow") span.smooth = true;
+  if (source.captions === true) span.captions = true;
+  return span;
+}
+
+function sanitizeEffect(raw: unknown, index: number): EffectSpan {
+  if (typeof raw !== "object" || raw === null) throw new Error(`Effect ${index + 1} is invalid`);
+  const source = raw as Record<string, unknown>;
+  if (!isEffectId(source.effectId)) throw new Error(`Unknown effect: ${String(source.effectId)}`);
+  const span: EffectSpan = {
+    id: idOf(source.id, `fx${index + 1}`),
+    effectId: source.effectId,
+    startSec: round3(clampNumber(source.startSec, 0, MAX_SEC, "effect startSec")),
+    endSec: round3(clampNumber(source.endSec, 0, MAX_SEC, "effect endSec")),
+    amount: round3(clampNumber(source.amount ?? 0.7, 0, 1, "effect amount")),
+  };
+  const variants = EFFECTS_BY_ID.get(source.effectId)?.variants;
+  if (variants && typeof source.variant === "string" && variants.some((item) => item.id === source.variant)) {
+    span.variant = source.variant;
+  }
+  return span;
+}
+
+const CUTAWAY_MOTIONS = new Set(["none", "in", "out", "left", "right", "up", "down"]);
+
+function sanitizeEdge(raw: unknown, fallback: string): Cutaway["in"] {
+  const source = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;
+  const transitionId = isTransitionId(source.transitionId) ? source.transitionId : fallback;
+  const sec = round3(clampNumber(source.sec ?? 0.3, 0, MAX_TRANSITION_SEC, "transition sec"));
+  return { transitionId, sec: transitionId === "cut" ? 0 : sec };
+}
+
+function sanitizeCutaway(raw: unknown, index: number): Cutaway {
+  if (typeof raw !== "object" || raw === null) throw new Error(`Cutaway ${index + 1} is invalid`);
+  const source = raw as Record<string, unknown>;
+  if (typeof source.assetId !== "string" || !source.assetId) throw new Error("A cutaway needs a media asset");
+  const cutaway: Cutaway = {
+    id: idOf(source.id, `cut${index + 1}`),
+    startSec: round3(clampNumber(source.startSec, 0, MAX_SEC, "cutaway startSec")),
+    endSec: round3(clampNumber(source.endSec, 0, MAX_SEC, "cutaway endSec")),
+    assetId: source.assetId.slice(0, 64),
+    fit: source.fit === "blur" ? "blur" : "cover",
+    motion: typeof source.motion === "string" && CUTAWAY_MOTIONS.has(source.motion) ? (source.motion as Cutaway["motion"]) : "in",
+    in: sanitizeEdge(source.in, "dissolve"),
+    out: sanitizeEdge(source.out, "dissolve"),
+  };
+  if (source.offsetSec !== undefined && source.offsetSec !== null) {
+    const offsetSec = round3(clampNumber(source.offsetSec, 0, MAX_SEC, "cutaway offsetSec"));
+    if (offsetSec > 0) cutaway.offsetSec = offsetSec;
+  }
+  return cutaway;
+}
+
 function sanitizeAnchor(raw: unknown): CameraAnchor {
-  if (raw === "face" || raw === "center") return raw;
+  if (raw === "face" || raw === "center" || raw === "look") return raw;
   if (typeof raw === "object" && raw !== null) {
     const point = raw as Record<string, unknown>;
     return {
@@ -134,18 +221,34 @@ function sanitizeMove(raw: unknown, index: number): CameraMove {
   if (typeof raw !== "object" || raw === null) throw new Error(`Camera move ${index + 1} is invalid`);
   const source = raw as Record<string, unknown>;
   const kind = source.kind;
-  if (kind !== "punch" && kind !== "push" && kind !== "pull") throw new Error("Unknown camera move");
+  if (kind !== "punch" && kind !== "push" && kind !== "pull" && kind !== "frame" && kind !== "hold") throw new Error("Unknown camera move");
   const ease = source.ease ?? "out";
   if (ease !== "cut" && ease !== "out" && ease !== "in_out") throw new Error("Unknown camera ease");
-  return {
+  const move: CameraMove = {
     id: idOf(source.id, `move${index + 1}`),
     kind,
     startSec: round3(clampNumber(source.startSec, 0, MAX_SEC, "move startSec")),
     endSec: round3(clampNumber(source.endSec, 0, MAX_SEC, "move endSec")),
-    zoom: round3(clampNumber(source.zoom, 1, MAX_CAMERA_ZOOM, "move zoom")),
+    zoom: round3(clampNumber(source.zoom, MIN_CAMERA_ZOOM, MAX_CAMERA_ZOOM, "move zoom")),
     anchor: sanitizeAnchor(source.anchor ?? "face"),
     ease,
   };
+  // Optional framing; a default is left absent so an untouched move round-trips.
+  if (source.zoomFrom !== undefined && source.zoomFrom !== null) {
+    const zoomFrom = round3(clampNumber(source.zoomFrom, MIN_CAMERA_ZOOM, MAX_CAMERA_ZOOM, "move zoomFrom"));
+    if (Math.abs(zoomFrom - 1) >= 0.005) move.zoomFrom = zoomFrom;
+  }
+  if (source.pan !== undefined && source.pan !== null) {
+    if (typeof source.pan !== "object") throw new Error("Invalid move pan");
+    const pan = source.pan as Record<string, unknown>;
+    const x = round3(clampNumber(pan.x ?? 0, -1, 1, "pan.x"));
+    const y = round3(clampNumber(pan.y ?? 0, -1, 1, "pan.y"));
+    if (x !== 0 || y !== 0) move.pan = { x, y };
+  }
+  if (source.rampSec !== undefined && source.rampSec !== null) {
+    move.rampSec = round3(clampNumber(source.rampSec, 0, 10, "move rampSec"));
+  }
+  return move;
 }
 
 function sanitizeScene(raw: unknown, index: number): CaptionScene {
@@ -212,7 +315,11 @@ export function sanitizeCreatorPlan(raw: unknown): CreatorPlan {
     const movesRaw = camera.moves ?? [];
     if (!Array.isArray(movesRaw)) throw new Error("camera.moves must be an array");
     if (movesRaw.length > MAX_CAMERA_MOVES) throw new Error(`At most ${MAX_CAMERA_MOVES} camera moves`);
-    const moves = orderSpans(movesRaw.map(sanitizeMove), true).filter((move) => move.zoom > 1);
+    // A move that neither zooms nor pans does nothing; drop it. A hold is
+    // the exception: stopping the camera is the whole point.
+    const moves = orderSpans(movesRaw.map(sanitizeMove), true).filter(
+      (move) => move.kind === "hold" || move.zoom !== (move.zoomFrom ?? 1) || (move.zoomFrom ?? 1) !== 1 || move.pan !== undefined
+    );
     const out: NonNullable<CreatorPlan["camera"]> = { moves };
     if (camera.follow !== undefined && camera.follow !== null) {
       if (typeof camera.follow !== "object") throw new Error("Invalid follow settings");
@@ -234,6 +341,10 @@ export function sanitizeCreatorPlan(raw: unknown): CreatorPlan {
         if (follow.axis !== "x" && follow.axis !== "y") throw new Error("Invalid follow axis");
         out.follow.axis = follow.axis;
       }
+      if (follow.lead !== undefined && follow.lead !== null) {
+        const lead = round3(clampNumber(follow.lead, 0, 1, "follow lead"));
+        if (lead > 0) out.follow.lead = lead;
+      }
     }
     if (out.moves.length > 0 || out.follow) plan.camera = out;
   }
@@ -252,6 +363,29 @@ export function sanitizeCreatorPlan(raw: unknown): CreatorPlan {
     if (titles.length > 0) plan.titles = titles;
   }
 
+  if (source.speed !== undefined) {
+    if (!Array.isArray(source.speed)) throw new Error("speed must be an array");
+    if (source.speed.length > MAX_SPEED_SPANS) throw new Error(`At most ${MAX_SPEED_SPANS} speed spans`);
+    const speed = orderSpans(source.speed.map(sanitizeSpeed), true);
+    if (speed.length > 0) plan.speed = speed;
+  }
+
+  if (source.effects !== undefined) {
+    if (!Array.isArray(source.effects)) throw new Error("effects must be an array");
+    if (source.effects.length > MAX_EFFECT_SPANS) throw new Error(`At most ${MAX_EFFECT_SPANS} effects`);
+    // Effects may overlap (they stack); only the order is fixed.
+    const effects = orderSpans(source.effects.map(sanitizeEffect), false);
+    if (effects.length > 0) plan.effects = effects;
+  }
+
+  if (source.cutaways !== undefined) {
+    if (!Array.isArray(source.cutaways)) throw new Error("cutaways must be an array");
+    if (source.cutaways.length > MAX_CUTAWAYS) throw new Error(`At most ${MAX_CUTAWAYS} cutaways`);
+    // One picture at a time: cutaways never overlap.
+    const cutaways = orderSpans(source.cutaways.map(sanitizeCutaway), true);
+    if (cutaways.length > 0) plan.cutaways = cutaways;
+  }
+
   if (source.director !== undefined && source.director !== null) {
     if (typeof source.director !== "object") throw new Error("Invalid director notes");
     const director = source.director as Record<string, unknown>;
@@ -262,6 +396,19 @@ export function sanitizeCreatorPlan(raw: unknown): CreatorPlan {
     }
     if (typeof director.generatedAt === "string") out.generatedAt = director.generatedAt.slice(0, 40);
     if (typeof director.model === "string") out.model = director.model.slice(0, 80);
+    if (Array.isArray(director.turns)) {
+      // Field by field: a mongoose subdocument spread copies its internals.
+      const turns = director.turns
+        .filter((turn): turn is Record<string, unknown> => typeof turn === "object" && turn !== null)
+        .filter((turn) => typeof turn.summary === "string" && turn.summary.trim())
+        .map((turn) => ({
+          ...(typeof turn.notes === "string" && turn.notes.trim() ? { notes: turn.notes.trim().slice(0, 600) } : {}),
+          summary: String(turn.summary).trim().slice(0, 1200),
+          at: typeof turn.at === "string" ? turn.at.slice(0, 40) : "",
+        }))
+        .slice(-MAX_DIRECTOR_TURNS);
+      if (turns.length > 0) out.turns = turns;
+    }
     if (Object.keys(out).length > 0) plan.director = out;
   }
 
@@ -277,6 +424,9 @@ export function isEmptyCreatorPlan(plan: CreatorPlan | undefined): boolean {
     !plan.camera &&
     !plan.captionScenes?.length &&
     !plan.titles?.length &&
+    !plan.speed?.length &&
+    !plan.effects?.length &&
+    !plan.cutaways?.length &&
     !plan.director
   );
 }

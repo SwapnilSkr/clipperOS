@@ -81,6 +81,7 @@ const KEYFRAME_MOVE_PX = 48;
  * what is not recorded here can never be followed.
  */
 const FACE_KEYFRAME_PX = 8;
+const FACE_KEYFRAME_YAW = 0.15;
 const FACE_KEYFRAME_MIN_GAP_SEC = 0.1;
 /**
  * Light EMA on the face sample (12 fps, so 0.5 ≈ one frame): enough to drop
@@ -112,6 +113,8 @@ export interface FaceObservation {
   faceX?: number;
   faceY?: number;
   faceW?: number;
+  /** Which way the head faces: −1 screen-left … 1 screen-right. */
+  yaw?: number;
   mouthEnergy: number;
 }
 
@@ -362,7 +365,7 @@ export function buildTrack(args: {
 
   const chosenCx = new Array<number | null>(n).fill(null);
   /** The tracked speaker's face per frame, source pixels. */
-  const chosenFace = new Array<{ x: number; y: number; w: number } | null>(n).fill(null);
+  const chosenFace = new Array<{ x: number; y: number; w: number; yaw: number } | null>(n).fill(null);
   const switchTimes: number[] = [];
   const coarseCuts = frames.map((f, i) => (f.cut ? i / ANALYSIS_FPS : -1)).filter((t) => t >= 0);
   const cutTimes = alignCutTimes(coarseCuts, sceneCuts ?? []);
@@ -406,6 +409,7 @@ export function buildTrack(args: {
           x: (speaker.faceX ?? speaker.x + speaker.w / 2) * analysisScale,
           y: (speaker.faceY ?? speaker.y + speaker.h / 2) * analysisScale,
           w: (speaker.faceW ?? speaker.w) * analysisScale,
+          yaw: speaker.yaw ?? 0,
         };
         carrySpeakerX = speakerX;
       }
@@ -449,6 +453,7 @@ export function buildTrack(args: {
     const headX = seatCentres.map((c) => new Array<number>(length).fill(c));
     const headY = seatCentres.map(() => new Array<number>(length).fill(analysisHeight * 0.42));
     const headW = seatCentres.map(() => new Array<number>(length).fill(typicalFace));
+    const headYaw = seatCentres.map(() => new Array<number>(length).fill(0));
 
     for (let i = shot.from; i < shot.to; i++) {
       const local = i - shot.from;
@@ -475,6 +480,7 @@ export function buildTrack(args: {
         headX[seat]![local] = face.faceX ?? centre;
         headY[seat]![local] = face.faceY ?? face.y + face.h / 2;
         headW[seat]![local] = face.faceW ?? face.w;
+        headYaw[seat]![local] = face.yaw ?? 0;
       }
       // Carry the last observed position forward so a dropout does not move the
       // crop; the seat is still there even when the detector blinks.
@@ -486,6 +492,7 @@ export function buildTrack(args: {
           headX[s]![local] = headX[s]![local - 1]!;
           headY[s]![local] = headY[s]![local - 1]!;
           headW[s]![local] = headW[s]![local - 1]!;
+          headYaw[s]![local] = headYaw[s]![local - 1]!;
         }
       }
     }
@@ -571,6 +578,7 @@ export function buildTrack(args: {
         x: headX[current]![i]! * analysisScale,
         y: headY[current]![i]! * analysisScale,
         w: headW[current]![i]! * analysisScale,
+        yaw: headYaw[current]![i]!,
       };
     }
     carrySpeakerX = seatCentres[current]! * analysisScale;
@@ -605,19 +613,24 @@ export function buildTrack(args: {
       break;
     }
   }
-  let smoothFace: { x: number; y: number; w: number } | null = null;
+  let smoothFace: { x: number; y: number; w: number; yaw: number } | null = null;
   // A holder rather than two `let`s: they are assigned inside `emit`, which
   // TypeScript's narrowing cannot see, so bare variables read as never-set.
-  const emitted: { face: { x: number; y: number } | null; at: number } = { face: null, at: -Infinity };
-  let lastKnownFace: { x: number; y: number; w: number } | null = null;
-  const faceOf = (): Pick<CropKeyframe, "fx" | "fy" | "fw"> =>
+  const emitted: { face: { x: number; y: number; yaw: number } | null; at: number } = { face: null, at: -Infinity };
+  let lastKnownFace: { x: number; y: number; w: number; yaw: number } | null = null;
+  const faceOf = (): Pick<CropKeyframe, "fx" | "fy" | "fw" | "fyaw"> =>
     smoothFace
-      ? { fx: Math.round(smoothFace.x), fy: Math.round(smoothFace.y), fw: Math.round(smoothFace.w) }
+      ? {
+          fx: Math.round(smoothFace.x),
+          fy: Math.round(smoothFace.y),
+          fw: Math.round(smoothFace.w),
+          fyaw: Math.round(smoothFace.yaw * 100) / 100,
+        }
       : {};
   const emit = (t: number, cxValue: number) => {
     keyframes.push({ t, cx: Math.round(cxValue), cy, width: cropWidth, ...faceOf() });
     lastEmitted = cxValue;
-    emitted.face = smoothFace ? { x: smoothFace.x, y: smoothFace.y } : null;
+    emitted.face = smoothFace ? { x: smoothFace.x, y: smoothFace.y, yaw: smoothFace.yaw } : null;
     emitted.at = t;
   };
 
@@ -638,6 +651,7 @@ export function buildTrack(args: {
               x: smoothFace.x + (lastKnownFace.x - smoothFace.x) * FACE_EMA,
               y: smoothFace.y + (lastKnownFace.y - smoothFace.y) * FACE_EMA,
               w: smoothFace.w + (lastKnownFace.w - smoothFace.w) * FACE_EMA,
+              yaw: smoothFace.yaw + (lastKnownFace.yaw - smoothFace.yaw) * FACE_EMA,
             };
     }
 
@@ -673,7 +687,9 @@ export function buildTrack(args: {
       t - emitted.at >= FACE_KEYFRAME_MIN_GAP_SEC &&
       (emitted.face === null ||
         Math.abs(smoothFace.x - emitted.face.x) >= FACE_KEYFRAME_PX ||
-        Math.abs(smoothFace.y - emitted.face.y) >= FACE_KEYFRAME_PX);
+        Math.abs(smoothFace.y - emitted.face.y) >= FACE_KEYFRAME_PX ||
+        // A head turn without a move: the gaze lead needs the sample too.
+        Math.abs(smoothFace.yaw - emitted.face.yaw) >= FACE_KEYFRAME_YAW);
     if (i === 0 || Math.abs(smoothCx - lastEmitted) >= KEYFRAME_MOVE_PX || faceMoved) {
       emit(t, smoothCx);
     }

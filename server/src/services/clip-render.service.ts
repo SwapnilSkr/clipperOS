@@ -1,4 +1,4 @@
-import { copyFile, rename, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import ffmpeg from "fluent-ffmpeg";
 import "../config/ffmpeg-bootstrap";
@@ -28,8 +28,10 @@ import {
   createScratchDir,
   deleteFile,
   ensureDir,
+  fileExists,
   getFileSize,
   listFiles,
+  projectMediaDir,
   projectOutputDir,
   runCommand,
 } from "../utils";
@@ -53,14 +55,16 @@ import { mixSoundtrackOntoClip, soundtrackNeedsMix, soundtrackSpansOutro } from 
 import { appendOutroToClip, loadSharedOutroLibrary, overlaySharedOutroLibrary, pickProjectOutro } from "./outro.service";
 import { creatorPlanActive } from "./creator-plan.service";
 import {
+  type TimeWindow,
+  cameraTrackFor,
   followCx,
-  followSigma,
-  followTightness,
+  followLead,
   followTightnessX,
-  smoothedTrack,
   windowsFor,
 } from "./creator-timeline";
-import { cameraFilterChain } from "./camera.service";
+import { cameraFilterChain, panExpr } from "./camera.service";
+import { effectsFilterChain } from "./effects.service";
+import { cutawaysInWindow, prepareCutaway, type PreparedCutaway } from "./cutaway.service";
 import { ensureClipMatte, matteSpansFor, type ClipMatte } from "./matte.service";
 import { renderTitlesAss } from "./title.service";
 
@@ -106,10 +110,10 @@ function cropGeometry(sourceWidth: number, sourceHeight: number): { w: number; h
 }
 
 /** Crop the frame around one keyframe's centre, then scale to the output size. */
-export function cropChainFor(keyframe: CropKeyframe, track: ReframeTrack, tightness = 0): string {
+export function cropChainFor(keyframe: CropKeyframe, track: ReframeTrack, tightness = 0, lead = 0): string {
   const { sourceWidth, sourceHeight } = track;
   const { w, h } = cropGeometry(sourceWidth, sourceHeight);
-  const x = Math.max(0, Math.min(sourceWidth - w, Math.round(followCx(keyframe, tightness, sourceWidth) - w / 2)));
+  const x = Math.max(0, Math.min(sourceWidth - w, Math.round(followCx(keyframe, tightness, sourceWidth, lead) - w / 2)));
   const y = Math.max(0, Math.min(sourceHeight - h, Math.round(keyframe.cy - h / 2)));
   return `crop=${w}:${h}:${x}:${y},scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT},setsar=1`;
 }
@@ -142,33 +146,32 @@ export function cropChainForTrack(
   track: ReframeTrack,
   windowStartSec?: number,
   tightness = 0,
-  windowEndSec?: number
+  windowEndSec?: number,
+  camera: {
+    /** Follow lead room (0..1): the crop leans toward the head's gaze. */
+    lead?: number;
+    /** A pan in source pixels as expressions of the window clock (camera.service panExpr). */
+    pan?: { x: string; y: string };
+  } = {}
 ): string {
   const shifted = shiftTrackToWindow(track, windowStartSec ?? track.originSec ?? 0);
   if (shifted.mode === "resize") return reframeFilterChain(shifted);
-  const keyframes = coalesceKeyframes(
+  let keyframes = coalesceKeyframes(
     collapseHoldKeyframes(keyframesForWindow(shifted.keyframes, windowEndSec, windowStartSec)),
     MAX_SEGMENTS_PER_WINDOW
   );
-  if (keyframes.length <= 1) {
-    return cropChainFor(
-      keyframes[0] ?? {
-        t: 0,
-        cx: shifted.sourceWidth / 2,
-        cy: shifted.sourceHeight / 2,
-        width: shifted.sourceWidth,
-      },
-      shifted,
-      tightness
-    );
+  if (keyframes.length === 0) {
+    keyframes = [{ t: 0, cx: shifted.sourceWidth / 2, cy: shifted.sourceHeight / 2, width: shifted.sourceWidth }];
   }
+  // A still crop is one filter with constant offsets — unless a pan moves it.
+  if (keyframes.length === 1 && !camera.pan) return cropChainFor(keyframes[0]!, shifted, tightness, camera.lead);
 
   const { sourceWidth, sourceHeight } = shifted;
   const { w, h } = cropGeometry(sourceWidth, sourceHeight);
   const y = Math.max(0, Math.min(sourceHeight - h, Math.round((sourceHeight - h) / 2)));
   // Follow blends the steady seat crop toward the recorded face per keyframe.
   const xOf = (keyframe: CropKeyframe) =>
-    Math.max(0, Math.min(sourceWidth - w, Math.round(followCx(keyframe, tightness, sourceWidth) - w / 2)));
+    Math.max(0, Math.min(sourceWidth - w, Math.round(followCx(keyframe, tightness, sourceWidth, camera.lead ?? 0) - w / 2)));
 
   // The pan as a FLAT sum: the first crop, plus one clipped ramp (glide) or
   // step (snap) per keyframe. Nested `if(lt(t,…),…,if(…))` pieces would read
@@ -195,7 +198,17 @@ export function cropChainForTrack(
         : `+${delta}*clip((t-${from.t.toFixed(4)})/${Math.max(span, 0.001).toFixed(4)}\\,0\\,1)`;
   }
 
+  // A pan is one more term; `crop` clamps the result to the source.
+  if (camera.pan) {
+    xExpr += `+${escapeCommas(camera.pan.x)}`;
+    if (camera.pan.y !== "0") return `crop=w=${w}:h=${h}:x=${xExpr}:y=${y}+${escapeCommas(camera.pan.y)},scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT},setsar=1`;
+  }
   return `crop=w=${w}:h=${h}:x=${xExpr}:y=${y},scale=${OUTPUT_WIDTH}:${OUTPUT_HEIGHT},setsar=1`;
+}
+
+/** Commas separate filter options; inside an expression they must be escaped. */
+function escapeCommas(expression: string): string {
+  return expression.replace(/,/g, "\\,");
 }
 
 /**
@@ -320,9 +333,23 @@ async function writeCaptions(
 /** A segment resolved against the source, ready to be wired into a filtergraph. */
 interface PreparedSegment {
   startSec: number;
+  /** Source seconds read from the file. */
   duration: number;
+  /** Seconds on the output clock: `duration` unless the segment is re-timed. */
+  outputDuration: number;
+  /** Playback rate; 1 plays as shot, 0 holds the first frame. */
+  rate: number;
+  smooth?: boolean;
+  /** Creator-mode looks in the chain: it may branch, so it needs a filtergraph. */
+  looks?: boolean;
   /** The complete per-frame chain: cleanup, crop, camera, effects, captions. */
   filterChain: string;
+  /** The same chain in two halves, for a graph that lays cutaways between them. */
+  picture: string;
+  /** Captions (with their leading comma) and the final format. */
+  tail: string;
+  /** Stock shots over this window, in order. */
+  cutaways: PreparedCutaway[];
   /**
    * Creator-mode titles. `behind` needs the matte composite; `front` is one
    * more `ass` burn under the captions. Absent on the original render path.
@@ -438,6 +465,138 @@ function reportProgress(clipId: string, revision: number, progress: number): voi
   });
 }
 
+// ---- span preview ----------------------------------------------------------
+
+const spanPreviewJobs = new Map<string, Promise<SpanPreview>>();
+
+export interface SpanPreview {
+  /** File under the project's media dir; served by the clip controller. */
+  path: string;
+  key: string;
+  durationSec: number;
+}
+
+function spanPreviewDir(projectId: string): string {
+  return join(projectMediaDir(projectId), "previews");
+}
+
+export function spanPreviewPath(projectId: string, clipId: string, key: string): string {
+  return join(spanPreviewDir(projectId), `${clipId}-${key}.mp4`);
+}
+
+/**
+ * Render just [startSec, endSec] of a clip with its stored plan — the exact
+ * picture the burn would produce — quickly, to a local file the editor plays
+ * beside the live preview. Nothing about the clip changes: no status, no
+ * delivery, no outro or soundtrack (the picture is what a look is checked on).
+ * Fast preset, higher CRF; keyed on the span and the plan, so a repeat of the
+ * same request is served from disk.
+ */
+export async function renderSpanPreview(clipId: string, startSec: number, endSec: number): Promise<SpanPreview> {
+  const clip = await Clip.findById(clipId);
+  if (!clip) throw new Error(`Clip not found: ${clipId}`);
+  if (clip.kind === "merge") throw new Error("Span previews are for single clips");
+  const project = await ClipProject.findById(clip.projectId);
+  if (!project) throw new Error(`Project not found for clip ${clipId}`);
+  const profile = resolveGenreProfile(project.genreId);
+  const mediaPath = await ensureProjectMedia(String(project._id));
+  const meta = await getVideoMetadata(mediaPath);
+  const trimmed = resolveWindow(clip, meta.durationSec);
+  const from = Math.max(trimmed.startSec, Math.min(startSec, endSec));
+  const to = Math.min(trimmed.endSec, Math.max(startSec, endSec));
+  if (to - from < MIN_SEGMENT_SEC) throw new Error("That span is too short to preview");
+
+  const plan = clip.edit?.creator;
+  const planKey = Bun.hash(JSON.stringify({ edit: plainEdit(clip), from, to })).toString(36);
+  const key = planKey;
+  const outputPath = spanPreviewPath(String(project._id), clipId, key);
+  if (await fileExists(outputPath)) {
+    return { path: outputPath, key, durationSec: to - from };
+  }
+  const inflight = spanPreviewJobs.get(outputPath);
+  if (inflight) return inflight;
+
+  const task = (async (): Promise<SpanPreview> => {
+    const scratchDir = await createScratchDir(`span-${clipId}`);
+    try {
+      const kept: TimeWindow[] = creatorPlanActive(plan)
+        ? windowsFor(trimmed.startSec, trimmed.endSec, plan.cuts, plan.speed)
+        : [{ startSec: trimmed.startSec, endSec: trimmed.endSec }];
+      const windows: SourceWindow[] = kept
+        .map((window) => ({ ...window, startSec: Math.max(window.startSec, from), endSec: Math.min(window.endSec, to) }))
+        .filter((window) => window.endSec - window.startSec >= MIN_SEGMENT_SEC)
+        .map((window, index) => ({
+          startSec: round3(window.startSec),
+          endSec: round3(window.endSec),
+          mode: clip.edit?.reframeMode ?? "smart",
+          rate: window.rate,
+          smooth: window.smooth,
+          captions: window.captions,
+          label: `Preview part ${index + 1}`,
+        }));
+      if (windows.length === 0) throw new Error("That span is entirely cut");
+      // A behind-title in the span uses the matte (built or cached by the same
+      // path the render takes; a preview is worth the one-off build).
+      const matte = creatorPlanActive(plan) && matteSpansFor(plan, from, to).length > 0 ? await ensureClipMatte(clipId) : null;
+      const prepared = await prepareSegments({
+        clip,
+        project,
+        mediaPath,
+        sourceWidth: meta.width,
+        sourceHeight: meta.height,
+        sourceDuration: meta.durationSec,
+        sourceFps: meta.frameRate,
+        windows,
+        options: {},
+        defaultCaptionsOn: profile.captionsDefault,
+        scratchDir,
+        persistTrack: true,
+        inputTimeOffset: 0,
+        delogoRegions: activeCleanupRegions(clip),
+        matte,
+      });
+      await mkdir(spanPreviewDir(String(project._id)), { recursive: true });
+      const audioFx = audioEffectFilterChain(clip.edit?.videoEffects);
+      const hasAudio = await hasAudioStream(mediaPath);
+      const scratchOutput = join(scratchDir, "span.mp4");
+      await encodeMerge(mediaPath, scratchOutput, prepared.segments, hasAudio, prepared.duration, audioFx, () => undefined, matte ?? undefined, {
+        preset: "veryfast",
+        crf: 26,
+        fps: meta.frameRate,
+      });
+      await rename(scratchOutput, outputPath);
+      // Keep the folder small: the newest handful per clip.
+      await pruneSpanPreviews(String(project._id), clipId, outputPath);
+      return { path: outputPath, key, durationSec: prepared.duration };
+    } finally {
+      await rm(scratchDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  })().finally(() => spanPreviewJobs.delete(outputPath));
+  spanPreviewJobs.set(outputPath, task);
+  return task;
+}
+
+const MAX_SPAN_PREVIEWS_PER_CLIP = 6;
+
+async function pruneSpanPreviews(projectId: string, clipId: string, keep: string): Promise<void> {
+  const dir = spanPreviewDir(projectId);
+  const names = (await readdir(dir).catch(() => [] as string[])).filter((name) => name.startsWith(`${clipId}-`));
+  const stats = await Promise.all(
+    names.map(async (name) => ({ path: join(dir, name), mtime: (await stat(join(dir, name))).mtimeMs }))
+  );
+  stats
+    .filter((entry) => entry.path !== keep)
+    .sort((a, b) => b.mtime - a.mtime)
+    .slice(MAX_SPAN_PREVIEWS_PER_CLIP - 1)
+    .forEach((entry) => void rm(entry.path, { force: true }).catch(() => undefined));
+}
+
+/** The edit as the sanitiser would emit it: the part of the clip a preview depends on. */
+function plainEdit(clip: IClip): unknown {
+  const source = clip.edit as { toObject?: () => unknown } | undefined;
+  return source && typeof source.toObject === "function" ? source.toObject() : source;
+}
+
 /**
  * Render one clip and store it.
  *
@@ -464,8 +623,10 @@ export async function renderClip(clipId: string, options: RenderClipOptions = {}
           status: "rendering",
           renderProgress: 5,
           renderRevision: revision,
-          renderError: undefined,
         },
+        // `$set: { renderError: undefined }` is dropped by mongoose; the last
+        // failure would outlive the render that fixed it.
+        $unset: { renderError: 1 },
       }
     );
 
@@ -504,14 +665,17 @@ export async function renderClip(clipId: string, options: RenderClipOptions = {}
       const plan = clip.edit?.creator;
       // Creator mode: pause cuts split the trim into kept windows, which then
       // render exactly like a merge's parts — one concat, no intermediates.
-      const kept = creatorPlanActive(plan)
-        ? windowsFor(trimmed.startSec, trimmed.endSec, plan.cuts)
+      const kept: TimeWindow[] = creatorPlanActive(plan)
+        ? windowsFor(trimmed.startSec, trimmed.endSec, plan.cuts, plan.speed)
         : [{ startSec: trimmed.startSec, endSec: trimmed.endSec }];
       kept.forEach((window, index) => {
         windows.push({
           startSec: window.startSec,
           endSec: window.endSec,
           mode,
+          rate: window.rate,
+          smooth: window.smooth,
+          captions: window.captions,
           label: kept.length > 1 ? `Part ${index + 1}` : undefined,
         });
       });
@@ -588,7 +752,9 @@ export async function renderClip(clipId: string, options: RenderClipOptions = {}
     const audioFx = audioEffectFilterChain(clip.edit?.videoEffects);
     const hasTitles = prepared.segments.some((segment) => segment.titles);
     const hasAudio = audioFx || prepared.segments.length > 1 || hasTitles ? await hasAudioStream(inputPath) : true;
-    if (prepared.segments.length === 1 && !hasTitles) {
+    const retimed = prepared.segments.some((segment) => segment.rate !== 1);
+    const looks = prepared.segments.some((segment) => segment.looks || segment.cutaways.length > 0);
+    if (prepared.segments.length === 1 && !hasTitles && !retimed && !looks) {
       // One segment keeps the original single-pass encode, byte-for-byte.
       const only = prepared.segments[0]!;
       await encode(inputPath, outputPath, only.startSec, only.duration, only.filterChain, hasAudio ? audioFx : "", (pct) =>
@@ -598,7 +764,7 @@ export async function renderClip(clipId: string, options: RenderClipOptions = {}
       // Titles need a filtergraph (a second layer, and the matte as an input),
       // which the concat path already is — even for one segment.
       await encodeMerge(inputPath, outputPath, prepared.segments, hasAudio, duration, audioFx, (pct) =>
-        reportProgress(clipId, revision, 20 + pct * 0.7), matte ?? undefined
+        reportProgress(clipId, revision, 20 + pct * 0.7), matte ?? undefined, { fps: meta.frameRate }
       );
     }
 
@@ -711,6 +877,11 @@ export interface SourceWindow {
   endSec: number;
   /** Framing strategy requested for this window. */
   mode: "center" | "smart";
+  /** Creator-mode speed: absent/1 as shot, <1 slow, >1 fast, 0 a freeze. */
+  rate?: number;
+  smooth?: boolean;
+  /** Captions stay on inside a slowed window (off by default: the voice is faded). */
+  captions?: boolean;
   captionStyleId?: string;
   captionsOn?: boolean;
   /** For error messages. */
@@ -760,7 +931,7 @@ export function coalesceKeyframes(keyframes: CropKeyframe[], max: number): CropK
   let sinceGroup = 0;
   for (let i = 0; i < keyframes.length; i++) {
     const current = keyframes[i]!;
-    if (sinceGroup === 0) groups.push(current);
+    if (sinceGroup === 0 || current.held) groups.push(current);
     sinceGroup++;
 
     const next = keyframes[i + 1];
@@ -794,7 +965,9 @@ export function collapseHoldKeyframes(keyframes: CropKeyframe[]): CropKeyframe[]
       next.t - current.t <= 0.12 &&
       Math.abs(current.cx - previous.cx) <= 0.25 * previous.width &&
       Math.abs(next.cx - current.cx) > 0.25 * current.width;
-    if (sameCrop || holdBeforeSnap) continue;
+    // A hold's plateau is two equal keyframes on purpose: dropping the second
+    // would glide straight through it.
+    if ((sameCrop || holdBeforeSnap) && !current.held) continue;
     out.push(current);
   }
   return out;
@@ -832,7 +1005,7 @@ export function windowSegments(
  * which have no single window to key a cache on.
  */
 /** Bump when framing maths changes so a cached shaky track is not reused. */
-const REFRAME_CACHE_VERSION = 15;
+const REFRAME_CACHE_VERSION = 16;
 
 type ReframeCacheKey = { startSec: number; endSec: number; mode: string; v?: number };
 
@@ -1166,13 +1339,18 @@ async function prepareSegments(input: {
     note ??= track.note;
 
     const pieceDuration = window.endSec - window.startSec;
-    duration += pieceDuration;
+    const rate = window.rate ?? 1;
+    const pieceOutput = rate > 0 ? pieceDuration / rate : pieceDuration;
+    duration += pieceOutput;
 
     const plan = input.clip.edit?.creator;
     const creatorActive = creatorPlanActive(plan) && input.persistTrack;
 
     let assPath: string | undefined;
-    if (input.options.captions ?? captionsOnFor(input.clip, input.defaultCaptionsOn, window)) {
+    // A slowed or frozen window has its voice faded out, so its captions are
+    // off unless the span asks for them.
+    const captionsWanted = rate === 1 || rate > 1 || window.captions === true;
+    if (captionsWanted && (input.options.captions ?? captionsOnFor(input.clip, input.defaultCaptionsOn, window))) {
       assPath = await writeCaptions(
         input.scratchDir,
         `segment_${w}.ass`,
@@ -1190,14 +1368,16 @@ async function prepareSegments(input: {
     }
 
     // A following camera rides the smoothed face path, never the raw box; how
-    // smoothed is the plan's response.
-    const following = creatorActive && followTightness(plan) > 0;
-    const cameraTrack = following ? smoothedTrack(track, followSigma(plan)) : track;
+    // smoothed is the plan's response. Holds lock it off on top.
+    const cameraTrack = creatorActive ? cameraTrackFor(track, plan) : track;
     const base = cropChainForTrack(
       cameraTrack,
       window.startSec,
       creatorActive ? followTightnessX(plan) : 0,
-      window.endSec
+      window.endSec,
+      creatorActive
+        ? { lead: followLead(plan), pan: panExpr(plan, cameraTrack, window.startSec, window.endSec) }
+        : {}
     );
     const camera = creatorActive
       ? cameraFilterChain({ plan, track: cameraTrack, windowStartSec: window.startSec, windowEndSec: window.endSec })
@@ -1219,10 +1399,26 @@ async function prepareSegments(input: {
     );
 
     const captionsFilter = assPath ? `,${assVideoFilter(assPath)}` : "";
+    // Creator-mode looks, after the grade and before the words. Labels carry
+    // the segment index: some looks split the graph.
+    const looks = creatorActive ? effectsFilterChain(plan, window.startSec, window.endSec, `s${w}`) : "";
+    const picture = `${delogo ? `${delogo},` : ""}${base}${camera ? `,${camera}` : ""}${pictureEffects ? `,${pictureEffects}` : ""}${looks ? `,${looks}` : ""}`;
+    const cutaways = creatorActive
+      ? (await cutawaysInWindow(plan, window.startSec, window.endSec))
+          .map((item) => prepareCutaway(item.cutaway, item.asset, item.path, window.startSec, window.endSec))
+          .filter((item): item is PreparedCutaway => item !== undefined)
+      : [];
     const segment: PreparedSegment = {
       startSec: window.startSec - input.inputTimeOffset,
       duration: pieceDuration,
-      filterChain: `${delogo ? `${delogo},` : ""}${base}${camera ? `,${camera}` : ""}${pictureEffects ? `,${pictureEffects}` : ""}${captionsFilter},format=yuv420p`,
+      outputDuration: pieceOutput,
+      rate,
+      smooth: window.smooth,
+      looks: looks.length > 0,
+      filterChain: `${picture}${captionsFilter},format=yuv420p`,
+      picture,
+      tail: `${captionsFilter},format=yuv420p`,
+      cutaways,
     };
 
     // Creator-mode titles: separate ASS files per layer, timed on this window.
@@ -1251,7 +1447,7 @@ async function prepareSegments(input: {
         }
         segment.titles = {
           picture: `${base}${camera ? `,${camera}` : ""}`,
-          effects: `${delogo ? `${delogo},` : ""}${base}${camera ? `,${camera}` : ""}${pictureEffects ? `,${pictureEffects}` : ""}`,
+          effects: picture,
           captions: captionsFilter,
           behindAss,
           behindMaskAss,
@@ -1390,7 +1586,7 @@ async function persistOutput(clipId: string, revision: number, delivered: Delive
     renderedAt: new Date(),
     renderRevision: revision,
   };
-  const $unset: Record<string, 1> = {};
+  const $unset: Record<string, 1> = { renderError: 1 };
   if (delivered.outputKey) $set.outputKey = delivered.outputKey;
   else $unset.outputKey = 1;
   if (delivered.outputPath) $set.outputPath = delivered.outputPath;
@@ -1500,12 +1696,23 @@ function segmentVideoGraph(
   index: number,
   segment: PreparedSegment,
   matte?: ClipMatte,
-  matteIndex?: number
+  matteIndex?: number,
+  cutawayInputs: number[] = [],
+  fps = 30
 ): string[] {
   const trim = `trim=start=${segment.startSec.toFixed(4)}:duration=${segment.duration.toFixed(4)}`;
   const head = `[${index}:v]${trim},${alignPtsToTrim(segment.startSec)}`;
   const titles = segment.titles;
-  if (!titles) return [`${head},${segment.filterChain}[v${index}]`];
+  // Re-timing is the LAST step: crop, camera, captions and titles are all
+  // written on the source clock, so the whole finished picture is stretched.
+  const out = segment.rate === 1 ? `[v${index}]` : `[vt${index}]`;
+  const retime = segment.rate === 1 ? [] : [`[vt${index}]${rateVideoChain(segment)}[v${index}]`];
+  // Cutaways lie between the picture and the words: B-roll under the captions.
+  const cutaways = cutawayGraph(index, segment, cutawayInputs, fps);
+  if (!titles) {
+    if (cutaways.lines.length === 0) return [`${head},${segment.filterChain}${out}`, ...retime];
+    return [`${head},${segment.picture}[pic${index}]`, ...cutaways.lines, `[${cutaways.output}]null${segment.tail}${out}`, ...retime];
+  }
 
   const front = titles.frontAss ? `,${assVideoFilter(titles.frontAss)}` : "";
   const lines: string[] = [];
@@ -1529,12 +1736,66 @@ function segmentVideoGraph(
       `[mraw${index}]scale=${titles.sourceWidth}:${titles.sourceHeight},${titles.picture},format=gray[mk${index}]`,
       `[fg${index}]format=rgba[fga${index}]`,
       `[fga${index}][mk${index}]alphamerge[cut${index}]`,
-      `[bgt${index}][cut${index}]overlay=format=auto[vb${index}]`,
-      `[vb${index}]null${front}${titles.captions},format=yuv420p[v${index}]`
+      `[bgt${index}][cut${index}]overlay=format=auto[vb${index}]`
     );
+    if (cutaways.lines.length > 0) {
+      lines.push(`[vb${index}]null[pic${index}]`, ...cutaways.lines, `[${cutaways.output}]null${front}${titles.captions},format=yuv420p${out}`, ...retime);
+    } else {
+      lines.push(`[vb${index}]null${front}${titles.captions},format=yuv420p${out}`, ...retime);
+    }
     return lines;
   }
-  return [`${head},${titles.effects}${front}${titles.captions},format=yuv420p[v${index}]`];
+  if (cutaways.lines.length > 0) {
+    return [`${head},${titles.effects}[pic${index}]`, ...cutaways.lines, `[${cutaways.output}]null${front}${titles.captions},format=yuv420p${out}`, ...retime];
+  }
+  return [`${head},${titles.effects}${front}${titles.captions},format=yuv420p${out}`, ...retime];
+}
+
+/**
+ * The cutaway streams of a segment laid on `[pic<index>]` one after another.
+ * `output` is the label carrying the picture once every cutaway is on it.
+ */
+function cutawayGraph(
+  index: number,
+  segment: PreparedSegment,
+  cutawayInputs: number[],
+  fps: number
+): { lines: string[]; output: string } {
+  const lines: string[] = [];
+  let current = `pic${index}`;
+  segment.cutaways.forEach((cutaway, k) => {
+    const inputIndex = cutawayInputs[k];
+    if (inputIndex === undefined) return;
+    const label = `cw${index}_${k}`;
+    lines.push(...cutaway.lines(inputIndex, label, fps));
+    lines.push(`[${current}][${label}]${cutaway.overlay}[${label}p]`);
+    current = `${label}p`;
+  });
+  return { lines, output: current };
+}
+
+/**
+ * Stretch a finished segment to its output length. A freeze holds the first
+ * frame; slow motion stretches the timestamps (optionally
+ * synthesising the in-between frames); fast motion compresses them.
+ */
+function rateVideoChain(segment: PreparedSegment): string {
+  // `loop` repeats the first frame forever; `trim` ends it at the span's length.
+  if (segment.rate <= 0) return `loop=loop=-1:size=1:start=0,trim=duration=${segment.outputDuration.toFixed(4)},setpts=PTS-STARTPTS`;
+  const stretch = `setpts=PTS/${segment.rate.toFixed(4)}`;
+  if (segment.smooth && segment.rate < 1) return `${stretch},minterpolate=fps=30:mi_mode=mci:mc_mode=aobmc:vsbmc=1`;
+  return stretch;
+}
+
+/**
+ * The voice for a re-timed segment. Slow motion and a freeze fade it out over
+ * the first 0.2 s and pad silence to the output length; fast motion keeps the
+ * words, pitch-corrected (atempo takes 0.5–100 per stage, so 3× is one stage).
+ */
+function rateAudioChain(segment: PreparedSegment): string {
+  if (segment.rate === 1) return "";
+  if (segment.rate > 1) return `,atempo=${segment.rate.toFixed(4)}`;
+  return `,afade=t=out:st=0:d=0.2,apad=whole_dur=${segment.outputDuration.toFixed(4)}`;
 }
 
 async function encodeMerge(
@@ -1545,7 +1806,8 @@ async function encodeMerge(
   totalDuration: number,
   audioFilter: string,
   onProgress: (pct: number) => void,
-  matte?: ClipMatte
+  matte?: ClipMatte,
+  encoder: { preset?: string; crf?: number; fps?: number } = {}
 ): Promise<void> {
   const args: string[] = ["-y", "-hide_banner", "-loglevel", "error", "-nostats"];
   for (const segment of segments) {
@@ -1561,22 +1823,31 @@ async function encodeMerge(
     );
   }
   let matteIndex: number | undefined;
+  let nextInput = segments.length;
   if (matte && segments.some((segment) => segment.titles?.behindAss)) {
-    matteIndex = segments.length;
+    matteIndex = nextInput++;
     args.push("-i", matte.path);
   }
+  // Every cutaway's media is one more input, numbered after the footage.
+  const cutawayInputs = segments.map((segment) =>
+    segment.cutaways.map((cutaway) => {
+      args.push(...cutaway.inputArgs(cutaway.lengthSec));
+      return nextInput++;
+    })
+  );
+  const fps = segments.find((segment) => segment.titles?.fps)?.titles?.fps ?? encoder.fps ?? 30;
 
   const graph: string[] = [];
   const concatParts: string[] = [];
   segments.forEach((segment, index) => {
-    graph.push(...segmentVideoGraph(index, segment, matte, matteIndex));
+    graph.push(...segmentVideoGraph(index, segment, matte, matteIndex, cutawayInputs[index], fps));
     if (audio) {
       graph.push(
         // Zero the clock BEFORE aresample: with `first_pts=0` on audio whose
         // timestamps still read the source's (copyts), aresample pads the whole
         // gap with silence — minutes of it for a window deep into an episode —
         // and concat waits on that audio before it will start the next part.
-        `[${index}:a]atrim=start=${segment.startSec.toFixed(4)}:duration=${segment.duration.toFixed(4)},asetpts=PTS-(${segment.startSec.toFixed(4)}/TB),aresample=async=1:first_pts=0${audioFilter ? `,${audioFilter}` : ""}[a${index}]`
+        `[${index}:a]atrim=start=${segment.startSec.toFixed(4)}:duration=${segment.duration.toFixed(4)},asetpts=PTS-(${segment.startSec.toFixed(4)}/TB),aresample=async=1:first_pts=0${audioFilter ? `,${audioFilter}` : ""}${rateAudioChain(segment)}[a${index}]`
       );
     }
     concatParts.push(`[v${index}]`);
@@ -1591,8 +1862,8 @@ async function encodeMerge(
   if (audio) args.push("-map", "[outa]");
   args.push(
     "-c:v", "libx264",
-    "-preset", config.ffmpegPreset,
-    "-crf", String(config.ffmpegCrf),
+    "-preset", encoder.preset ?? config.ffmpegPreset,
+    "-crf", String(encoder.crf ?? config.ffmpegCrf),
     "-pix_fmt", "yuv420p"
   );
   if (audio) args.push("-c:a", "aac", "-b:a", "128k");

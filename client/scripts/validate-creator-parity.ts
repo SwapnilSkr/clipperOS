@@ -58,12 +58,12 @@ for (let round = 0; round < 60; round++) {
       follow: { enabled: rand() > 0.5, tightness: rand(), zoom: 1 + rand() * 0.3 },
       moves: Array.from({ length: Math.floor(rand() * 4) }, (_, i) => {
         const start = trimStart + i * 5 + rand() * 2;
-        const kinds = ["punch", "push", "pull"] as const;
+        const kinds = ["punch", "push", "pull", "hold"] as const;
         const eases = ["cut", "out", "in_out"] as const;
         const anchors = ["face", "center", { x: rand(), y: rand() }] as const;
         return {
           id: `m${i}`,
-          kind: kinds[Math.floor(rand() * 3)]!,
+          kind: kinds[Math.floor(rand() * 4)]!,
           startSec: start,
           endSec: start + 0.3 + rand() * 2,
           zoom: 1.05 + rand() * 0.4,
@@ -78,12 +78,16 @@ for (let round = 0; round < 60; round++) {
   const b = server.windowsFor(trimStart, trimEnd, cuts);
   if (JSON.stringify(a) !== JSON.stringify(b)) mismatches++;
 
+  // The camera path both sides frame from: smoothed, with the holds locked off.
+  const trackA = client.cameraTrackFor(track, plan);
+  const trackB = server.cameraTrackFor(track, plan);
+  if (JSON.stringify(trackA.keyframes) !== JSON.stringify(trackB.keyframes)) mismatches++;
   for (let i = 0; i < 40; i++) {
     const t = trimStart + rand() * (trimEnd - trimStart);
     if (Math.abs(client.sourceToOutput(a, t) - server.sourceToOutput(b, t)) > 1e-9) mismatches++;
     if (Math.abs(client.nextKeptTime(a, t) - server.nextKeptTime(b, t)) > 1e-9) mismatches++;
-    const ca = client.cameraStateAt(plan, track, t);
-    const cb = server.cameraStateAt(plan, track, t);
+    const ca = client.cameraStateAt(plan, trackA, t);
+    const cb = server.cameraStateAt(plan, trackB, t);
     if (Math.abs(ca.zoom - cb.zoom) > 1e-9 || Math.abs(ca.ax - cb.ax) > 1e-9 || Math.abs(ca.ay - cb.ay) > 1e-9) mismatches++;
   }
 }

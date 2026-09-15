@@ -112,6 +112,13 @@ export interface CropKeyframe {
   fx?: number;
   fy?: number;
   fw?: number;
+  /** Which way the head faces: −1 screen-left … 1 screen-right, 0 at the camera. */
+  fyaw?: number;
+  /**
+   * Written by a creator-mode hold, never by the analyser: this keyframe pins
+   * a locked-off plateau, so the renderer's de-duplication must keep it.
+   */
+  held?: boolean;
 }
 
 export interface ReframeTrack {
@@ -333,6 +340,63 @@ export interface PauseCut {
   source: "director" | "user";
 }
 
+export type SpeedKind = "slow" | "fast" | "freeze";
+
+/**
+ * A stretch of the clip played at another speed. Slow motion and a freeze
+ * fade the voice out for the span (music and hits keep the output clock);
+ * fast motion keeps the voice, pitch-corrected. Spans never overlap.
+ */
+export interface SpeedSpan {
+  id: string;
+  startSec: number;
+  endSec: number;
+  kind: SpeedKind;
+  /** Playback rate: 0.2–0.9 slow, 1.1–3 fast; ignored for a freeze (0). */
+  rate: number;
+  /** Motion-interpolated slow motion (slower render, silkier picture). */
+  smooth?: boolean;
+  /** Keep captions on during the span; off by default while the voice is faded. */
+  captions?: boolean;
+}
+
+export type CutawayMotion = "none" | "in" | "out" | "left" | "right" | "up" | "down";
+
+/**
+ * A stock image or video laid over the picture for a span, the voice running
+ * on underneath. Transitions at both edges take their time from the main
+ * footage either side, so the clock and the audio are untouched.
+ */
+export interface Cutaway {
+  id: string;
+  startSec: number;
+  endSec: number;
+  /** A media-library asset id. */
+  assetId: string;
+  /** cover: fill the 9:16 frame; blur: the whole picture over a blurred fill. */
+  fit: "cover" | "blur";
+  /** Ken Burns on a still, or a drift on a video. */
+  motion: CutawayMotion;
+  in: { transitionId: string; sec: number };
+  out: { transitionId: string; sec: number };
+  /** For a video asset: where in it the cutaway starts. */
+  offsetSec?: number;
+}
+
+/**
+ * A look on a span of the picture: one of the registry's effects
+ * (config/effects.ts), at an amount, optionally in a variant. Spans stack.
+ */
+export interface EffectSpan {
+  id: string;
+  effectId: string;
+  startSec: number;
+  endSec: number;
+  /** 0..1 */
+  amount: number;
+  variant?: string;
+}
+
 /**
  * The zoom curve inside [startSec, endSec]; 1 outside it.
  *
@@ -343,20 +407,43 @@ export interface PauseCut {
  *   pull   start AT `zoom` and settle back to 1 across the span — the classic
  *          opening push-in that relaxes as the hook lands.
  */
-export type CameraMoveKind = "punch" | "push" | "pull";
+/**
+ * punch: hard in, hold, hard out. push: creep in, let go. pull: start in,
+ * settle out. frame: ramp to a framing you set (zoom, anchor, pan) and hold it.
+ * hold: lock the camera off — the follow stops riding the head for the span
+ * (at the move's zoom and pan, from its first frame), then glides back.
+ */
+export type CameraMoveKind = "punch" | "push" | "pull" | "frame" | "hold";
 
 export type CameraEase = "cut" | "out" | "in_out";
 
-/** Where the digital zoom converges. Fractions are of the OUTPUT frame. */
-export type CameraAnchor = "face" | "center" | { x: number; y: number };
+/**
+ * Where the digital zoom converges. Fractions are of the OUTPUT frame.
+ * "look" is ahead of the head — the side it faces — so a zoom gives look room.
+ */
+export type CameraAnchor = "face" | "center" | "look" | { x: number; y: number };
 
 export interface CameraMove {
   id: string;
   kind: CameraMoveKind;
   startSec: number;
   endSec: number;
-  /** 1 is no zoom. Capped at 1.5 — beyond that a 1080p source visibly softens. */
+  /**
+   * The zoom the move reaches, relative to the 9:16 crop: 1 is none, capped at
+   * 1.5 — beyond that a 1080p source visibly softens. Below `zoomFrom` the
+   * move zooms OUT (never past the crop itself).
+   */
   zoom: number;
+  /** The zoom the move starts from; 1 when absent. */
+  zoomFrom?: number;
+  /**
+   * Where the 9:16 window sits over the source at the move's full amount, as
+   * −1..1 of the slack either side of the tracked crop (0 = the track's own
+   * framing, ±1 = the source's edge). Absent = no pan.
+   */
+  pan?: { x: number; y: number };
+  /** Seconds the move takes to reach its zoom/pan; a kind's own default when absent. */
+  rampSec?: number;
   anchor: CameraAnchor;
   ease: CameraEase;
 }
@@ -376,6 +463,8 @@ export interface CameraFollow {
   response?: FollowResponse;
   /** Default "both". */
   axis?: FollowAxis;
+  /** 0..1 lead room: the crop leans toward the side the head faces. */
+  lead?: number;
 }
 
 export interface CameraPlan {
@@ -413,6 +502,13 @@ export interface BehindTitle {
   depth: "behind" | "front";
 }
 
+/** One Director pass: what the creator asked, what the Director said it did. */
+export interface DirectorTurn {
+  notes?: string;
+  summary: string;
+  at: string;
+}
+
 export interface DirectorNotes {
   /** What the user asked for on the last pass. */
   notes?: string;
@@ -420,7 +516,11 @@ export interface DirectorNotes {
   summary?: string;
   generatedAt?: string;
   model?: string;
+  /** The last passes, oldest first, so a note can build on the ones before it. */
+  turns?: DirectorTurn[];
 }
+
+export const MAX_DIRECTOR_TURNS = 6;
 
 export interface CreatorPlan {
   enabled: boolean;
@@ -429,15 +529,42 @@ export interface CreatorPlan {
   camera?: CameraPlan;
   captionScenes?: CaptionScene[];
   titles?: BehindTitle[];
+  speed?: SpeedSpan[];
+  effects?: EffectSpan[];
+  cutaways?: Cutaway[];
   director?: DirectorNotes;
 }
 
 export const MAX_PAUSE_CUTS = 40;
+export const MAX_SPEED_SPANS = 12;
+export const MAX_EFFECT_SPANS = 24;
+export const MAX_CUTAWAYS = 8;
+export const MAX_TRANSITION_SEC = 1.5;
+
+/** A still or a video in the shared media library (uploads and stock picks). */
+export interface MediaAsset {
+  id: string;
+  kind: "image" | "video";
+  source: "upload" | "pexels" | "pixabay";
+  label: string;
+  width: number;
+  height: number;
+  /** Videos only. */
+  durationSec?: number;
+  /** Credit line the provider's terms ask for. */
+  attribution?: string;
+  /** The provider's page for the item, when it has one. */
+  sourceUrl?: string;
+}
+export const MIN_SPEED_RATE = 0.2;
+export const MAX_SPEED_RATE = 3;
 export const MAX_CAMERA_MOVES = 24;
 export const MAX_CAPTION_SCENES = 12;
 export const MAX_TITLES = 6;
 /** Digital zoom ceiling. Above ~1.35 the UI warns about softness on 1080p. */
 export const MAX_CAMERA_ZOOM = 1.5;
+/** A move may zoom out to this share of the crop; the picture never shows past the crop (total ≥ 1). */
+export const MIN_CAMERA_ZOOM = 0.75;
 export const MAX_FOLLOW_ZOOM = 1.3;
 
 /** Per-clip join onto a shared library sting. */

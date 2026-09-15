@@ -87,13 +87,56 @@ const PauseCutBody = t.Object({
   source: t.Union([t.Literal("director"), t.Literal("user")]),
 });
 
+const SpeedSpanBody = t.Object({
+  id: t.String({ minLength: 1, maxLength: 64 }),
+  startSec: t.Number(),
+  endSec: t.Number(),
+  kind: t.Union([t.Literal("slow"), t.Literal("fast"), t.Literal("freeze")]),
+  rate: t.Number(),
+  smooth: t.Optional(t.Boolean()),
+  captions: t.Optional(t.Boolean()),
+});
+
+const EffectSpanBody = t.Object({
+  id: t.String({ minLength: 1, maxLength: 64 }),
+  effectId: t.String({ minLength: 1, maxLength: 40 }),
+  startSec: t.Number(),
+  endSec: t.Number(),
+  amount: t.Number(),
+  variant: t.Optional(t.String({ maxLength: 20 })),
+});
+
+const CutawayEdgeBody = t.Object({ transitionId: t.String({ maxLength: 24 }), sec: t.Number() });
+const CutawayBody = t.Object({
+  id: t.String({ minLength: 1, maxLength: 64 }),
+  startSec: t.Number(),
+  endSec: t.Number(),
+  assetId: t.String({ minLength: 1, maxLength: 64 }),
+  fit: t.Union([t.Literal("cover"), t.Literal("blur")]),
+  motion: t.Union([
+    t.Literal("none"),
+    t.Literal("in"),
+    t.Literal("out"),
+    t.Literal("left"),
+    t.Literal("right"),
+    t.Literal("up"),
+    t.Literal("down"),
+  ]),
+  in: CutawayEdgeBody,
+  out: CutawayEdgeBody,
+  offsetSec: t.Optional(t.Number()),
+});
+
 const CameraMoveBody = t.Object({
   id: t.String({ minLength: 1, maxLength: 64 }),
-  kind: t.Union([t.Literal("punch"), t.Literal("push"), t.Literal("pull")]),
+  kind: t.Union([t.Literal("punch"), t.Literal("push"), t.Literal("pull"), t.Literal("frame"), t.Literal("hold")]),
   startSec: t.Number(),
   endSec: t.Number(),
   zoom: t.Number(),
-  anchor: t.Union([t.Literal("face"), t.Literal("center"), t.Object({ x: t.Number(), y: t.Number() })]),
+  zoomFrom: t.Optional(t.Number()),
+  pan: t.Optional(t.Object({ x: t.Number(), y: t.Number() })),
+  rampSec: t.Optional(t.Number()),
+  anchor: t.Union([t.Literal("face"), t.Literal("center"), t.Literal("look"), t.Object({ x: t.Number(), y: t.Number() })]),
   ease: t.Union([t.Literal("cut"), t.Literal("out"), t.Literal("in_out")]),
 });
 
@@ -134,6 +177,7 @@ export const CreatorPlanBody = t.Object({
           zoom: t.Optional(t.Number()),
           response: t.Optional(t.Union([t.Literal("snappy"), t.Literal("natural"), t.Literal("smooth")])),
           axis: t.Optional(t.Union([t.Literal("both"), t.Literal("x"), t.Literal("y")])),
+          lead: t.Optional(t.Number()),
         })
       ),
       moves: t.Array(CameraMoveBody, { maxItems: 24 }),
@@ -141,12 +185,25 @@ export const CreatorPlanBody = t.Object({
   ),
   captionScenes: t.Optional(t.Array(CaptionSceneBody, { maxItems: 12 })),
   titles: t.Optional(t.Array(BehindTitleBody, { maxItems: 6 })),
+  speed: t.Optional(t.Array(SpeedSpanBody, { maxItems: 12 })),
+  effects: t.Optional(t.Array(EffectSpanBody, { maxItems: 24 })),
+  cutaways: t.Optional(t.Array(CutawayBody, { maxItems: 8 })),
   director: t.Optional(
     t.Object({
       notes: t.Optional(t.String({ maxLength: 600 })),
       summary: t.Optional(t.String({ maxLength: 1200 })),
       generatedAt: t.Optional(t.String({ maxLength: 40 })),
       model: t.Optional(t.String({ maxLength: 80 })),
+      turns: t.Optional(
+        t.Array(
+          t.Object({
+            notes: t.Optional(t.String({ maxLength: 600 })),
+            summary: t.String({ maxLength: 1200 }),
+            at: t.String({ maxLength: 40 }),
+          }),
+          { maxItems: 6 }
+        )
+      ),
     })
   ),
 });
@@ -262,8 +319,11 @@ export const DirectClipBody = t.Object({
         t.Literal("captions"),
         t.Literal("titles"),
         t.Literal("sfx"),
+        t.Literal("speed"),
+        t.Literal("fx"),
+        t.Literal("cutaways"),
       ]),
-      { maxItems: 5 }
+      { maxItems: 8 }
     )
   ),
 });
@@ -314,6 +374,22 @@ export const MergeClipsBody = t.Object({
 
 export const ProjectParams = t.Object({ id: t.String({ pattern: OBJECT_ID_PATTERN }) });
 export const ClipParams = t.Object({ id: t.String({ pattern: OBJECT_ID_PATTERN }) });
+export const ClipSpanPreviewParams = t.Object({
+  id: t.String({ pattern: OBJECT_ID_PATTERN }),
+  key: t.String({ pattern: "^[a-z0-9]{1,24}$" }),
+});
+export const PreviewSpanBody = t.Object({ startSec: t.Number(), endSec: t.Number() });
+export const MediaAssetParams = t.Object({ id: t.String({ pattern: "^[0-9a-f-]{36}$" }) });
+export const StockSearchQuery = t.Object({
+  q: t.String({ minLength: 1, maxLength: 120 }),
+  kind: t.Optional(t.Union([t.Literal("image"), t.Literal("video")])),
+});
+export const StockPickBody = t.Object({
+  source: t.Union([t.Literal("pexels"), t.Literal("pixabay")]),
+  id: t.String({ minLength: 1, maxLength: 32 }),
+  kind: t.Union([t.Literal("image"), t.Literal("video")]),
+  query: t.String({ minLength: 1, maxLength: 120 }),
+});
 export const ShareCopyBody = t.Object({
   force: t.Optional(t.Boolean()),
 });

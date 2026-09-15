@@ -1,8 +1,26 @@
-import { useMemo, useState, type ReactNode } from "react";
-import { Camera, Captions, Loader2, Mic, Music, Play, Scissors, Trash2, Type, Upload, Volume2, Wand2 } from "lucide-react";
+import { useMemo, useState, type ReactNode, type RefObject } from "react";
+import {
+  Camera,
+  Captions,
+  Film,
+  Gauge,
+  Loader2,
+  Mic,
+  Music,
+  Play,
+  Scissors,
+  Sparkles,
+  Trash2,
+  Type,
+  Upload,
+  Volume2,
+  Wand2,
+} from "lucide-react";
 import {
   api,
   MAX_CAMERA_ZOOM,
+  MAX_TRANSITION_SEC,
+  MIN_CAMERA_ZOOM,
   MAX_FOLLOW_ZOOM,
   type AudioAsset,
   type BehindTitle,
@@ -18,11 +36,30 @@ import {
   type Soundtrack,
   type SoundtrackHit,
   type FollowAxis,
+  type Cutaway,
+  type CutawayMotion,
+  type EffectInfo,
+  type EffectSpan,
+  type MediaAsset,
+  type TransitionInfo,
   type FollowResponse,
+  type ReframeTrack,
+  type SpeedKind,
+  type SpeedSpan,
   type VideoEffects,
 } from "@/api";
 import { enablePlan, removeBeat, type BeatLane } from "@/lib/beat-plan";
-import { FOLLOW_MIN_ZOOM, outputDuration, type TimeWindow } from "@/lib/creator-timeline";
+import {
+  FOLLOW_MIN_ZOOM,
+  followLead,
+  followTightnessX,
+  moveRampSec,
+  outputDuration,
+  type TimeWindow,
+} from "@/lib/creator-timeline";
+import { FramingWidget } from "./FramingWidget";
+import { EffectPicker, rememberEffect } from "./EffectPicker";
+import { MediaPicker } from "./MediaPicker";
 import { cn, timecode } from "@/lib/utils";
 import type { BeatSelection } from "./BeatTimeline";
 import { DirectorPanel } from "./DirectorPanel";
@@ -60,12 +97,29 @@ export interface CreatorDeskProps {
   hasFaceTrack: boolean;
   /** How far the head moves within a shot, as fractions of the frame — what follow has to work with. */
   headTravel?: { x: number; y: number };
+  /** The effects pack, served by the API. */
+  effects: EffectInfo[];
+  /** Stills and videos for cutaways, the stock providers with a key, and the transitions on offer. */
+  mediaLibrary: MediaAsset[];
+  stockSources: ("pexels" | "pixabay")[];
+  transitions: TransitionInfo[];
+  /** The library changed: reload it. */
+  onMediaChanged: () => Promise<void> | void;
+  /** Place a cutaway with this asset at the playhead. */
+  onPlaceCutaway: (assetId: string) => void;
+  /** Render [startSec, endSec] exactly (the draft is flushed first); resolves to a streamable URL. */
+  onPreviewSpan: (startSec: number, endSec: number) => Promise<{ url: string; durationSec: number }>;
+  /** The player's source element and its crop track, for the framing widget. */
+  videoRef: RefObject<HTMLVideoElement | null>;
+  track: ReframeTrack | undefined;
+  /** The track's time origin (source seconds of keyframe t=0). */
+  cropOrigin: number;
   /** Built-in and uploaded audio: beds for the Sound panel, one-shots for the SFX lane. */
   audioLibrary: AudioAsset[];
   /** Upload a file into the shared library; the editor refreshes `audioLibrary`. */
   onUploadAudio: (file: File, kind: "music" | "sfx") => Promise<void>;
   /** Flush the draft, run the Director, adopt its plan. Rejects with a message. */
-  onDirect: (input: { notes?: string; keep: DirectorLane[] }) => Promise<void>;
+  onDirect: (input: { notes?: string; keep: DirectorLane[] }) => Promise<{ warnings: string[] }>;
 }
 
 function round3(value: number): number {
@@ -93,6 +147,16 @@ export function CreatorDesk({
   onSelect,
   hasFaceTrack,
   headTravel,
+  effects: effectsPack,
+  mediaLibrary,
+  stockSources,
+  transitions,
+  onMediaChanged,
+  onPlaceCutaway,
+  onPreviewSpan,
+  videoRef,
+  track,
+  cropOrigin,
   audioLibrary: library,
   onUploadAudio,
   onDirect,
@@ -139,6 +203,9 @@ export function CreatorDesk({
   }
 
   const cuts = plan.cuts ?? [];
+  const speed = plan.speed ?? [];
+  const effects = plan.effects ?? [];
+  const cutaways = plan.cutaways ?? [];
   const moves = plan.camera?.moves ?? [];
   const scenes = plan.captionScenes ?? [];
   const titles = plan.titles ?? [];
@@ -157,6 +224,15 @@ export function CreatorDesk({
     patch({
       cuts: cuts.map((cut) => (cut.id === id ? { ...cut, ...change } : cut)),
     });
+  }
+  function updateCutaway(id: string, change: Partial<Cutaway>) {
+    patch({ cutaways: cutaways.map((item) => (item.id === id ? { ...item, ...change } : item)) });
+  }
+  function updateEffect(id: string, change: Partial<EffectSpan>) {
+    patch({ effects: effects.map((span) => (span.id === id ? { ...span, ...change } : span)) });
+  }
+  function updateSpeed(id: string, change: Partial<SpeedSpan>) {
+    patch({ speed: speed.map((span) => (span.id === id ? { ...span, ...change } : span)) });
   }
   function updateMove(id: string, change: Partial<CameraMove>) {
     patch({
@@ -219,6 +295,9 @@ export function CreatorDesk({
 
   const selectedCut = selected?.lane === "cuts" ? cuts.find((cut) => cut.id === selected.id) : undefined;
   const selectedMove = selected?.lane === "camera" ? moves.find((move) => move.id === selected.id) : undefined;
+  const selectedSpeed = selected?.lane === "speed" ? speed.find((span) => span.id === selected.id) : undefined;
+  const selectedEffect = selected?.lane === "fx" ? effects.find((span) => span.id === selected.id) : undefined;
+  const selectedCutaway = selected?.lane === "cutaways" ? cutaways.find((item) => item.id === selected.id) : undefined;
   const selectedScene = selected?.lane === "captions" ? scenes.find((scene) => scene.id === selected.id) : undefined;
   const selectedTitle = selected?.lane === "titles" ? titles.find((title) => title.id === selected.id) : undefined;
   const selectedHit = selected?.lane === "sfx" ? sfx.find((hit) => hit.id === selected.id) : undefined;
@@ -252,7 +331,7 @@ export function CreatorDesk({
       >
         <p className="text-meta text-muted">
           {plan.enabled
-            ? `${moves.length} camera · ${scenes.length} caption ${scenes.length === 1 ? "scene" : "scenes"} · ${titles.length} ${titles.length === 1 ? "title" : "titles"} · ${sfx.length} SFX${removed > 0.05 ? ` · −${removed.toFixed(1)}s` : ""}`
+            ? `${moves.length} camera${speed.length > 0 ? ` · ${speed.length} speed` : ""}${effects.length > 0 ? ` · ${effects.length} FX` : ""}${cutaways.length > 0 ? ` · ${cutaways.length} B-roll` : ""} · ${scenes.length} caption ${scenes.length === 1 ? "scene" : "scenes"} · ${titles.length} ${titles.length === 1 ? "title" : "titles"} · ${sfx.length} SFX${removed > 0.05 ? ` · −${removed.toFixed(1)}s` : ""}`
             : "Renders with the Edit desk only."}
         </p>
       </Panel>
@@ -274,17 +353,239 @@ export function CreatorDesk({
         </Inspector>
       ) : null}
 
+      {plan.enabled && selectedSpeed ? (
+        <Inspector title="Speed" icon={Gauge} onRemove={() => remove("speed", selectedSpeed.id)}>
+          <Choice<SpeedKind>
+            value={selectedSpeed.kind}
+            options={[
+              ["slow", "Slow motion"],
+              ["freeze", "Freeze frame"],
+              ["fast", "Fast forward"],
+            ]}
+            onChange={(kind) =>
+              updateSpeed(selectedSpeed.id, {
+                kind,
+                rate: kind === "freeze" ? 0 : kind === "fast" ? 1.5 : 0.5,
+                ...(kind !== "slow" ? { smooth: undefined } : {}),
+              })
+            }
+          />
+          {selectedSpeed.kind === "slow" ? (
+            <Field label="Rate">
+              <Choice<string>
+                value={String(selectedSpeed.rate)}
+                options={[
+                  ["0.25", "¼×"],
+                  ["0.4", "0.4×"],
+                  ["0.5", "½×"],
+                  ["0.75", "¾×"],
+                ]}
+                onChange={(rate) => updateSpeed(selectedSpeed.id, { rate: Number(rate) })}
+              />
+            </Field>
+          ) : null}
+          {selectedSpeed.kind === "fast" ? (
+            <Field label="Rate">
+              <Choice<string>
+                value={String(selectedSpeed.rate)}
+                options={[
+                  ["1.25", "1¼×"],
+                  ["1.5", "1½×"],
+                  ["2", "2×"],
+                  ["3", "3×"],
+                ]}
+                onChange={(rate) => updateSpeed(selectedSpeed.id, { rate: Number(rate) })}
+              />
+            </Field>
+          ) : null}
+          <SpanFields
+            startSec={selectedSpeed.startSec}
+            endSec={selectedSpeed.endSec}
+            min={trimStart}
+            max={trimEnd}
+            onChange={(span) => updateSpeed(selectedSpeed.id, span)}
+          />
+          {selectedSpeed.kind === "slow" ? (
+            <Check
+              label="Smooth (synthesise in-between frames; slower render)"
+              checked={selectedSpeed.smooth === true}
+              onChange={(smooth) => updateSpeed(selectedSpeed.id, { smooth: smooth || undefined })}
+            />
+          ) : null}
+          {selectedSpeed.kind !== "fast" ? (
+            <Check
+              label="Keep captions on"
+              checked={selectedSpeed.captions === true}
+              onChange={(captions) => updateSpeed(selectedSpeed.id, { captions: captions || undefined })}
+            />
+          ) : null}
+          <p className="text-meta mt-2 text-muted">
+            {selectedSpeed.kind === "fast"
+              ? "The voice speeds up with the picture, pitch kept."
+              : "The voice fades out for this stretch; music and sound effects carry on."}
+          </p>
+        </Inspector>
+      ) : null}
+
+      {plan.enabled && selectedCutaway ? (
+        <Inspector
+          title={mediaLibrary.find((item) => item.id === selectedCutaway.assetId)?.label ?? "Cutaway"}
+          icon={Film}
+          onRemove={() => remove("cutaways", selectedCutaway.id)}
+        >
+          <SpanFields
+            startSec={selectedCutaway.startSec}
+            endSec={selectedCutaway.endSec}
+            min={trimStart}
+            max={trimEnd}
+            onChange={(span) => updateCutaway(selectedCutaway.id, span)}
+          />
+          <Field label="Fit">
+            <Choice<Cutaway["fit"]>
+              value={selectedCutaway.fit}
+              options={[
+                ["cover", "Fill the frame"],
+                ["blur", "Whole, blurred fill"],
+              ]}
+              onChange={(fit) => updateCutaway(selectedCutaway.id, { fit })}
+            />
+          </Field>
+          <Field label="Motion">
+            <Choice<CutawayMotion>
+              value={selectedCutaway.motion}
+              options={[
+                ["none", "Still"],
+                ["in", "Zoom in"],
+                ["out", "Zoom out"],
+                ["left", "← Pan"],
+                ["right", "Pan →"],
+              ]}
+              onChange={(motion) => updateCutaway(selectedCutaway.id, { motion })}
+            />
+          </Field>
+          <div className="mt-3 grid grid-cols-2 gap-2">
+            <TransitionField
+              label="In"
+              edge={selectedCutaway.in}
+              transitions={transitions}
+              onChange={(edge) => updateCutaway(selectedCutaway.id, { in: edge })}
+            />
+            <TransitionField
+              label="Out"
+              edge={selectedCutaway.out}
+              transitions={transitions}
+              onChange={(edge) => updateCutaway(selectedCutaway.id, { out: edge })}
+            />
+          </div>
+          {mediaLibrary.find((item) => item.id === selectedCutaway.assetId)?.kind === "video" ? (
+            <Slider
+              label="Start in the video at"
+              value={selectedCutaway.offsetSec ?? 0}
+              min={0}
+              max={Math.max(0.5, (mediaLibrary.find((item) => item.id === selectedCutaway.assetId)?.durationSec ?? 10) - 0.5)}
+              step={0.1}
+              format={(value) => `${value.toFixed(1)}s`}
+              onChange={(offsetSec) => updateCutaway(selectedCutaway.id, { offsetSec: offsetSec > 0 ? round3(offsetSec) : undefined })}
+            />
+          ) : null}
+          <Field label="Picture">
+            <MediaPicker
+              assets={mediaLibrary}
+              stockSources={stockSources}
+              value={selectedCutaway.assetId}
+              onPick={(asset) => updateCutaway(selectedCutaway.id, { assetId: asset.id })}
+              onChanged={onMediaChanged}
+              pickLabel="Use here"
+            />
+          </Field>
+          <SpanPreview
+            key={selectedCutaway.id}
+            startSec={selectedCutaway.startSec}
+            endSec={selectedCutaway.endSec}
+            onRender={onPreviewSpan}
+          />
+        </Inspector>
+      ) : null}
+
+      {plan.enabled && selectedEffect ? (
+        <Inspector
+          title={effectsPack.find((item) => item.id === selectedEffect.effectId)?.label ?? "Effect"}
+          icon={Sparkles}
+          onRemove={() => remove("fx", selectedEffect.id)}
+        >
+          <SpanFields
+            startSec={selectedEffect.startSec}
+            endSec={selectedEffect.endSec}
+            min={trimStart}
+            max={trimEnd}
+            onChange={(span) => updateEffect(selectedEffect.id, span)}
+          />
+          <Slider
+            label="Amount"
+            value={selectedEffect.amount}
+            min={0}
+            max={1}
+            step={0.05}
+            format={(value) => `${Math.round(value * 100)}%`}
+            onChange={(amount) => updateEffect(selectedEffect.id, { amount: round3(amount) })}
+          />
+          {(() => {
+            const variants = effectsPack.find((item) => item.id === selectedEffect.effectId)?.variants;
+            return variants?.length ? (
+              <Field label="Direction">
+                <Choice<string>
+                  value={selectedEffect.variant ?? variants[0]!.id}
+                  options={variants.map((variant) => [variant.id, variant.label] as [string, string])}
+                  onChange={(variant) => updateEffect(selectedEffect.id, { variant })}
+                />
+              </Field>
+            ) : null;
+          })()}
+          <Field label="Effect">
+            <EffectPicker
+              effects={effectsPack}
+              sample={{ video: videoRef, track, cropOrigin, tightness: followTightnessX(plan), lead: followLead(plan) }}
+              amount={selectedEffect.amount}
+              value={selectedEffect.effectId}
+              onPick={(effectId) => {
+                updateEffect(selectedEffect.id, { effectId, variant: undefined });
+                rememberEffect(effectId);
+              }}
+            />
+          </Field>
+          <SpanPreview
+            key={selectedEffect.id}
+            startSec={selectedEffect.startSec}
+            endSec={selectedEffect.endSec}
+            onRender={onPreviewSpan}
+          />
+        </Inspector>
+      ) : null}
+
       {plan.enabled && selectedMove ? (
         <Inspector title="Camera move" icon={Camera} onRemove={() => remove("camera", selectedMove.id)}>
           <Choice<CameraMove["kind"]>
             value={selectedMove.kind}
             options={[
-              ["punch", "Punch in"],
-              ["push", "Slow push"],
-              ["pull", "Hook pull"],
+              ["punch", "Punch"],
+              ["push", "Push"],
+              ["pull", "Pull"],
+              ["frame", "Frame"],
+              ["hold", "Hold"],
             ]}
             onChange={(kind) => updateMove(selectedMove.id, { kind })}
           />
+          <p className="text-meta mt-1 text-muted">
+            {selectedMove.kind === "punch"
+              ? "Hard in, hold, hard out."
+              : selectedMove.kind === "push"
+                ? "Creeps in, lets go at the end."
+                : selectedMove.kind === "pull"
+                  ? "Starts zoomed, settles out."
+                  : selectedMove.kind === "hold"
+                    ? "Locks the camera off: it stops riding the head for the span, then glides back."
+                    : "Ramps to the framing you set below and holds it."}
+          </p>
           <SpanFields
             startSec={selectedMove.startSec}
             endSec={selectedMove.endSec}
@@ -292,20 +593,46 @@ export function CreatorDesk({
             max={trimEnd}
             onChange={(span) => updateMove(selectedMove.id, span)}
           />
+          <FramingWidget
+            video={videoRef}
+            track={track}
+            plan={plan}
+            move={selectedMove}
+            tightness={followTightnessX(plan)}
+            lead={followLead(plan)}
+            cropOrigin={cropOrigin}
+            onChange={(change) => updateMove(selectedMove.id, change)}
+          />
           <Slider
-            label="Zoom"
+            label={selectedMove.kind === "pull" ? "Zoom from" : selectedMove.kind === "hold" ? "Zoom" : "Zoom to"}
             value={selectedMove.zoom}
-            min={1.02}
+            min={MIN_CAMERA_ZOOM}
             max={MAX_CAMERA_ZOOM}
             step={0.01}
-            format={(value) => `${Math.round((value - 1) * 100)}%${value > 1.35 ? " · soft" : ""}`}
+            format={(value) =>
+              `${value >= 1 ? "+" : ""}${Math.round((value - 1) * 100)}%${value > 1.35 ? " · soft" : value < 1 ? " · out" : ""}`
+            }
             onChange={(zoom) => updateMove(selectedMove.id, { zoom: round3(zoom) })}
           />
-          <Field label="Anchor">
-            <Choice<"face" | "center" | "custom">
+          {selectedMove.kind !== "hold" ? (
+            <Slider
+              label={selectedMove.kind === "pull" ? "Zoom to" : "Zoom from"}
+              value={selectedMove.zoomFrom ?? 1}
+              min={MIN_CAMERA_ZOOM}
+              max={MAX_CAMERA_ZOOM}
+              step={0.01}
+              format={(value) => `${value >= 1 ? "+" : ""}${Math.round((value - 1) * 100)}%`}
+              onChange={(zoomFrom) =>
+                updateMove(selectedMove.id, { zoomFrom: Math.abs(zoomFrom - 1) < 0.005 ? undefined : round3(zoomFrom) })
+              }
+            />
+          ) : null}
+          <Field label="Zoom point">
+            <Choice<"face" | "look" | "center" | "custom">
               value={typeof selectedMove.anchor === "string" ? selectedMove.anchor : "custom"}
               options={[
                 ["face", "Face"],
+                ["look", "Look"],
                 ["center", "Centre"],
                 ["custom", "Point"],
               ]}
@@ -316,53 +643,34 @@ export function CreatorDesk({
               }
             />
           </Field>
-          {typeof selectedMove.anchor === "object" ? (
-            <>
-              <Slider
-                label="Across"
-                value={selectedMove.anchor.x}
-                min={0}
-                max={1}
-                step={0.01}
-                format={(value) => `${Math.round(value * 100)}%`}
-                onChange={(x) =>
-                  updateMove(selectedMove.id, {
-                    anchor: {
-                      ...(selectedMove.anchor as { x: number; y: number }),
-                      x: round3(x),
-                    },
-                  })
-                }
-              />
-              <Slider
-                label="Down"
-                value={selectedMove.anchor.y}
-                min={0}
-                max={1}
-                step={0.01}
-                format={(value) => `${Math.round(value * 100)}%`}
-                onChange={(y) =>
-                  updateMove(selectedMove.id, {
-                    anchor: {
-                      ...(selectedMove.anchor as { x: number; y: number }),
-                      y: round3(y),
-                    },
-                  })
-                }
-              />
-            </>
+          {selectedMove.anchor === "look" && !hasFaceTrack ? (
+            <p className="text-meta mt-1 text-warn">No face track yet — Look behaves like Face until one exists.</p>
           ) : null}
-          <Field label="Ease">
-            <Choice<CameraMove["ease"]>
-              value={selectedMove.ease}
-              options={[
-                ["cut", "Hard"],
-                ["out", "Out"],
-                ["in_out", "In & out"],
-              ]}
-              onChange={(ease) => updateMove(selectedMove.id, { ease })}
+          {/* A hold is in force for its whole span: no ease, no ramp. */}
+          {selectedMove.kind !== "hold" ? (
+            <Field label="Ease">
+              <Choice<CameraMove["ease"]>
+                value={selectedMove.ease}
+                options={[
+                  ["cut", "Hard"],
+                  ["out", "Out"],
+                  ["in_out", "In & out"],
+                ]}
+                onChange={(ease) => updateMove(selectedMove.id, { ease })}
+              />
+            </Field>
+          ) : null}
+          {selectedMove.ease !== "cut" && selectedMove.kind !== "hold" ? (
+            <Slider
+              label="Ramp"
+              value={moveRampSec(selectedMove)}
+              min={0.05}
+              max={Math.max(0.1, Math.min(3, selectedMove.endSec - selectedMove.startSec))}
+              step={0.05}
+              format={(value) => `${value.toFixed(2)}s`}
+              onChange={(rampSec) => updateMove(selectedMove.id, { rampSec: round3(rampSec) })}
             />
-          </Field>
+          ) : null}
         </Inspector>
       ) : null}
 
@@ -840,6 +1148,17 @@ export function CreatorDesk({
                     onChange={(response) => patch({ camera: { moves, follow: { ...follow, response } } })}
                   />
                 </Field>
+                <Slider
+                  label="Lead room"
+                  value={follow.lead ?? 0}
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  format={(value) => (value > 0 ? `${Math.round(value * 100)}%` : "off")}
+                  onChange={(lead) =>
+                    patch({ camera: { moves, follow: { ...follow, lead: lead > 0 ? round3(lead) : undefined } } })
+                  }
+                />
                 <Field label="Follow">
                   <Choice<FollowAxis>
                     value={follow.axis ?? "both"}
@@ -866,6 +1185,17 @@ export function CreatorDesk({
             ) : (
               <p className="text-meta text-muted">Pins the head to the frame; the room moves around it.</p>
             )}
+          </Panel>
+
+          <Panel title="B-roll" icon={Film}>
+            <MediaPicker
+              assets={mediaLibrary}
+              stockSources={stockSources}
+              onPick={(asset) => onPlaceCutaway(asset.id)}
+              onChanged={onMediaChanged}
+              pickLabel="Place at playhead"
+            />
+            <p className="text-micro mt-2 text-muted">Click a picture to lay it over the speaker at the playhead; the voice runs on underneath.</p>
           </Panel>
 
           <Panel
@@ -1081,6 +1411,99 @@ function SpanFields({
         max={max}
         onChange={(value) => onChange({ endSec: value })}
       />
+    </div>
+  );
+}
+
+/**
+ * "Render this span": the exact burn of a stretch, played beside the live
+ * approximation. Rendered on demand (a second or two), cached by the server.
+ */
+function SpanPreview({
+  startSec,
+  endSec,
+  onRender,
+}: {
+  startSec: number;
+  endSec: number;
+  onRender: (startSec: number, endSec: number) => Promise<{ url: string; durationSec: number }>;
+}) {
+  const [state, setState] = useState<{ status: "idle" } | { status: "busy" } | { status: "ready"; url: string } | { status: "error"; message: string }>({
+    status: "idle",
+  });
+  // Half a second either side, so the way in and out of the look is visible too.
+  const from = Math.max(0, startSec - 0.5);
+  const to = endSec + 0.5;
+  async function run() {
+    setState({ status: "busy" });
+    try {
+      const result = await onRender(from, to);
+      setState({ status: "ready", url: `${result.url}?t=${Date.now()}` });
+    } catch (error) {
+      setState({ status: "error", message: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  return (
+    <div className="mt-3">
+      <button
+        type="button"
+        disabled={state.status === "busy"}
+        onClick={() => void run()}
+        className="press text-ui inline-flex h-9 w-full items-center justify-center gap-1.5 rounded-md border border-control bg-panel-2 px-2 hover:border-accent disabled:opacity-50"
+      >
+        {state.status === "busy" ? <Loader2 className="size-4 animate-spin" aria-hidden="true" /> : <Play className="size-3.5 fill-current" aria-hidden="true" />}
+        {state.status === "busy" ? "Rendering…" : state.status === "ready" ? "Render again" : "Render this span (exact)"}
+      </button>
+      {state.status === "ready" ? (
+        <video src={state.url} controls autoPlay loop muted playsInline className="mt-2 w-full rounded-md border border-border bg-black" />
+      ) : null}
+      {state.status === "error" ? <p className="text-meta mt-2 text-bad">{state.message}</p> : null}
+      <p className="text-micro mt-1 text-muted">The player approximates looks; this is the burn itself, half a second either side.</p>
+    </div>
+  );
+}
+
+/** One edge of a cutaway: which transition, and how long it takes. */
+function TransitionField({
+  label,
+  edge,
+  transitions,
+  onChange,
+}: {
+  label: string;
+  edge: Cutaway["in"];
+  transitions: TransitionInfo[];
+  onChange: (edge: Cutaway["in"]) => void;
+}) {
+  return (
+    <div>
+      <span className="text-micro text-muted">{label}</span>
+      <select
+        value={edge.transitionId}
+        aria-label={`${label} transition`}
+        onChange={(event) => onChange({ ...edge, transitionId: event.target.value })}
+        className={cn(FIELD, "mt-1")}
+      >
+        {transitions.length === 0 ? <option value={edge.transitionId}>{edge.transitionId}</option> : null}
+        {transitions.map((transition) => (
+          <option key={transition.id} value={transition.id} title={transition.summary}>
+            {transition.label}
+          </option>
+        ))}
+      </select>
+      {edge.transitionId !== "cut" ? (
+        <input
+          type="range"
+          min={0.1}
+          max={MAX_TRANSITION_SEC}
+          step={0.05}
+          value={edge.sec}
+          aria-label={`${label} transition length`}
+          onChange={(event) => onChange({ ...edge, sec: round3(Number(event.target.value)) })}
+          className="mt-1 w-full"
+        />
+      ) : null}
+      {edge.transitionId !== "cut" ? <span className="text-micro text-muted">{edge.sec.toFixed(2)}s</span> : null}
     </div>
   );
 }

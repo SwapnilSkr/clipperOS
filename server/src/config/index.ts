@@ -58,6 +58,10 @@ export const config = {
   outputPath: absPath(process.env.OUTPUT_PATH, "./storage/output"),
   mediaPath: absPath(process.env.MEDIA_PATH, "./storage/media"),
   audioPath: absPath(process.env.AUDIO_PATH, "./storage/audio"),
+  /** Shared stills and videos for cutaways: uploads and stock picks. */
+  mediaLibraryPath: absPath(process.env.MEDIA_LIBRARY_PATH, "./storage/library/media"),
+  pexelsApiKey: process.env.PEXELS_API_KEY?.trim() || "",
+  pixabayApiKey: process.env.PIXABAY_API_KEY?.trim() || "",
   outroPath: absPath(process.env.OUTRO_PATH, "./storage/outros"),
 
   // ---- FFmpeg ----

@@ -1,10 +1,15 @@
 import type { CameraMove, CreatorPlan, CropKeyframe, ReframeTrack } from "../types/clip.types";
 import { OUTPUT_HEIGHT, OUTPUT_WIDTH } from "../types/clip.types";
 import {
+  cropBoxAt,
   followAnchorOfKeyframe,
+  followLead,
   followTightnessX,
   followZoom,
   moveRampSec,
+  moveZoomFrom,
+  panPxAt,
+  panSlack,
   pushReleaseSec,
   resolveAnchor,
 } from "./creator-timeline";
@@ -58,6 +63,12 @@ export function moveAmountExpr(move: CameraMove, a: number, b: number): string {
     if (ramp <= 0) return "1";
     return `if(lt(t-${num(a)},${num(ramp)}),${easeExpr(move.ease, `(t-${num(a)})/${num(ramp)}`)},if(lt(${num(b)}-t,${num(ramp)}),${easeExpr(move.ease, `(${num(b)}-t)/${num(ramp)}`)},1))`;
   }
+  if (move.kind === "hold") return "1";
+  if (move.kind === "frame") {
+    const ramp = moveRampSec(move);
+    if (ramp <= 0) return "1";
+    return `if(lt(t-${num(a)},${num(ramp)}),${easeExpr(move.ease, `(t-${num(a)})/${num(ramp)}`)},1)`;
+  }
   if (move.kind === "push") {
     const release = pushReleaseSec(move);
     const creep = Math.max(0.05, span - release);
@@ -72,6 +83,50 @@ interface LocalMove {
   b: number;
   amount: string;
   anchor: { x: number; y: number };
+}
+
+/** The plan's moves that touch a window, on its clock, with their amount expressions. */
+function localMoves(
+  plan: CreatorPlan,
+  windowStartSec: number,
+  windowEndSec: number
+): Omit<LocalMove, "anchor">[] {
+  return (plan.camera?.moves ?? [])
+    .filter((move) => move.startSec < windowEndSec && move.endSec > windowStartSec)
+    .map((move) => {
+      const a = move.startSec - windowStartSec;
+      const b = move.endSec - windowStartSec;
+      return { move, a, b, amount: moveAmountExpr(move, a, b) };
+    });
+}
+
+/**
+ * The pan in force over a window, source pixels, as expressions of its clock
+ * — one gated term per move that pans. Undefined when nothing pans.
+ */
+export function panExpr(
+  plan: CreatorPlan,
+  track: Pick<ReframeTrack, "sourceWidth" | "sourceHeight">,
+  windowStartSec: number,
+  windowEndSec: number
+): { x: string; y: string } | undefined {
+  if (!plan.enabled) return undefined;
+  const slack = panSlack(track);
+  const panning = localMoves(plan, windowStartSec, windowEndSec).filter(({ move }) => move.pan);
+  if (panning.length === 0) return undefined;
+  const term = (axis: "x" | "y") =>
+    panning
+      .map(({ move, a, b, amount }) => {
+        const px = move.pan![axis] * slack[axis];
+        if (Math.abs(px) < 0.5) return undefined;
+        return `gte(t,${num(a)})*lt(t,${num(b)})*${num(px)}*(${amount})`;
+      })
+      .filter((piece): piece is string => piece !== undefined)
+      .join("+");
+  const x = term("x");
+  const y = term("y");
+  if (!x && !y) return undefined;
+  return { x: x || "0", y: y || "0" };
 }
 
 /**
@@ -139,32 +194,32 @@ export function cameraExpressions(
   const { plan, track, windowStartSec, windowEndSec } = input;
   if (!plan.enabled || !plan.camera) return undefined;
   const tightness = followTightnessX(plan);
+  const lead = followLead(plan);
   const fz = followZoom(plan);
 
-  const locals: LocalMove[] = plan.camera.moves
-    .filter((move) => move.zoom > 1 && move.startSec < windowEndSec && move.endSec > windowStartSec)
-    .map((move) => {
-      const a = move.startSec - windowStartSec;
-      const b = move.endSec - windowStartSec;
+  const locals: LocalMove[] = localMoves(plan, windowStartSec, windowEndSec)
+    .filter(({ move }) => move.zoom !== moveZoomFrom(move) || moveZoomFrom(move) !== 1 || move.pan)
+    .map((local) => {
+      const mid = (local.move.startSec + local.move.endSec) / 2;
       return {
-        move,
-        a,
-        b,
-        amount: moveAmountExpr(move, a, b),
-        anchor: resolveAnchor(move.anchor, track, (move.startSec + move.endSec) / 2, tightness),
+        ...local,
+        anchor: resolveAnchor(local.move.anchor, track, mid, tightness, lead, panPxAt(plan, track, mid)),
       };
     });
   if (fz <= 1 && locals.length === 0) return undefined;
 
   const active = (local: LocalMove) => `gte(t,${num(local.a)})*lt(t,${num(local.b)})`;
 
-  // Z(t)
+  // Z(t): the follow zoom under the move's own, from `zoomFrom` to `zoom`;
+  // never below 1 (a move may zoom out to the crop, not past it).
   let zoom = num(fz);
   for (let i = locals.length - 1; i >= 0; i--) {
     const local = locals[i]!;
-    const dz = num(local.move.zoom - 1);
-    zoom = `if(${active(local)},${num(fz)}*(1+${dz}*${local.amount}),${zoom})`;
+    const from = moveZoomFrom(local.move);
+    zoom = `if(${active(local)},${num(fz)}*(${num(from)}+${num(local.move.zoom - from)}*${local.amount}),${zoom})`;
   }
+  zoom = `max(1,${zoom})`;
+  const pan = panExpr(plan, track, windowStartSec, windowEndSec);
 
   // Follow anchor: the head pinned through the crop, per keyframe.
   const anchorExpr = (pick: (anchor: { x: number; y: number }) => number, fallback: number) =>
@@ -178,8 +233,11 @@ export function cameraExpressions(
       },
       fallback
     );
-  const fax = fz > 1 ? anchorExpr((anchor) => anchor.x, 0.5) : "0.5";
-  const fay = fz > 1 ? anchorExpr((anchor) => anchor.y, 0.42) : "0.5";
+  // A pan slides the crop under the pinned head, so the follow anchor moves
+  // the other way by the same source pixels (as a share of the crop width).
+  const box = cropBoxAt(track.keyframes[0] ?? { t: 0, cx: 0, cy: 0, width: 0 }, track);
+  const fax = fz > 1 ? `(${anchorExpr((anchor) => anchor.x, 0.5)}${pan ? `-(${pan.x})/${num(box.w)}` : ""})` : "0.5";
+  const fay = fz > 1 ? `(${anchorExpr((anchor) => anchor.y, 0.42)}${pan ? `-(${pan.y})/${num(box.h)}` : ""})` : "0.5";
 
   // AX/AY: inside a move, blend from the follow anchor toward the move's own
   // anchor by the move's amount (no follow zoom: the move's anchor outright).

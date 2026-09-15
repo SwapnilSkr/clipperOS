@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { Plus } from "lucide-react";
-import type { AudioAsset, CreatorPlan, SoundtrackHit } from "@/api";
+import type { AudioAsset, CameraMove, CreatorPlan, SoundtrackHit } from "@/api";
 import { laneFull, type BeatLane } from "@/lib/beat-plan";
 import { outputToSource, sourceToOutput, type TimeWindow } from "@/lib/creator-timeline";
 import { cn, timecode } from "@/lib/utils";
@@ -38,9 +38,26 @@ interface Block {
   muted?: boolean;
 }
 
+/**
+ * A camera block's label: the zoom it reaches, "1.3→1×" when it starts
+ * elsewhere (a zoom out reads as one), and "pan" for a framing that moves.
+ */
+function moveLabel(move: CameraMove): string {
+  const zoom =
+    move.zoomFrom !== undefined
+      ? `${Number(move.zoomFrom.toFixed(2))}→${Number(move.zoom.toFixed(2))}×`
+      : move.zoom !== 1
+        ? `${Math.round((move.zoom - 1) * 100)}%`
+        : "";
+  return [move.kind, zoom, move.pan ? "pan" : ""].filter(Boolean).join(" ");
+}
+
 const LANES: { id: BeatLane; label: string; add: string }[] = [
   { id: "cuts", label: "Cuts", add: "Cut 0.4s here" },
   { id: "camera", label: "Camera", add: "Punch in here" },
+  { id: "speed", label: "Speed", add: "Slow motion here" },
+  { id: "fx", label: "FX", add: "Effect here" },
+  { id: "cutaways", label: "B-roll", add: "Cutaway here" },
   { id: "captions", label: "Captions", add: "Caption scene here" },
   { id: "titles", label: "Titles", add: "Title here" },
   { id: "sfx", label: "SFX", add: "Sound here" },
@@ -69,6 +86,10 @@ export interface BeatTimelineProps {
   sfxLabels: Map<string, string>;
   /** The one-shots on offer: the SFX lane's "+" picks one before placing it. */
   sfxAssets: AudioAsset[];
+  /** Effect id → label, for the FX lane's blocks. */
+  effectLabels: Map<string, string>;
+  /** Media asset id → label, for the B-roll lane's blocks. */
+  mediaLabels: Map<string, string>;
   /** Shot changes on the source clock, for the ruler. */
   sceneCuts: number[];
   peakSec: number;
@@ -85,6 +106,8 @@ export interface BeatTimelineProps {
   onAddSfx: (assetId: string) => void;
   /** Delete / Backspace on a focused block. */
   onRemove: (lane: BeatLane, id: string) => void;
+  /** An image or video dropped on the B-roll lane: upload it and place a cutaway at that time. */
+  onDropMedia?: (file: File, sourceSec: number) => Promise<void>;
   /** Dimmed when the plan is off: the blocks are kept but do not render. */
   dimmed?: boolean;
 }
@@ -104,6 +127,8 @@ export function BeatTimeline({
   sfx,
   sfxLabels,
   sfxAssets,
+  effectLabels,
+  mediaLabels,
   sceneCuts,
   peakSec,
   playhead,
@@ -114,8 +139,12 @@ export function BeatTimeline({
   onAdd,
   onAddSfx,
   onRemove,
+  onDropMedia,
   dimmed,
 }: BeatTimelineProps) {
+  // A file dragged over the B-roll lane: where it would land, and an upload in flight.
+  const [dropAt, setDropAt] = useState<number | null>(null);
+  const [uploadingAt, setUploadingAt] = useState<number | null>(null);
   const spanSec = Math.max(0.1, trimEnd - trimStart);
   // The SFX "+" opens a picker instead of placing a default: which sound is
   // the whole decision, so it comes first.
@@ -172,7 +201,34 @@ export function BeatTimeline({
         id: move.id,
         startSec: move.startSec,
         endSec: move.endSec,
-        label: `${move.kind} ${Math.round((move.zoom - 1) * 100)}%`,
+        label: moveLabel(move),
+      });
+    }
+    for (const span of plan.speed ?? []) {
+      out.push({
+        lane: "speed",
+        id: span.id,
+        startSec: span.startSec,
+        endSec: span.endSec,
+        label: span.kind === "freeze" ? "Freeze" : `${span.rate}×`,
+      });
+    }
+    for (const span of plan.effects ?? []) {
+      out.push({
+        lane: "fx",
+        id: span.id,
+        startSec: span.startSec,
+        endSec: span.endSec,
+        label: effectLabels.get(span.effectId) ?? span.effectId,
+      });
+    }
+    for (const cutaway of plan.cutaways ?? []) {
+      out.push({
+        lane: "cutaways",
+        id: cutaway.id,
+        startSec: cutaway.startSec,
+        endSec: cutaway.endSec,
+        label: mediaLabels.get(cutaway.assetId) ?? "cutaway",
       });
     }
     for (const scene of plan.captionScenes ?? []) {
@@ -205,7 +261,7 @@ export function BeatTimeline({
       });
     }
     return out;
-  }, [plan, sfx, sfxLabels, windows]);
+  }, [plan, sfx, sfxLabels, effectLabels, mediaLabels, windows]);
 
   function secondsAt(clientX: number): number {
     const rect = containerRef.current?.getBoundingClientRect();
@@ -288,7 +344,9 @@ export function BeatTimeline({
                 className="flex items-center justify-between pl-2 pr-1"
                 style={{ height: LANE_HEIGHT }}
               >
-                <span className="eyebrow text-muted">{lane.label}</span>
+                <span className="eyebrow text-muted" title={lane.id === "cutaways" && onDropMedia ? "Drop an image or video on this lane to add it" : undefined}>
+                  {lane.label}
+                </span>
                 <button
                   type="button"
                   disabled={full}
@@ -383,9 +441,42 @@ export function BeatTimeline({
           {LANES.map((lane, index) => (
             <div
               key={lane.id}
-              className={cn("relative border-b border-border/60", index === LANES.length - 1 && "border-b-0")}
+              className={cn(
+                "relative border-b border-border/60",
+                index === LANES.length - 1 && "border-b-0",
+                lane.id === "cutaways" && dropAt !== null && "bg-sky-400/10"
+              )}
               style={{ height: LANE_HEIGHT }}
+              {...(lane.id === "cutaways" && onDropMedia
+                ? {
+                    onDragOver: (event: React.DragEvent<HTMLDivElement>) => {
+                      if (!event.dataTransfer.types.includes("Files") || uploadingAt !== null) return;
+                      event.preventDefault();
+                      event.dataTransfer.dropEffect = "copy";
+                      setDropAt(secondsAt(event.clientX));
+                    },
+                    onDragLeave: () => setDropAt(null),
+                    onDrop: (event: React.DragEvent<HTMLDivElement>) => {
+                      event.preventDefault();
+                      setDropAt(null);
+                      const file = event.dataTransfer.files[0];
+                      if (!file || uploadingAt !== null) return;
+                      const at = secondsAt(event.clientX);
+                      setUploadingAt(at);
+                      void onDropMedia(file, at).finally(() => setUploadingAt(null));
+                    },
+                  }
+                : {})}
             >
+              {lane.id === "cutaways" && (dropAt !== null || uploadingAt !== null) ? (
+                <div
+                  aria-hidden="true"
+                  className="pointer-events-none absolute top-1 bottom-1 flex items-center whitespace-nowrap rounded-sm border border-dashed border-sky-400 bg-sky-400/20 px-1.5 text-micro font-semibold text-fg"
+                  style={{ left: pct(uploadingAt ?? dropAt!) }}
+                >
+                  {uploadingAt !== null ? "Uploading…" : `Drop to place at ${timecode(dropAt!)}`}
+                </div>
+              ) : null}
               {blocks
                 .filter((block) => block.lane === lane.id)
                 .map((block) => {
@@ -452,6 +543,12 @@ function laneTone(lane: BeatLane, muted?: boolean): string {
       return "border-bad/60 bg-bad/20 text-bad";
     case "camera":
       return "border-accent/60 bg-accent/20 text-fg";
+    case "speed":
+      return "border-fg/40 bg-fg/15 text-fg";
+    case "fx":
+      return "border-fuchsia-400/60 bg-fuchsia-400/20 text-fg";
+    case "cutaways":
+      return "border-sky-400/60 bg-sky-400/20 text-fg";
     case "captions":
       return "border-accent-2/60 bg-accent-2/20 text-fg";
     case "titles":

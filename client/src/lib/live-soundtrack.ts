@@ -25,6 +25,8 @@ export function useLiveSoundtrack(input: {
   /** False mutes everything and leaves the video's own volume alone. */
   enabled: boolean;
   playing: boolean;
+  /** Voice faded out for a slowed or frozen span; the bed and hits carry on. */
+  voiceDucked?: boolean;
   /** Output-clock seconds. */
   localTime: number;
   /** Where the clip ends on that clock; the bed stops there unless it carries into the sting. */
@@ -33,7 +35,7 @@ export function useLiveSoundtrack(input: {
   soundtrack: Soundtrack;
   videoRef: RefObject<HTMLVideoElement | null>;
 }): void {
-  const { enabled, playing, localTime, clipEndSec, outroSec, soundtrack, videoRef } = input;
+  const { enabled, playing, voiceDucked, localTime, clipEndSec, outroSec, soundtrack, videoRef } = input;
   const musicEl = useRef<HTMLAudioElement | null>(null);
   const lastLocal = useRef(localTime);
   /** Hits already played this pass, so a hit under a resting playhead fires once. */
@@ -42,11 +44,11 @@ export function useLiveSoundtrack(input: {
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
-    video.volume = enabled ? Math.min(1, Math.max(0, soundtrack.voiceGain ?? 1)) : 1;
+    video.volume = voiceDucked ? 0 : enabled ? Math.min(1, Math.max(0, soundtrack.voiceGain ?? 1)) : 1;
     return () => {
       video.volume = 1;
     };
-  }, [enabled, soundtrack.voiceGain, videoRef]);
+  }, [enabled, voiceDucked, soundtrack.voiceGain, videoRef]);
 
   const musicSrc = soundtrack.music?.assetId ? audioSrc(soundtrack.music.assetId) : undefined;
   const musicThroughOutro = outroSec > 0 && soundtrack.music?.carryIntoOutro !== false;

@@ -11,26 +11,38 @@ import { sanitizeCreatorPlan, isEmptyCreatorPlan } from "../src/services/creator
 import {
   activeCuts,
   cameraStateAt,
+  cameraTrackFor,
+  heldTrack,
+  holdSpans,
+  keyframeStateAt,
   cropBoxAt,
   faceRestY,
   FOLLOW_MIN_ZOOM,
   FOLLOW_SIGMA_SEC,
   followAnchorOfKeyframe,
+  followCx,
   followSigma,
   followTightnessX,
   followTightnessY,
   followZoom,
   headTravel,
+  LEAD_ROOM,
+  LOOK_ROOM,
   moveAmountAt,
+  moveZoomAt,
   nextKeptTime,
   outputDuration,
   outputToSource,
+  panPxAt,
+  panSlack,
+  rateAt,
+  resolveAnchor,
   smoothedTrack,
   sourceToOutput,
   windowsFor,
 } from "../src/services/creator-timeline";
 import { pauseCandidates, parseSilenceLog, wordGaps } from "../src/services/pause-detect.service";
-import type { CameraMove, ReframeTrack } from "../src/types/clip.types";
+import type { CameraMove, CreatorPlan, MediaAsset, ReframeTrack } from "../src/types/clip.types";
 
 function check(name: string, condition: boolean, detail = ""): void {
   if (!condition) throw new Error(`FAIL  ${name}${detail ? ` — ${detail}` : ""}`);
@@ -95,6 +107,27 @@ check("source→output inside a cut lands on the splice", near(sourceToOutput(wi
 check("output→source round-trips", near(outputToSource(windows, sourceToOutput(windows, 17.25)), 17.25));
 check("nextKeptTime jumps a cut", near(nextKeptTime(windows, 12.4), 14) && near(nextKeptTime(windows, 11), 11));
 check("a plan that cuts everything keeps the trim", windowsFor(10, 11, [{ id: "all", startSec: 9, endSec: 12, enabled: true, source: "user" }]).length === 1);
+
+// ---- speed spans: windows split at their edges, the output clock stretches ----
+{
+  const speed = [
+    { id: "s1", startSec: 15, endSec: 16, kind: "slow" as const, rate: 0.5 },
+    { id: "f1", startSec: 17, endSec: 17.5, kind: "freeze" as const, rate: 0 },
+    { id: "x1", startSec: 18, endSec: 19, kind: "fast" as const, rate: 2 },
+    { id: "overlap", startSec: 15.5, endSec: 16.5, kind: "slow" as const, rate: 0.25 },
+  ];
+  const timed = windowsFor(10, 20, cuts, speed);
+  const rates = timed.map((window) => window.rate ?? 1);
+  check("speed: kept windows split at span edges, one rate each", timed.length === 8 && rates.join(",") === "1,1,0.5,1,0,1,2,1", `${timed.length} windows, rates ${rates.join(",")}`);
+  check("speed: an overlapping span is dropped in favour of the earlier one", !timed.some((window) => window.rate === 0.25));
+  // 7.85 s of source; the slow second doubles, the frozen half holds, the fast second halves.
+  check("speed: output duration = Σ len/rate, a freeze counts its length", near(outputDuration(timed), 7.85 + 1 + 0 - 0.5));
+  check("speed: source→output stretches inside a slow window", near(sourceToOutput(timed, 15.5), sourceToOutput(timed, 15) + 1));
+  check("speed: output→source round-trips through slow, freeze and fast", [15.25, 17.2, 18.6, 19.5].every((sec) => near(outputToSource(timed, sourceToOutput(timed, sec)), sec)));
+  check("speed: rateAt reads the window", rateAt(timed, 15.5) === 0.5 && rateAt(timed, 17.2) === 0 && rateAt(timed, 18.5) === 2 && rateAt(timed, 14.5) === 1);
+  check("speed: no spans leaves the windows untouched", JSON.stringify(windowsFor(10, 20, cuts, [])) === JSON.stringify(windows));
+  check("speed: a span shorter than a frame is ignored", windowsFor(10, 20, [], [{ id: "tiny", startSec: 12, endSec: 12.05, kind: "slow", rate: 0.5 }]).length === 1);
+}
 
 // ---- pause candidates ----
 const words = [
@@ -242,7 +275,7 @@ check("a disabled plan has no camera", off.zoom === 1 && off.ax === 0.5);
 console.log("\nall creator-mode checks passed");
 
 // ---- camera expressions agree with the numeric camera ----
-import { cameraExpressions, cameraFilterChain } from "../src/services/camera.service";
+import { cameraExpressions, cameraFilterChain, panExpr } from "../src/services/camera.service";
 import { cropChainForTrack } from "../src/services/clip-render.service";
 import { config } from "../src/config";
 
@@ -354,8 +387,30 @@ const plans: CreatorPlan[] = [
     },
   },
   { enabled: true, version: 1, camera: { follow: { enabled: true, tightness: 1, zoom: 1.2 }, moves: [] } },
+  {
+    enabled: true,
+    version: 1,
+    camera: {
+      follow: { enabled: true, tightness: 0.85, zoom: 1.18, lead: 0.5 },
+      moves: [
+        { id: "f", kind: "frame", startSec: 100.5, endSec: 102, zoom: 1.3, zoomFrom: 1.1, pan: { x: 0.6, y: 0 }, rampSec: 0.4, anchor: "look", ease: "in_out" },
+        { id: "o", kind: "punch", startSec: 103, endSec: 104, zoom: 0.85, anchor: "face", ease: "out" },
+        { id: "p", kind: "pull", startSec: 105, endSec: 106, zoom: 1.4, zoomFrom: 1.2, anchor: { x: 0.2, y: 0.3 }, ease: "cut" },
+      ],
+    },
+  },
+  {
+    enabled: true,
+    version: 1,
+    camera: {
+      follow: { enabled: true, tightness: 0.9, zoom: 1.2 },
+      moves: [
+        { id: "h", kind: "hold", startSec: 100.6, endSec: 102.2, zoom: 1, anchor: "face", ease: "cut" },
+        { id: "h2", kind: "hold", startSec: 105.2, endSec: 107, zoom: 1.15, anchor: "look", ease: "out" },
+      ],
+    },
+  },
 ];
-import type { CreatorPlan } from "../src/types/clip.types";
 let worst = 0;
 let evaluated = 0;
 for (const cameraPlan of plans) {
@@ -363,15 +418,18 @@ for (const cameraPlan of plans) {
     { startSec: 100, endSec: 104 },
     { startSec: 104.3, endSec: 109 },
   ]) {
-    const expressions = cameraExpressions({ plan: cameraPlan, track: richTrack, windowStartSec: window.startSec, windowEndSec: window.endSec });
+    // Holds lock the path the camera reads, as the render does (cameraTrackFor).
+    const planTrack = holdSpans(cameraPlan).length ? heldTrack(richTrack, holdSpans(cameraPlan)) : richTrack;
+    const expressions = cameraExpressions({ plan: cameraPlan, track: planTrack, windowStartSec: window.startSec, windowEndSec: window.endSec });
     for (let local = 0; local < window.endSec - window.startSec; local += 0.037) {
       const sourceSec = window.startSec + local;
-      const numeric = cameraStateAt(cameraPlan, richTrack, sourceSec);
+      const numeric = cameraStateAt(cameraPlan, planTrack, sourceSec);
       // No expression means "nothing to apply in this window" — identity.
       const zoom = expressions ? evalExpr(expressions.zoom, local) : 1;
       const ax = expressions ? evalExpr(expressions.ax, local) : 0.5;
       const ay = expressions ? evalExpr(expressions.ay, local) : 0.5;
       const error = Math.max(Math.abs(zoom - numeric.zoom), Math.abs(ax - numeric.ax) * (numeric.zoom - 1), Math.abs(ay - numeric.ay) * (numeric.zoom - 1));
+      if (process.env.SWEEP_DEBUG && error > 2e-3) console.log(`plan ${plans.indexOf(cameraPlan)} t=${sourceSec.toFixed(3)} zoom ${zoom.toFixed(4)}/${numeric.zoom.toFixed(4)} ax ${ax.toFixed(4)}/${numeric.ax.toFixed(4)} ay ${ay.toFixed(4)}/${numeric.ay.toFixed(4)}`);
       worst = Math.max(worst, error);
       evaluated++;
     }
@@ -445,6 +503,106 @@ check("camera expressions stay command-line sized", longest < 20_000, `${longest
   check("dense window: ffmpeg accepts a 400-keyframe pan + follow in one window", proc.exitCode === 0, err.slice(0, 160) || `${base.length + camera.length} chars`);
 }
 
+// ---- creative camera: zoom out, frame moves, pan, look room, lead ----
+{
+  const yawTrack: ReframeTrack = {
+    ...richTrack,
+    keyframes: richTrack.keyframes.map((key) => ({ ...key, fyaw: 0.8 })),
+  };
+  const frame: CameraMove = { id: "f", kind: "frame", startSec: 100.5, endSec: 102, zoom: 1.3, zoomFrom: 1.1, pan: { x: 0.6, y: 0 }, rampSec: 0.4, anchor: "look", ease: "out" };
+  const plan: CreatorPlan = { enabled: true, version: 1, camera: { moves: [frame] } };
+  check("frame: amount ramps over rampSec then holds", moveAmountAt(frame, 100.5) === 0 && moveAmountAt(frame, 100.9) === 1 && moveAmountAt(frame, 101.9) === 1 && moveAmountAt(frame, 102) === 0);
+  check("zoomFrom: the move starts from it", near(moveZoomAt(frame, 0), 1.1) && near(moveZoomAt(frame, 1), 1.3));
+  const out: CameraMove = { id: "o", kind: "punch", startSec: 103, endSec: 104, zoom: 0.85, anchor: "face", ease: "cut" };
+  const outPlan: CreatorPlan = { enabled: true, version: 1, camera: { follow: { enabled: true, tightness: 0.8, zoom: 1.18 }, moves: [out] } };
+  check("zoom out: under a follow zoom the picture opens up, never past the crop", near(cameraStateAt(outPlan, yawTrack, 103.5).zoom, Math.max(1, 1.18 * 0.85)));
+  const slack = panSlack(yawTrack);
+  check("pan slack: half the room either side of a 9:16 crop, none vertically on 16:9", near(slack.x, (1920 - 608) / 2) && slack.y === 0);
+  const panned = panPxAt(plan, yawTrack, 101.5);
+  check("pan: at full amount the crop moves pan × slack source pixels", near(panned.x, 0.6 * slack.x));
+  check("pan: zero outside the move", panPxAt(plan, yawTrack, 99).x === 0 && panPxAt(plan, yawTrack, 102.5).x === 0);
+  const noLook = resolveAnchor("face", yawTrack, 101, 0.8, 0, panned);
+  const look = resolveAnchor("look", yawTrack, 101, 0.8, 0, panned);
+  check("look: the anchor sits ahead of the face, the way it faces", near(look.x - noLook.x, LOOK_ROOM * 0.8, 1e-3) && near(look.y, noLook.y));
+  const key = yawTrack.keyframes[0]!;
+  check("lead: the crop leans toward the gaze by lead × yaw × LEAD_ROOM crop widths", near(followCx(key, 0, 1920, 1) - followCx(key, 0, 1920, 0), 0.8 * LEAD_ROOM * key.width));
+  check("lead: off without a yaw", followCx(richTrack.keyframes[0]!, 0, 1920, 1) === followCx(richTrack.keyframes[0]!, 0, 1920, 0));
+
+  // The base crop through FFmpeg: a still track, a frame move that pans right.
+  const still: ReframeTrack = { ...richTrack, cuts: [], keyframes: [{ t: 0, cx: 960, cy: 540, width: 608, fx: 1000, fy: 380, fw: 120 }] };
+  const window = { startSec: 100, endSec: 103 };
+  const chain = cropChainForTrack(still, window.startSec, 0, window.endSec, { pan: panExpr(plan, still, window.startSec, window.endSec) });
+  const graph = `color=c=black:s=1920x1080:r=10:d=3,${chain}`;
+  const proc = Bun.spawnSync([config.ffmpegPath, "-hide_banner", "-loglevel", "trace", "-filter_complex", graph, "-f", "null", "-"], { stderr: "pipe", stdout: "pipe" });
+  const log = new TextDecoder().decode(proc.stderr);
+  let worstPx = 0;
+  let samples = 0;
+  for (const match of log.matchAll(/Parsed_crop_\d+ @ [^\]]+\] n:\d+ t:([\d.]+)(?: pos:-?\d+)? x:(\d+) y:(\d+)/g)) {
+    const t = Number(match[1]);
+    const box = cropBoxAt(still.keyframes[0]!, still, 0, 0, panPxAt(plan, still, window.startSec + t));
+    worstPx = Math.max(worstPx, Math.abs(Number(match[2]) - box.x));
+    samples++;
+  }
+  check("ffmpeg pans the base crop where panPxAt says, through the ramp and the hold", proc.exitCode === 0 && samples >= 25 && worstPx <= 1.5, `${samples} frames, worst ${worstPx.toFixed(1)}px`);
+}
+
+// ---- hold: the camera locks off, then rejoins the path ----
+{
+  const moving: ReframeTrack = {
+    mode: "crop",
+    sourceWidth: 1920,
+    sourceHeight: 1080,
+    confidence: 1,
+    provider: "faces",
+    originSec: 100,
+    untilSec: 107,
+    cuts: [4],
+    keyframes: Array.from({ length: 13 }, (_, i) => ({ t: i * 0.5, cx: 700 + 50 * i, cy: 540, width: 608, fx: 740 + 50 * i, fy: 380 + 6 * i, fw: 120 })),
+  };
+  const hold: CameraMove = { id: "h", kind: "hold", startSec: 101.2, endSec: 102.4, zoom: 1, anchor: "face", ease: "cut" };
+  const cutHold: CameraMove = { id: "h2", kind: "hold", startSec: 103.5, endSec: 104.8, zoom: 1.1, anchor: "face", ease: "cut" };
+  const plan: CreatorPlan = { enabled: true, version: 1, camera: { follow: { enabled: true, tightness: 1, zoom: 1.15, response: "snappy" }, moves: [hold, cutHold] } };
+  check("hold: the sanitiser keeps a hold that neither zooms nor pans", sanitizeCreatorPlan(plan).camera?.moves.filter((move) => move.kind === "hold").length === 2);
+  check("hold: amount is 1 for the whole span", moveAmountAt(hold, 101.2) === 1 && moveAmountAt(hold, 102.39) === 1 && moveAmountAt(hold, 102.4) === 0);
+  const held = heldTrack(moving, holdSpans(plan));
+  const x = (source: ReframeTrack, sourceSec: number) => keyframeStateAt(source, sourceSec - 100).cx;
+  const lockedAt = x(moving, 101.2);
+  check(
+    "hold: the crop stays where it was at the hold's first frame",
+    [101.2, 101.6, 102.0, 102.4].every((t) => near(x(held, t), lockedAt)) && !near(x(moving, 102.4), lockedAt, 1)
+  );
+  check("hold: the path is untouched before it and rejoined after the release", near(x(held, 100.8), x(moving, 100.8)) && near(x(held, 103.0), x(moving, 103.0)));
+  const face = (source: ReframeTrack, sourceSec: number) => keyframeStateAt(source, sourceSec - 100).fy!;
+  check("hold: the face the zoom pins is held too", near(face(held, 101.3), face(held, 102.3)));
+  check(
+    "hold: a shot cut ends it — the next shot frames its own speaker",
+    near(x(held, 103.9), x(moving, 103.5)) && near(x(held, 104.2), x(moving, 104.2))
+  );
+  const stateA = cameraStateAt(plan, held, 101.3);
+  const stateB = cameraStateAt(plan, held, 102.3);
+  check("hold: the camera state (zoom and anchor) is constant through it", near(stateA.zoom, stateB.zoom) && near(stateA.ax, stateB.ax) && near(stateA.ay, stateB.ay));
+  check("cameraTrackFor: smoothing then holds, what the render and the player share", JSON.stringify(cameraTrackFor(moving, plan).keyframes.filter((key) => key.t > 1.2 && key.t < 2.4)) === "[]");
+
+  // Through FFmpeg: the base crop's x over the window, frame by frame.
+  const chain = cropChainForTrack(held, 100, 1, 103);
+  const graph = `color=c=black:s=1920x1080:r=10:d=3,${chain}`;
+  const proc = Bun.spawnSync([config.ffmpegPath, "-hide_banner", "-loglevel", "trace", "-filter_complex", graph, "-f", "null", "-"], { stderr: "pipe", stdout: "pipe" });
+  const log = new TextDecoder().decode(proc.stderr);
+  const inHold: number[] = [];
+  let worstPx = 0;
+  for (const match of log.matchAll(/Parsed_crop_\d+ @ [^\]]+\] n:\d+ t:([\d.]+)(?: pos:-?\d+)? x:(\d+) y:(\d+)/g)) {
+    const t = Number(match[1]);
+    const px = Number(match[2]);
+    if (t >= 1.2 && t <= 2.4) inHold.push(px);
+    worstPx = Math.max(worstPx, Math.abs(px - cropBoxAt(keyframeStateAt(held, t), held, 1).x));
+  }
+  check(
+    "ffmpeg: the crop does not move through the hold and follows the held path elsewhere",
+    proc.exitCode === 0 && inHold.length >= 12 && Math.max(...inHold) - Math.min(...inHold) <= 1 && worstPx <= 1.5,
+    `${inHold.length} held frames, spread ${Math.max(...inHold) - Math.min(...inHold)}px, worst ${worstPx.toFixed(1)}px`
+  );
+}
+
 console.log("\nall camera checks passed");
 
 // ---- the Director's answer becomes a sane plan ----
@@ -485,5 +643,189 @@ check("a kept lane survives untouched", directed.plan.titles?.length === 1 && di
 check("director sfx: unknown assets dropped, gains clamped, user hits kept", directed.sfx.map((hit) => hit.assetId).join(",") === "hit,swoosh,boom" && directed.sfx[2]!.gain === 1.5);
 check("the summary is trimmed into the plan", directed.plan.director?.summary === "Tight hook, punch the peak.");
 check("lenient overrides drop nonsense and keep the rest", JSON.stringify(lenientOverrides({ chunkWords: 99, background: "glow", uppercase: 1 })) === JSON.stringify({ chunkWords: 8, uppercase: true }));
+
+
+// ---- Creator Mode II: the Director writes speed, looks, B-roll and framing ----
+import { buildDirectorPrompt, gazeSummary, libraryMatch, resolveDirectorMedia, type DirectorLane, type DirectorPlanJson } from "../src/services/director.service";
+
+const stored: CreatorPlan = {
+  enabled: true,
+  version: 1,
+  speed: [{ id: "s_user", kind: "slow", startSec: 120, endSec: 121, rate: 0.5 }],
+  effects: [{ id: "fx_user", effectId: "vhs", startSec: 101, endSec: 102, amount: 0.6 }],
+  cutaways: [{ id: "c_user", assetId: "lib1", startSec: 125, endSec: 127, fit: "cover", motion: "in", in: { transitionId: "dissolve", sec: 0.3 }, out: { transitionId: "cut", sec: 0 } }],
+  captionScenes: [{ id: "scene_user", startSec: 100, endSec: 103 }],
+};
+const baseDirect = {
+  trimStart: 100,
+  trimEnd: 140,
+  onsets: [0, 0.4, 1.2, 10.0, 11.4, 20.0],
+  candidates: [],
+  current: stored,
+  currentSfx: [],
+  keep: [] as DirectorLane[],
+  sfxIds: new Set(["swoosh"]),
+  mediaIds: new Set(["lib1", "stock9"]),
+  windowsOutput: (sourceSec: number) => sourceSec - 100,
+};
+
+// A pass that only talks about captions must not wipe the lanes it left out.
+const captionsOnly = applyDirectorAnswer({ ...baseDirect, answer: { summary: "Calmer captions.", captionScenes: [{ start: 0, end: 5, styleId: "clean" }] } });
+check(
+  "lanes the answer leaves out keep their speed, effects and cutaways",
+  captionsOnly.plan.speed?.[0]?.id === "s_user" && captionsOnly.plan.effects?.[0]?.id === "fx_user" && captionsOnly.plan.cutaways?.[0]?.id === "c_user"
+);
+check("the lane the answer speaks to is rewritten", captionsOnly.plan.captionScenes?.length === 1 && captionsOnly.plan.captionScenes[0]!.styleId === "clean");
+const cleared = applyDirectorAnswer({ ...baseDirect, answer: { effects: [], speed: [] } });
+check("an empty list clears a lane", cleared.plan.effects === undefined && cleared.plan.speed === undefined && cleared.plan.cutaways?.length === 1);
+
+const full: DirectorPlanJson = {
+  summary: "Slow the reaction, VHS the flashback, cut to the racks.",
+  camera: {
+    moves: [
+      { kind: "frame", start: 9.95, end: 12, zoomFrom: 1.3, zoom: 0.6, pan: { x: -3, y: 0.2 }, rampSec: 0.5, anchor: "look", ease: "in_out" },
+    ],
+  },
+  speed: [
+    { kind: "slow", start: 19.97, end: 21, rate: 2 },
+    { kind: "freeze", start: 30, end: 30.5, rate: 0.5 },
+    { kind: "fast", start: 35, end: 36, rate: 0.5, smooth: true },
+  ],
+  effects: [
+    { effect: "vhs", start: 1.21, end: 3, amount: 4 },
+    { effect: "made_up", start: 4, end: 5 },
+    { effectId: "glitch", start: 10, end: 10.5 },
+  ],
+  cutaways: [
+    { asset: "stock9", start: 11.39, end: 13, motion: "sideways", in: { transition: "slide_left", sec: 9 }, out: { transition: "nope" } },
+    { query: "never resolved", start: 15, end: 17 },
+  ],
+};
+const directedFull = applyDirectorAnswer({ ...baseDirect, keep: ["cuts"], answer: full });
+const frame = directedFull.plan.camera!.moves[0]!;
+check(
+  "director frame moves keep pan (clamped), zoomFrom, rampSec and the look anchor",
+  frame.kind === "frame" && frame.pan?.x === -1 && frame.pan?.y === 0.2 && frame.zoomFrom === 1.3 && frame.zoom === 0.75 && frame.rampSec === 0.5 && frame.anchor === "look" && near(frame.startSec, 110)
+);
+const [slow, freeze, fast] = directedFull.plan.speed ?? [];
+check(
+  "director speed: kinds keep their side of 1, freezes have no rate, starts snap to words",
+  slow?.rate === 0.9 && near(slow.startSec, 120) && freeze?.kind === "freeze" && freeze.rate === 0 && fast?.rate === 1.1 && fast.smooth === undefined
+);
+check(
+  "director effects: unknown ids dropped, amount clamped, effectId accepted as a synonym",
+  directedFull.plan.effects?.map((effect) => `${effect.effectId}:${effect.amount}`).join(",") === "vhs:1,glitch:0.7" && near(directedFull.plan.effects![0]!.startSec, 101.2)
+);
+const cutaway = directedFull.plan.cutaways?.[0];
+check(
+  "director cutaways: unresolved media dropped, motion and transitions coerced",
+  directedFull.plan.cutaways?.length === 1 && cutaway?.assetId === "stock9" && cutaway.motion === "in" && cutaway.in.transitionId === "slide_left" && cutaway.in.sec === 1.5 && cutaway.out.transitionId === "dissolve" && near(cutaway.startSec, 111.4)
+);
+const loose = applyDirectorAnswer({
+  ...baseDirect,
+  answer: {
+    effects: [{ effect: "RGB_Split", start: 1, end: 2 }, { effect: "Black & White", start: 3, end: 4 }, { effect: "chromatic aberration", start: 5, end: 6 }],
+    cutaways: [{ asset: "lib1", start: 20, end: 22, in: "crossfade", out: { transition: "slide" } }, { asset: "lib1", start: 25, end: 27, in: { transition: "Slide-Up" }, out: { transitionId: "flash" } }],
+  },
+});
+check(
+  "director ids are matched leniently: case, punctuation, labels and editors' words",
+  loose.plan.effects?.map((effect) => effect.effectId).join(",") === "rgbsplit,bw,rgbsplit" &&
+    loose.plan.cutaways?.map((item) => `${item.in.transitionId}/${item.out.transitionId}`).join(",") === "dissolve/slide_left,slide_up/dip_white"
+);
+const locked = applyDirectorAnswer({ ...baseDirect, keep: ["speed", "fx", "cutaways"], answer: full });
+check("locked Speed / FX / B-roll lanes survive an answer that rewrites them", locked.plan.speed?.[0]?.id === "s_user" && locked.plan.effects?.length === 1 && locked.plan.cutaways?.[0]?.id === "c_user");
+
+const library: MediaAsset[] = [
+  { id: "lib1", kind: "video", source: "upload", label: "Server room racks", width: 1080, height: 1920, durationSec: 12 },
+  { id: "lib2", kind: "image", source: "upload", label: "City skyline at night", width: 1080, height: 1920 },
+];
+check("library match: shared words win, nothing shared is no match", libraryMatch("a data center server rack", library)?.id === "lib1" && libraryMatch("puppies", library) === undefined);
+let stockCalls = 0;
+const resolved = await resolveDirectorMedia({
+  cutaways: [
+    { asset: "lib2", start: 1, end: 2 },
+    { query: "rocket launch", kind: "video", start: 3, end: 4 },
+    { query: "Rocket launch", kind: "video", start: 5, end: 6 },
+    { query: "servers in a server room", start: 7, end: 8 },
+    { query: "puppies", start: 9, end: 10 },
+    { asset: "gone", start: 11, end: 12 },
+  ],
+  library,
+  findStock: async (query) => {
+    stockCalls++;
+    if (query.toLowerCase().includes("rocket")) return { id: "stock_rocket", kind: "video", source: "pexels", label: query, width: 1080, height: 1920 };
+    throw new Error("pexels answered 429");
+  },
+});
+check(
+  "stock queries resolve once per query, fall back to the library, and report what failed",
+  resolved.cutaways.map((item) => item.asset ?? "-").join(",") === "lib2,stock_rocket,stock_rocket,lib1,-,-" &&
+    stockCalls === 3 &&
+    resolved.assets.length === 1 &&
+    resolved.warnings.length === 2 &&
+    resolved.warnings.some((warning) => warning.includes("puppies") && warning.includes("429"))
+);
+const noStock = await resolveDirectorMedia({ cutaways: [{ query: "rocket launch" }], library });
+const noStockPlan = applyDirectorAnswer({ ...baseDirect, mediaIds: new Set(library.map((asset) => asset.id)), answer: { cutaways: noStock.cutaways } });
+check(
+  "with no stock and no match the cutaway is left out and the plan is still valid",
+  noStock.warnings[0]?.includes("no stock search is configured") === true && noStockPlan.plan.cutaways === undefined && noStockPlan.plan.enabled
+);
+
+// Conversation turns: the sanitiser keeps the last six, field by field.
+const turned = sanitizeCreatorPlan({
+  enabled: true,
+  director: { turns: Array.from({ length: 8 }, (_, i) => ({ notes: i % 2 ? `note ${i}` : "", summary: `did ${i}`, at: `t${i}`, junk: true })).concat([{ summary: "  " } as never]) },
+});
+check(
+  "director turns: last six kept, blank summaries and stray fields dropped",
+  turned.director?.turns?.length === 6 && turned.director.turns[0]!.summary === "did 2" && turned.director.turns[0]!.notes === undefined && turned.director.turns[1]!.notes === "note 3" && !("junk" in turned.director.turns[5]!)
+);
+
+const gazeTrack: ReframeTrack = {
+  ...track,
+  originSec: 0,
+  keyframes: [
+    { t: 0, cx: 960, cy: 540, width: 608, fx: 900, fyaw: 0 },
+    { t: 5, cx: 960, cy: 540, width: 608, fx: 900, fyaw: -0.6 },
+    { t: 7.5, cx: 960, cy: 540, width: 608, fx: 900, fyaw: 0.5 },
+  ],
+};
+check("gaze summary is time-weighted over the trim", gazeSummary(gazeTrack, 0, 10) === "faces the camera 50% of the time, screen-left 25%, screen-right 25%");
+
+const prompt = buildDirectorPrompt({
+  duration: 40,
+  trimStart: 100,
+  peak: { at: 20, line: "the payoff" },
+  words: [{ t: 0, word: "hello" }],
+  lines: [{ t: 7.33, text: "California and he was like" }],
+  cuts: [],
+  pauses: [],
+  genre: { label: "Business", summary: "advice" },
+  styles: [],
+  fonts: ["Anton"],
+  sfx: [],
+  effects: [{ id: "vhs", group: "texture", summary: "Tape.", variants: ["worn"] }],
+  transitions: [{ id: "dissolve", summary: "Cross-fades." }],
+  media: [{ id: "lib1", kind: "video", label: "Server room racks", width: 1080, height: 1920, durationSec: 12 }],
+  stock: false,
+  current: stored,
+  keep: ["fx"],
+  notes: "slow-mo the last line",
+  turns: [{ notes: "VHS on the hook", summary: "Put VHS on the hook.", at: "t0" }],
+});
+check(
+  "the brief lists effects, transitions, library media, the stored new lanes and earlier turns",
+  prompt.includes("vhs (texture) — Tape. [variants: worn]") &&
+    prompt.includes("dissolve — Cross-fades.") &&
+    prompt.includes("\n7.33 California and he was like") &&
+    prompt.includes('lib1 — video "Server room racks" 1080x1920 12s') &&
+    prompt.includes("speed slow 0.5× 20.00–21.00") &&
+    prompt.includes('cutaway asset lib1 "Server room racks" 25.00–27.00') &&
+    prompt.includes('1. creator: "VHS on the hook" → you: Put VHS on the hook.') &&
+    prompt.includes("a library \"asset\" id only") &&
+    prompt.includes("KEEP these lanes exactly as they are in the current plan (leave their keys out of your answer): fx.")
+);
 
 console.log("\nall director checks passed");
