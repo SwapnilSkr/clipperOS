@@ -28,7 +28,7 @@ import { sourceToOutput, type TimeWindow } from "./creator-timeline";
 
 export type BeatLane = "cuts" | "camera" | "speed" | "fx" | "cutaways" | "captions" | "titles" | "sfx";
 
-export const MAX_SOUNDTRACK_HITS = 16;
+export const MAX_SOUNDTRACK_HITS = 32;
 
 /** The default sound a new SFX pin carries until the inspector changes it. */
 export const DEFAULT_SFX = "whoosh";

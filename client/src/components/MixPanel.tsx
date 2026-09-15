@@ -2,20 +2,23 @@ import { useEffect, useMemo, useState } from "react";
 import { Music, Trash2, Upload, Volume2 } from "lucide-react";
 import { api, type AudioAsset, type Soundtrack, type SoundtrackHit } from "@/api";
 import { MAX_SOUNDTRACK_HITS } from "@/lib/beat-plan";
+import { bedOutSec, musicBeds } from "@/lib/music-beds";
 import { cn, timecode } from "@/lib/utils";
+import { MusicBedsEditor } from "./MusicBeds";
 
 export { MAX_SOUNDTRACK_HITS };
 
 export function soundtrackPayload(track: Soundtrack): Soundtrack {
   const hits = track.sfx ?? [];
-  const hasMusic = Boolean(track.music?.assetId);
+  const beds = musicBeds(track);
   const voice = track.voiceGain;
-  if (!hasMusic && hits.length === 0 && (voice == null || Math.abs(voice - 1) < 0.001)) {
+  if (beds.length === 0 && hits.length === 0 && (voice == null || Math.abs(voice - 1) < 0.001)) {
     return {};
   }
   return {
     ...(voice != null ? { voiceGain: voice } : {}),
-    ...(hasMusic ? { music: track.music } : {}),
+    // Always sent, so clearing the last bed clears it on the server too.
+    beds,
     ...(hits.length > 0 ? { sfx: hits } : {}),
   };
 }
@@ -38,6 +41,9 @@ export function MixTimeline({
   const span = Math.max(0.1, clipSpan + Math.max(0, outroSec));
   const playhead = Math.min(1, Math.max(0, localTime / span));
   const clipPct = (clipSpan / span) * 100;
+  const beds = musicBeds(soundtrack);
+  // Each bed on its own lane, over the stretch it plays.
+  const laneHeight = 20 / Math.max(1, beds.length);
   return (
     <button
       type="button"
@@ -49,15 +55,22 @@ export function MixTimeline({
       }}
       className="relative mt-1 h-7 w-full overflow-hidden rounded-md border border-border bg-panel-2"
     >
-      {soundtrack.music?.assetId ? (
-        <span
-          className="absolute inset-y-1 start-0 rounded-sm bg-accent/20"
-          style={{
-            width:
-              outroSec > 0 && soundtrack.music.carryIntoOutro !== false ? "100%" : `${clipPct}%`,
-          }}
-        />
-      ) : null}
+      {beds.map((bed, index) => {
+        const from = Math.min(span, Math.max(0, bed.inSec ?? 0));
+        const to = Math.max(from, bedOutSec(bed, clipSpan, outroSec));
+        return (
+          <span
+            key={bed.id}
+            className="absolute rounded-sm bg-accent/25"
+            style={{
+              top: 4 + index * laneHeight,
+              height: Math.max(2, laneHeight - 1),
+              left: `${(from / span) * 100}%`,
+              width: `${((to - from) / span) * 100}%`,
+            }}
+          />
+        );
+      })}
       {outroSec > 0 ? (
         <span
           className="absolute inset-y-1 rounded-sm bg-fg/10"
@@ -136,24 +149,6 @@ export function MixPanel({
 
   const clipEnd = Math.max(0.1, durationSec - Math.max(0, outroSec));
 
-  function setMusic(assetId: string | null) {
-    if (!assetId) {
-      const next = { ...soundtrack };
-      delete next.music;
-      onChange(next);
-      return;
-    }
-    onChange({
-      ...soundtrack,
-      music: {
-        assetId,
-        gain: soundtrack.music?.gain ?? 0.22,
-        duck: soundtrack.music?.duck ?? true,
-        carryIntoOutro: soundtrack.music?.carryIntoOutro,
-      },
-    });
-  }
-
   function addHit(assetId: string) {
     const existing = soundtrack.sfx ?? [];
     if (existing.length >= MAX_SOUNDTRACK_HITS) return;
@@ -168,6 +163,10 @@ export function MixPanel({
 
   function removeHit(id: string) {
     onChange({ ...soundtrack, sfx: (soundtrack.sfx ?? []).filter((hit) => hit.id !== id) });
+  }
+
+  function setHitGain(id: string, gain: number) {
+    onChange({ ...soundtrack, sfx: (soundtrack.sfx ?? []).map((hit) => (hit.id === id ? { ...hit, gain: round3(gain) } : hit)) });
   }
 
   async function onUpload(file: File | undefined) {
@@ -192,7 +191,7 @@ export function MixPanel({
       await api.deleteProjectAudio(projectId, fileId);
       onChange({
         ...soundtrack,
-        music: soundtrack.music?.assetId === assetId ? undefined : soundtrack.music,
+        beds: musicBeds(soundtrack).filter((bed) => bed.assetId !== assetId),
         sfx: (soundtrack.sfx ?? []).filter((hit) => hit.assetId !== assetId),
       });
       refreshLibrary();
@@ -203,7 +202,6 @@ export function MixPanel({
 
   const hits = soundtrack.sfx ?? [];
   const voiceGain = soundtrack.voiceGain ?? 1;
-  const musicGain = soundtrack.music?.gain ?? 0.22;
 
   return (
     <section className="rounded-xl border border-border bg-panel p-3">
@@ -240,86 +238,16 @@ export function MixPanel({
       </label>
 
       <p className="eyebrow mt-4 text-muted">Music</p>
-      <div className="mt-1.5 flex flex-wrap gap-1.5">
-        <Chip active={!soundtrack.music?.assetId} label="None" onClick={() => setMusic(null)} />
-        {musicTracks.map((asset) => (
-          <Chip
-            key={asset.id}
-            active={soundtrack.music?.assetId === asset.id}
-            label={asset.label}
-            onClick={() => setMusic(asset.id)}
-          />
-        ))}
+      <div className="mt-1.5">
+        <MusicBedsEditor
+          soundtrack={soundtrack}
+          onChange={onChange}
+          assets={musicTracks}
+          localTime={localTime}
+          clipEndSec={clipEnd}
+          outroSec={outroSec}
+        />
       </div>
-      {soundtrack.music?.assetId ? (
-        <div className="mt-2">
-          <label className="block">
-            <span className="text-ui flex items-center justify-between">
-              <span className="text-muted">Bed level</span>
-              <span className="num font-semibold">{Math.round(musicGain * 100)}%</span>
-            </span>
-            <input
-              type="range"
-              min={0}
-              max={0.8}
-              step={0.02}
-              value={musicGain}
-              onChange={(event) =>
-                onChange({
-                  ...soundtrack,
-                  music: {
-                    assetId: soundtrack.music!.assetId,
-                    duck: soundtrack.music?.duck ?? true,
-                    carryIntoOutro: soundtrack.music?.carryIntoOutro,
-                    gain: Number(event.target.value),
-                  },
-                })
-              }
-              className="accent-accent mt-1 h-11 w-full"
-            />
-          </label>
-          <label className="mt-2 flex items-center gap-2">
-            <input
-              type="checkbox"
-              checked={soundtrack.music?.duck !== false}
-              onChange={(event) =>
-                onChange({
-                  ...soundtrack,
-                  music: {
-                    assetId: soundtrack.music!.assetId,
-                    gain: musicGain,
-                    duck: event.target.checked,
-                    carryIntoOutro: soundtrack.music?.carryIntoOutro,
-                  },
-                })
-              }
-              className="size-4 accent-accent"
-            />
-            <span className="text-ui text-muted">Dip under speech</span>
-          </label>
-          {outroSec > 0 ? (
-            <label className="mt-2 flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={soundtrack.music?.carryIntoOutro !== false}
-                onChange={(event) =>
-                  onChange({
-                    ...soundtrack,
-                    music: {
-                      assetId: soundtrack.music!.assetId,
-                      gain: musicGain,
-                      duck: soundtrack.music?.duck ?? true,
-                      carryIntoOutro: event.target.checked,
-                    },
-                  })
-                }
-                className="size-4 accent-accent"
-              />
-              <span className="text-ui text-muted">Carry into sting</span>
-            </label>
-          ) : null}
-        </div>
-      ) : null}
 
       <p className="eyebrow mt-4 text-muted">
         {outroSec > 0 ? "Hits at playhead — clip or sting" : "Hits at playhead"}
@@ -340,23 +268,39 @@ export function MixPanel({
       ) : (
         <ul className="mt-2 flex flex-col gap-1.5">
           {hits.map((hit) => (
-            <li key={hit.id} className="flex items-center gap-2 rounded-lg border border-border bg-panel-2/50 px-2 py-1.5">
-              <span className="text-ui min-w-0 flex-1 truncate">
-                {labels.get(hit.assetId) ?? hit.assetId}
-              </span>
-              <span className="num text-micro text-muted">
-                {outroSec > 0 && hit.atSec >= clipEnd - 0.02
-                  ? `sting ${timecode(Math.max(0, hit.atSec - clipEnd))}`
-                  : timecode(hit.atSec)}
-              </span>
-              <button
-                type="button"
-                onClick={() => removeHit(hit.id)}
-                aria-label={`Remove ${labels.get(hit.assetId) ?? "hit"}`}
-                className="press inline-flex size-8 items-center justify-center rounded-md text-muted hover:bg-bad/15 hover:text-bad"
-              >
-                <Trash2 className="size-3.5" aria-hidden="true" />
-              </button>
+            <li key={hit.id} className="rounded-lg border border-border bg-panel-2/50 px-2 py-1.5">
+              <div className="flex items-center gap-2">
+                <span className="text-ui min-w-0 flex-1 truncate">
+                  {labels.get(hit.assetId) ?? hit.assetId}
+                </span>
+                <span className="num text-micro text-muted">
+                  {outroSec > 0 && hit.atSec >= clipEnd - 0.02
+                    ? `sting ${timecode(Math.max(0, hit.atSec - clipEnd))}`
+                    : timecode(hit.atSec)}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => removeHit(hit.id)}
+                  aria-label={`Remove ${labels.get(hit.assetId) ?? "hit"}`}
+                  className="press inline-flex size-8 items-center justify-center rounded-md text-muted hover:bg-bad/15 hover:text-bad"
+                >
+                  <Trash2 className="size-3.5" aria-hidden="true" />
+                </button>
+              </div>
+              <label className="flex items-center gap-2">
+                <span className="text-micro w-8 shrink-0 text-muted">Level</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={1.5}
+                  step={0.05}
+                  value={hit.gain ?? 0.9}
+                  aria-label={`${labels.get(hit.assetId) ?? "Hit"} level`}
+                  onChange={(event) => setHitGain(hit.id, Number(event.target.value))}
+                  className="accent-accent h-8 min-w-0 flex-1"
+                />
+                <span className="num text-micro w-9 text-right font-semibold">{Math.round((hit.gain ?? 0.9) * 100)}%</span>
+              </label>
             </li>
           ))}
         </ul>

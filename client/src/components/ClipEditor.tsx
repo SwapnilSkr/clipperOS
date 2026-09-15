@@ -90,6 +90,7 @@ import {
   windowsFor,
 } from "@/lib/creator-timeline";
 import { useLiveSoundtrack } from "@/lib/live-soundtrack";
+import { speechSpans } from "@/lib/music-beds";
 import { addBeat, enablePlan, removeBeat, type BeatLane } from "@/lib/beat-plan";
 import { rememberSfx } from "./SfxPicker";
 import { lastEffect } from "./EffectPicker";
@@ -1217,6 +1218,17 @@ export function ClipEditor({
   // are earlier than `time − trimStart` says (hits and the bed live there).
   const localPreviewTime = Math.max(0, isMerge ? time - active.startSec : sourceToOutput(creatorWindows, time));
   const playheadLocal = previewStage === "outro" ? clipWindowDur + outroTime : localPreviewTime;
+  // Where the voice is on the output clock, so the beds dip in the preview
+  // where the burn's compressor will.
+  const speech = useMemo(
+    () =>
+      speechSpans(
+        (words ?? [])
+          .filter((word) => word.t >= active.startSec && word.t < active.endSec)
+          .map((word) => (isMerge ? word.t - active.startSec : sourceToOutput(creatorWindows, word.t)))
+      ),
+    [words, active.startSec, active.endSec, isMerge, creatorWindows]
+  );
   // Hear the mix on any desk that shows the source; the Sound desk's controls
   // and creator mode's SFX lane both edit the same soundtrack.
   useLiveSoundtrack({
@@ -1227,6 +1239,7 @@ export function ClipEditor({
     clipEndSec: clipWindowDur,
     outroSec: outroPlaythrough ? outroDur : 0,
     soundtrack,
+    speech,
     videoRef,
   });
   const peakAt = clip.peakSec - active.startSec;

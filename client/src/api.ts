@@ -319,15 +319,34 @@ export interface SoundtrackHit {
   gain?: number;
 }
 
+/**
+ * One music bed: a file playing under the voice for a stretch of the clip's
+ * output clock. Several can play at once. Levels are linear, 1 = the file as
+ * it is. (Server: MusicBed in clip.types.)
+ */
+export interface MusicBed {
+  id: string;
+  assetId: string;
+  /** Default 0.22. */
+  gain?: number;
+  /** Where on the clip's clock it comes in. Default 0. */
+  inSec?: number;
+  /** Where it goes out; omitted = the end of the clip (or of the sting when it carries in). */
+  outSec?: number;
+  /** Where in the file it starts playing; the file loops past its end. Default 0. */
+  offsetSec?: number;
+  /** Fade lengths; omitted = a sixth of the span, at most 1.2 s. */
+  fadeInSec?: number;
+  fadeOutSec?: number;
+  /** How far it dips under speech: 0 = not at all, 1 = out of the way. Default 0.6. */
+  dip?: number;
+  /** Keep the bed playing through the sting. Default true. */
+  carryIntoOutro?: boolean;
+}
+
 export interface Soundtrack {
   voiceGain?: number;
-  music?: {
-    assetId: string;
-    gain?: number;
-    duck?: boolean;
-    /** Keep the bed playing through the sting. Default true. */
-    carryIntoOutro?: boolean;
-  };
+  beds?: MusicBed[];
   sfx?: SoundtrackHit[];
 }
 

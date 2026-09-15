@@ -330,9 +330,27 @@ const soundtrackHitSchema = new Schema(
   { _id: false }
 );
 
+const musicBedSchema = new Schema(
+  {
+    id: { type: String, required: true, trim: true },
+    assetId: { type: String, required: true, trim: true },
+    gain: { type: Number, min: 0, max: 1.5 },
+    inSec: { type: Number, min: 0 },
+    outSec: { type: Number, min: 0 },
+    offsetSec: { type: Number, min: 0 },
+    fadeInSec: { type: Number, min: 0, max: 10 },
+    fadeOutSec: { type: Number, min: 0, max: 10 },
+    dip: { type: Number, min: 0, max: 1 },
+    carryIntoOutro: { type: Boolean },
+  },
+  { _id: false }
+);
+
 const soundtrackSchema = new Schema(
   {
     voiceGain: { type: Number, min: 0, max: 1.5 },
+    beds: { type: [musicBedSchema], default: undefined },
+    // Kept so clips saved before `beds` still load; the service reads it as one bed.
     music: {
       type: new Schema(
         {

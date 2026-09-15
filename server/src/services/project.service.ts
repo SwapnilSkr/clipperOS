@@ -10,6 +10,7 @@ import { mineMoments } from "./mining.service";
 import { holdCropUntilCuts } from "./speaker-reframe.service";
 import { overlaySharedOutroLibrary, pickProjectOutro } from "./outro.service";
 import { plainCreatorPlan } from "./creator-plan.service";
+import { musicBeds } from "./soundtrack.service";
 import { generateProjectShareCopy } from "./share-copy.service";
 
 // ---------------------------------------------------------------------------
@@ -417,14 +418,19 @@ export function serializeClip(doc: IClip): ClipPayload {
           soundtrack: doc.edit.soundtrack
             ? {
                 voiceGain: doc.edit.soundtrack.voiceGain,
-                music: doc.edit.soundtrack.music
-                  ? {
-                      assetId: doc.edit.soundtrack.music.assetId,
-                      gain: doc.edit.soundtrack.music.gain,
-                      duck: doc.edit.soundtrack.music.duck,
-                      carryIntoOutro: doc.edit.soundtrack.music.carryIntoOutro,
-                    }
-                  : undefined,
+                // The pre-`beds` single bed reads as beds[0]; the client only knows beds.
+                beds: musicBeds(doc.edit.soundtrack).map((bed) => ({
+                  id: bed.id,
+                  assetId: bed.assetId,
+                  gain: bed.gain,
+                  inSec: bed.inSec,
+                  outSec: bed.outSec,
+                  offsetSec: bed.offsetSec,
+                  fadeInSec: bed.fadeInSec,
+                  fadeOutSec: bed.fadeOutSec,
+                  dip: bed.dip,
+                  carryIntoOutro: bed.carryIntoOutro,
+                })),
                 sfx: doc.edit.soundtrack.sfx?.map((hit) => ({
                   id: hit.id,
                   assetId: hit.assetId,

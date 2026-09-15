@@ -10,6 +10,7 @@ import type {
   ClipEdit,
   ClipOutro,
   ClipSegment,
+  MusicBed,
   Soundtrack,
   SoundtrackHit,
   VideoEffects,
@@ -19,6 +20,7 @@ import { mergeClipOutro, sanitizeClipOutro } from "./outro.service";
 import { isEmptyCreatorPlan, plainCreatorPlan, sanitizeCreatorPlan } from "./creator-plan.service";
 import { generateClipShareCopy } from "./share-copy.service";
 import { MAX_CAPTION_WORD_OVERRIDES, MAX_CLEANUP_REGIONS } from "../types/clip.types";
+import { MAX_MUSIC_BEDS, MAX_SOUNDTRACK_HITS, musicBeds } from "./soundtrack.service";
 import { resolveCaptionFont } from "../config/caption-fonts";
 import { deleteFile, getFileSize, listFiles, projectOutputDir } from "../utils";
 import { buildWordTimeline } from "./mining.service";
@@ -342,23 +344,30 @@ function plainClipOutro(source: Record<string, unknown>): ClipOutro {
 function isEmptySoundtrack(track: Soundtrack): boolean {
   return (
     (track.voiceGain === undefined || Math.abs(track.voiceGain - 1) < 0.001) &&
-    !track.music?.assetId &&
+    musicBeds(track).length === 0 &&
     !(track.sfx && track.sfx.length > 0)
   );
 }
 
+const BED_NUMBER_FIELDS = ["gain", "inSec", "outSec", "offsetSec", "fadeInSec", "fadeOutSec", "dip"] as const;
+
+function plainBed(bed: Record<string, unknown>): MusicBed {
+  const out: MusicBed = { id: String(bed.id ?? ""), assetId: String(bed.assetId ?? "") };
+  for (const field of BED_NUMBER_FIELDS) {
+    if (bed[field] !== undefined && bed[field] !== null) out[field] = Number(bed[field]);
+  }
+  if (bed.carryIntoOutro !== undefined && bed.carryIntoOutro !== null) out.carryIntoOutro = Boolean(bed.carryIntoOutro);
+  return out;
+}
+
+/** A stored soundtrack as the client sees it: the pre-`beds` single bed becomes `beds[0]`. */
 function plainSoundtrack(source: Record<string, unknown>): Soundtrack {
   const out: Soundtrack = {};
   if (source.voiceGain !== undefined) out.voiceGain = Number(source.voiceGain);
-  const music = source.music as Record<string, unknown> | null | undefined;
-  if (music && typeof music === "object" && typeof music.assetId === "string" && music.assetId.trim()) {
-    out.music = {
-      assetId: music.assetId,
-      ...(music.gain !== undefined ? { gain: Number(music.gain) } : {}),
-      ...(music.duck !== undefined ? { duck: Boolean(music.duck) } : {}),
-      ...(music.carryIntoOutro !== undefined ? { carryIntoOutro: Boolean(music.carryIntoOutro) } : {}),
-    };
-  }
+  const beds = Array.isArray(source.beds)
+    ? source.beds.map((item) => plainBed(item as Record<string, unknown>)).filter((bed) => bed.id && bed.assetId)
+    : musicBeds({ music: source.music as Soundtrack["music"] });
+  if (beds.length > 0) out.beds = beds;
   if (Array.isArray(source.sfx) && source.sfx.length > 0) {
     out.sfx = source.sfx.map((item) => {
       const hit = item as Record<string, unknown>;
@@ -377,23 +386,35 @@ function sanitizeSoundtrack(raw: Soundtrack): Soundtrack {
   if (typeof raw !== "object" || raw === null) throw new Error("Invalid soundtrack");
   const out: Soundtrack = {};
   if (raw.voiceGain !== undefined) out.voiceGain = clampNumber(raw.voiceGain, 0, 1.5);
-  if (raw.music !== undefined) {
-    if (raw.music === null || typeof raw.music !== "object") throw new Error("Invalid music bed");
-    const assetId = typeof raw.music.assetId === "string" ? raw.music.assetId.trim() : "";
-    if (assetId) {
-      out.music = {
-        assetId: sanitizeAssetId(assetId),
-        ...(raw.music.gain !== undefined ? { gain: clampNumber(raw.music.gain, 0, 1.5) } : {}),
-        ...(raw.music.duck !== undefined ? { duck: Boolean(raw.music.duck) } : {}),
-        ...(raw.music.carryIntoOutro !== undefined ? { carryIntoOutro: Boolean(raw.music.carryIntoOutro) } : {}),
-      };
-    }
+  // Beds are what is stored; a client still sending the single `music` bed gets it as beds[0].
+  const beds = raw.beds !== undefined ? raw.beds : raw.music !== undefined ? musicBeds({ music: raw.music }) : undefined;
+  if (beds !== undefined) {
+    if (!Array.isArray(beds)) throw new Error("beds must be an array");
+    if (beds.length > MAX_MUSIC_BEDS) throw new Error(`At most ${MAX_MUSIC_BEDS} music beds per clip`);
+    out.beds = beds.map(sanitizeBed);
   }
   if (raw.sfx !== undefined) {
     if (!Array.isArray(raw.sfx)) throw new Error("sfx must be an array");
-    if (raw.sfx.length > 16) throw new Error("At most 16 sound effects per clip");
+    if (raw.sfx.length > MAX_SOUNDTRACK_HITS) throw new Error(`At most ${MAX_SOUNDTRACK_HITS} sound effects per clip`);
     out.sfx = raw.sfx.map(sanitizeHit);
   }
+  return out;
+}
+
+function sanitizeBed(raw: MusicBed): MusicBed {
+  if (typeof raw !== "object" || raw === null) throw new Error("Invalid music bed");
+  const id = typeof raw.id === "string" ? raw.id.trim().slice(0, 80) : "";
+  if (!id) throw new Error("Each music bed needs an id");
+  const out: MusicBed = { id, assetId: sanitizeAssetId(raw.assetId) };
+  if (raw.gain !== undefined) out.gain = clampNumber(raw.gain, 0, 1.5);
+  if (raw.inSec !== undefined) out.inSec = clampNumber(raw.inSec, 0, 24 * 3600);
+  if (raw.outSec !== undefined) out.outSec = clampNumber(raw.outSec, 0, 24 * 3600);
+  if (raw.offsetSec !== undefined) out.offsetSec = clampNumber(raw.offsetSec, 0, 24 * 3600);
+  if (raw.fadeInSec !== undefined) out.fadeInSec = clampNumber(raw.fadeInSec, 0, 10);
+  if (raw.fadeOutSec !== undefined) out.fadeOutSec = clampNumber(raw.fadeOutSec, 0, 10);
+  if (raw.dip !== undefined) out.dip = clampNumber(raw.dip, 0, 1);
+  if (raw.carryIntoOutro !== undefined) out.carryIntoOutro = Boolean(raw.carryIntoOutro);
+  if (out.outSec !== undefined && out.outSec <= (out.inSec ?? 0)) throw new Error("A music bed must go out after it comes in");
   return out;
 }
 

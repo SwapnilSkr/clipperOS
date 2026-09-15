@@ -252,8 +252,22 @@ const SoundtrackHitBody = t.Object({
   gain: t.Optional(t.Number()),
 });
 
+const MusicBedBody = t.Object({
+  id: t.String({ minLength: 1, maxLength: 80 }),
+  assetId: t.String({ minLength: 1, maxLength: 80 }),
+  gain: t.Optional(t.Number()),
+  inSec: t.Optional(t.Number()),
+  outSec: t.Optional(t.Number()),
+  offsetSec: t.Optional(t.Number()),
+  fadeInSec: t.Optional(t.Number()),
+  fadeOutSec: t.Optional(t.Number()),
+  dip: t.Optional(t.Number()),
+  carryIntoOutro: t.Optional(t.Boolean()),
+});
+
 const SoundtrackBody = t.Object({
   voiceGain: t.Optional(t.Number()),
+  // The single-bed shape older clients still send; the service reads it as one bed.
   music: t.Optional(
     t.Object({
       assetId: t.Optional(t.String({ maxLength: 80 })),
@@ -262,7 +276,8 @@ const SoundtrackBody = t.Object({
       carryIntoOutro: t.Optional(t.Boolean()),
     })
   ),
-  sfx: t.Optional(t.Array(SoundtrackHitBody, { maxItems: 16 })),
+  beds: t.Optional(t.Array(MusicBedBody, { maxItems: 8 })),
+  sfx: t.Optional(t.Array(SoundtrackHitBody, { maxItems: 32 })),
 });
 
 const CleanupRegionBody = t.Object({

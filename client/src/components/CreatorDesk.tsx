@@ -62,9 +62,11 @@ import {
   followTightnessX,
   moveRampSec,
   outputDuration,
+  sourceToOutput,
   type TimeWindow,
 } from "@/lib/creator-timeline";
 import { FramingWidget } from "./FramingWidget";
+import { MusicBedsEditor } from "./MusicBeds";
 import { EffectPicker, rememberEffect } from "./EffectPicker";
 import { MediaPicker } from "./MediaPicker";
 import { cn, timecode } from "@/lib/utils";
@@ -220,24 +222,6 @@ export function CreatorDesk({
   const onSfxChange = (hits: SoundtrackHit[]) => onSoundtrackChange({ ...soundtrack, sfx: hits });
   const sfxAssets = useMemo(() => library.filter((asset) => asset.kind === "sfx"), [library]);
   const musicAssets = useMemo(() => library.filter((asset) => asset.kind === "music"), [library]);
-
-  function setMusic(assetId: string | null) {
-    if (!assetId) {
-      const next = { ...soundtrack };
-      delete next.music;
-      onSoundtrackChange(next);
-      return;
-    }
-    onSoundtrackChange({
-      ...soundtrack,
-      music: {
-        assetId,
-        gain: soundtrack.music?.gain ?? 0.22,
-        duck: soundtrack.music?.duck ?? true,
-        carryIntoOutro: soundtrack.music?.carryIntoOutro,
-      },
-    });
-  }
 
   async function upload(file: File | undefined, kind: "music" | "sfx") {
     if (!file) return;
@@ -1571,28 +1555,13 @@ export function CreatorDesk({
                   </span>
                 }
               >
-                <select
-                  value={soundtrack.music?.assetId ?? ""}
-                  aria-label="Music bed"
-                  onChange={(event) => setMusic(event.target.value || null)}
-                  className={cn(FIELD, "mt-0")}
-                >
-                  <option value="">No music</option>
-                  <AssetOptions assets={musicAssets} />
-                </select>
-                {soundtrack.music?.assetId ? (
-                  <Slider
-                    label="Bed level"
-                    value={soundtrack.music.gain ?? 0.22}
-                    min={0}
-                    max={0.8}
-                    step={0.02}
-                    format={(value) => `${Math.round(value * 100)}%`}
-                    onChange={(gain) =>
-                      onSoundtrackChange({ ...soundtrack, music: { ...soundtrack.music!, gain: round3(gain) } })
-                    }
-                  />
-                ) : null}
+                <MusicBedsEditor
+                  soundtrack={soundtrack}
+                  onChange={onSoundtrackChange}
+                  assets={musicAssets}
+                  localTime={sourceToOutput(windows, playhead)}
+                  clipEndSec={Math.max(0.1, outputDuration(windows))}
+                />
                 {uploadError ? <p className="text-meta mt-2 text-bad">{uploadError}</p> : null}
               </Panel>
             </>
@@ -1696,41 +1665,6 @@ function Inspector({
     >
       {children}
     </Panel>
-  );
-}
-
-/** Built-ins first, then the shared uploads, so a pack you added is easy to find. */
-function AssetOptions({ assets }: { assets: AudioAsset[] }) {
-  const builtin = assets.filter((asset) => !asset.id.startsWith("custom:"));
-  const custom = assets.filter((asset) => asset.id.startsWith("custom:"));
-  if (custom.length === 0) {
-    return (
-      <>
-        {builtin.map((asset) => (
-          <option key={asset.id} value={asset.id}>
-            {asset.label}
-          </option>
-        ))}
-      </>
-    );
-  }
-  return (
-    <>
-      <optgroup label="Yours">
-        {custom.map((asset) => (
-          <option key={asset.id} value={asset.id}>
-            {asset.label}
-          </option>
-        ))}
-      </optgroup>
-      <optgroup label="Built in">
-        {builtin.map((asset) => (
-          <option key={asset.id} value={asset.id}>
-            {asset.label}
-          </option>
-        ))}
-      </optgroup>
-    </>
   );
 }
 

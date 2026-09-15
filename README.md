@@ -273,6 +273,17 @@ renderer is the only thing that interprets it.
   - Fallback: a time-gated ffmpeg `delogo` per region. Cheap and dependency-free,
     but it interpolates the rect's border inward and leaves faint stripes on
     anything larger than a small logo.
+- **Sound.** The third desk mixes the voice with **music beds** and **hits** on
+  the output clock (`clip.edit.soundtrack`). Up to 8 beds play at once, each
+  its own file with a level, a *dip under speech* (a sidechain compressor keyed
+  off the voice; the slider is the dip in dB, and `dip=0` leaves it alone), in
+  and out points on the clip, a start point in the file (which loops), fade
+  lengths (auto: a sixth of the span, up to 1.2 s) and whether it carries into
+  the sting. Up to 32 hits, each with its own level. The live preview plays one
+  looping `<audio>` per bed with the same rules (`lib/music-beds`) and dips it
+  where the transcript's words are, at the compressor's attack and release, so
+  what you hear on the desk is the mix. `bun run soundtrack:validate` runs the
+  graph through ffmpeg and measures it.
 
 ### Creator mode
 
@@ -435,6 +446,7 @@ bun run validate:mining <url> [genreId]   # mine a real video, assert the contra
 bun run creator:validate                  # beat plan sanitiser, clock mapping, camera expressions, Director post-processing
 bun run effects:validate                  # every effect through ffmpeg: parses, gates to its span, stacks
 bun run cutaways:validate                 # cutaway graphs on synthetic media: fits, transitions, untouched picture between
+bun run soundtrack:validate               # the mix graph, then ffmpeg on synthetic beds: in/out, offset, the dip under speech
 bun run reframe:validate                  # speaker-tracking decision logic, no Python needed
 bun run vision:install                    # venv + OpenCV + YuNet (for tracking and cleanup)
 bun run typecheck

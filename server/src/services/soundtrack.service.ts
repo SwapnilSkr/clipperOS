@@ -2,13 +2,27 @@ import { existsSync } from "node:fs";
 import { cp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { config } from "../config";
-import type { Soundtrack, SoundtrackHit } from "../types/clip.types";
+import type { MusicBed, Soundtrack, SoundtrackHit } from "../types/clip.types";
 import { getErrorMessage } from "../types";
 import { containedPath, ensureDir, fileExists, getFileSize, projectAudioDir } from "../utils/file.utils";
 import { runCommand } from "../utils/process.utils";
 import { getVideoMetadata, hasAudioStream } from "./ffmpeg.service";
 
-export const MAX_SOUNDTRACK_HITS = 16;
+export const MAX_SOUNDTRACK_HITS = 32;
+export const MAX_MUSIC_BEDS = 8;
+export const DEFAULT_BED_GAIN = 0.22;
+export const DEFAULT_BED_DIP = 0.6;
+/**
+ * What is left of a bed under speech at dip 1: the sidechain compressor
+ * below drives the wet path this far down on speech at a normal level and
+ * `mix=dip` blends it with the dry bed, so under speech the bed sits at
+ * `1 - (1 - DIP_FLOOR) * dip`. The live preview (client live-soundtrack)
+ * dips by the same rule.
+ */
+export const DIP_FLOOR = 0.08;
+/** The compressor's ballistics, in ms — the preview's envelope uses the same. */
+export const DIP_ATTACK_MS = 30;
+export const DIP_RELEASE_MS = 280;
 export const MAX_CUSTOM_AUDIO = 24;
 export const MAX_CUSTOM_AUDIO_BYTES = 8 * 1024 * 1024;
 export const SHARED_AUDIO_OWNER = "shared";
@@ -235,27 +249,69 @@ export async function deleteCustomAudio(projectId: string, assetId: string): Pro
   );
 }
 
+/** The clip's music beds: `beds`, or the single `music` bed clips carried before it. */
+export function musicBeds(track: Soundtrack | undefined): MusicBed[] {
+  if (!track) return [];
+  if (track.beds) return track.beds.filter((bed) => bed.assetId);
+  const legacy = track.music;
+  if (!legacy?.assetId) return [];
+  return [
+    {
+      id: "bed-1",
+      assetId: legacy.assetId,
+      ...(legacy.gain !== undefined ? { gain: legacy.gain } : {}),
+      ...(legacy.duck === false ? { dip: 0 } : {}),
+      ...(legacy.carryIntoOutro !== undefined ? { carryIntoOutro: legacy.carryIntoOutro } : {}),
+    },
+  ];
+}
+
 export function soundtrackNeedsMix(track: Soundtrack | undefined): boolean {
   if (!track) return false;
   if (track.voiceGain != null && Math.abs(track.voiceGain - 1) > 0.001) return true;
-  if (track.music?.assetId) return true;
+  if (musicBeds(track).length > 0) return true;
   return (track.sfx ?? []).length > 0;
+}
+
+/** Where a bed stops on the output clock: its own out point, else the clip's end, or the sting's when it carries in. */
+export function bedOutSec(bed: MusicBed, clipDurationSec: number, outroSec: number): number {
+  const carries = outroSec > 0 && bed.carryIntoOutro !== false;
+  const end = carries ? clipDurationSec + outroSec : clipDurationSec;
+  return bed.outSec != null ? Math.min(bed.outSec, end) : end;
 }
 
 /** Music or hits that should be mixed after the sting is joined. */
 export function soundtrackSpansOutro(track: Soundtrack | undefined, clipDurationSec: number): boolean {
   if (!track) return false;
-  if (track.music?.assetId && track.music.carryIntoOutro !== false) return true;
+  if (musicBeds(track).some((bed) => bedOutSec(bed, clipDurationSec, 1) > clipDurationSec + 0.02)) return true;
   return (track.sfx ?? []).some((hit) => (hit.atSec ?? 0) > clipDurationSec - 0.02);
+}
+
+/** A bed's fade, explicit or a sixth of its span (at most 1.2 s), never longer than half the span. */
+export function bedFadeSec(explicit: number | undefined, spanSec: number): number {
+  const fade = explicit != null ? explicit : Math.min(1.2, spanSec / 6);
+  return Math.max(0, Math.min(fade, spanSec / 2));
+}
+
+export interface GraphBed {
+  index: number;
+  gain: number;
+  /** Output-clock span the bed plays for. */
+  inSec: number;
+  outSec: number;
+  offsetSec: number;
+  /** Omitted = the automatic fade (`bedFadeSec`). */
+  fadeInSec?: number;
+  fadeOutSec?: number;
+  /** 0 = never ducked. */
+  dip: number;
 }
 
 export function buildSoundtrackGraph(input: {
   durationSec: number;
   voiceGain: number;
   voiceHasAudio: boolean;
-  duck: boolean;
-  musicIndex?: number;
-  musicGain: number;
+  beds: GraphBed[];
   hits: { index: number; atSec: number; gain: number }[];
   /** Apply voiceGain only up to this time; later audio (the sting) stays at unity. */
   voiceUntilSec?: number;
@@ -263,7 +319,8 @@ export function buildSoundtrackGraph(input: {
   const duration = Math.max(0.05, input.durationSec);
   const graph: string[] = [];
   const mixParts: string[] = [];
-  const duckMusic = input.musicIndex != null && input.duck && input.voiceHasAudio && input.voiceGain > 0.05;
+  const beds = input.beds.filter((bed) => bed.outSec - bed.inSec > 0.05 && bed.inSec < duration - 0.02);
+  const duckedBeds = input.voiceHasAudio && input.voiceGain > 0.05 ? beds.filter((bed) => bed.dip > 0.001) : [];
   const voiceUntil = input.voiceUntilSec;
   const splitVoice =
     input.voiceHasAudio &&
@@ -285,23 +342,45 @@ export function buildSoundtrackGraph(input: {
         `[0:a]volume=${input.voiceGain.toFixed(3)},apad=whole_dur=${duration.toFixed(3)}[voicefull]`
       );
     }
-    graph.push(duckMusic ? `[voicefull]asplit=2[voice][voicekey]` : `[voicefull]anull[voice]`);
+    // One key copy per ducked bed: a filter output feeds one input.
+    const keys = duckedBeds.map((_, i) => `[voicekey${i}]`).join("");
+    graph.push(
+      duckedBeds.length > 0 ? `[voicefull]asplit=${duckedBeds.length + 1}[voice]${keys}` : `[voicefull]anull[voice]`
+    );
     mixParts.push("[voice]");
   }
 
-  if (input.musicIndex != null) {
-    const fade = Math.min(1.2, duration / 6);
-    const fadeOutStart = Math.max(0, duration - fade);
+  beds.forEach((bed, i) => {
+    const inSec = Math.max(0, bed.inSec);
+    const outSec = Math.min(duration, bed.outSec);
+    const span = outSec - inSec;
+    const fadeIn = bedFadeSec(bed.fadeInSec, span);
+    const fadeOut = bedFadeSec(bed.fadeOutSec, span);
+    const offset = Math.max(0, bed.offsetSec);
+    // The file loops (its input is -stream_loop -1), so the offset can pass its end.
+    const chain = [
+      `atrim=${offset.toFixed(3)}:${(offset + span).toFixed(3)}`,
+      `asetpts=PTS-STARTPTS`,
+      fadeIn > 0.005 ? `afade=t=in:d=${fadeIn.toFixed(3)}` : "",
+      fadeOut > 0.005 ? `afade=t=out:st=${Math.max(0, span - fadeOut).toFixed(3)}:d=${fadeOut.toFixed(3)}` : "",
+      `volume=${bed.gain.toFixed(3)}`,
+      inSec > 0.0005 ? `adelay=${Math.round(inSec * 1000)}:all=1` : "",
+      `apad=whole_dur=${duration.toFixed(3)}`,
+    ]
+      .filter(Boolean)
+      .join(",");
+    graph.push(`[${bed.index}:a]${chain}[bedraw${i}]`);
+    const keyIndex = duckedBeds.indexOf(bed);
     graph.push(
-      `[${input.musicIndex}:a]atrim=0:${duration.toFixed(3)},asetpts=PTS-STARTPTS,afade=t=in:d=${fade.toFixed(2)},afade=t=out:st=${fadeOutStart.toFixed(3)}:d=${fade.toFixed(2)},volume=${input.musicGain.toFixed(3)},apad=whole_dur=${duration.toFixed(3)}[musicraw]`
+      keyIndex >= 0
+        ? // Near-limiting on the speech (threshold −32 dB on a +9.5 dB key) takes
+          // the wet path ~21 dB down; `mix` blends it with the dry bed so the dip
+          // under speech is the bed's own `dip`, not the voice's level.
+          `[bedraw${i}][voicekey${keyIndex}]sidechaincompress=threshold=0.025:ratio=20:attack=${DIP_ATTACK_MS}:release=${DIP_RELEASE_MS}:knee=1:level_sc=3:mix=${bed.dip.toFixed(3)}[bed${i}]`
+        : `[bedraw${i}]anull[bed${i}]`
     );
-    graph.push(
-      duckMusic
-        ? `[musicraw][voicekey]sidechaincompress=threshold=0.05:ratio=7:attack=30:release=280:level_sc=1[music]`
-        : `[musicraw]anull[music]`
-    );
-    mixParts.push("[music]");
-  }
+    mixParts.push(`[bed${i}]`);
+  });
 
   input.hits.forEach((hit, i) => {
     const delayMs = Math.max(0, Math.round(hit.atSec * 1000));
@@ -313,10 +392,11 @@ export function buildSoundtrackGraph(input: {
   if (mixParts.length === 1) {
     graph.push(`${mixParts[0]}anull[outa]`);
   } else {
-    // Hits are cut hot (−1 dBTP) so they read over a loud voice; the sum can
-    // exceed full scale, so a brick-wall limiter catches those transients.
-    // `level=false` keeps it from re-levelling a quiet mix.
-    const limit = input.hits.length > 0 ? ",alimiter=limit=0.95:attack=2:release=60:level=false" : "";
+    // Hits are cut hot (−1 dBTP) so they read over a loud voice, and stacked
+    // beds add up; the sum can exceed full scale, so a brick-wall limiter
+    // catches those transients. `level=false` keeps it from re-levelling a
+    // quiet mix.
+    const limit = input.hits.length > 0 || beds.length > 1 ? ",alimiter=limit=0.95:attack=2:release=60:level=false" : "";
     graph.push(
       `${mixParts.join("")}amix=inputs=${mixParts.length}:duration=first:dropout_transition=0:normalize=0${limit}[outa]`
     );
@@ -340,20 +420,28 @@ export async function mixSoundtrackOntoClip(
   const track = soundtrack!;
   const mixedPath = join(scratchDir, "mixed.mp4");
   const voiceGain = clampGain(track.voiceGain, 1);
-  const musicGain = clampGain(track.music?.gain, 0.22);
-  const duck = track.music?.duck !== false;
   const hits = (track.sfx ?? []).slice(0, MAX_SOUNDTRACK_HITS);
+  const clipEnd = options?.voiceUntilSec ?? durationSec;
+  const outroSec = Math.max(0, durationSec - clipEnd);
 
   const inputs: string[] = ["-y", "-hide_banner", "-loglevel", "error", "-i", videoPath];
   let nextIndex = 1;
-  let musicIndex: number | undefined;
-  if (track.music?.assetId) {
-    const path = await resolveAssetPath(projectId, track.music.assetId);
-    if (path) {
-      musicIndex = nextIndex;
-      inputs.push("-stream_loop", "-1", "-i", path);
-      nextIndex += 1;
-    }
+  const beds: GraphBed[] = [];
+  for (const bed of musicBeds(track).slice(0, MAX_MUSIC_BEDS)) {
+    const path = await resolveAssetPath(projectId, bed.assetId);
+    if (!path) continue;
+    beds.push({
+      index: nextIndex,
+      gain: clampGain(bed.gain, DEFAULT_BED_GAIN),
+      inSec: Math.max(0, bed.inSec ?? 0),
+      outSec: bedOutSec(bed, clipEnd, outroSec),
+      offsetSec: Math.max(0, bed.offsetSec ?? 0),
+      fadeInSec: bed.fadeInSec,
+      fadeOutSec: bed.fadeOutSec,
+      dip: Math.min(1, Math.max(0, bed.dip ?? DEFAULT_BED_DIP)),
+    });
+    inputs.push("-stream_loop", "-1", "-i", path);
+    nextIndex += 1;
   }
   const hitInputs: { index: number; hit: SoundtrackHit }[] = [];
   for (const hit of hits) {
@@ -369,9 +457,7 @@ export async function mixSoundtrackOntoClip(
     durationSec,
     voiceGain,
     voiceHasAudio,
-    duck,
-    musicIndex,
-    musicGain,
+    beds,
     voiceUntilSec: options?.voiceUntilSec,
     hits: hitInputs.map(({ index, hit }) => ({
       index,
