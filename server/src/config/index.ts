@@ -26,7 +26,15 @@ export const config = {
   /** fal.ai, for generated sound effects (OpenRouter has no SFX model). Optional. */
   falKey: process.env.FAL_KEY?.trim() || "",
   /** Freesound.org, for real recorded sound effects (free). Optional. */
-  freesoundApiKey: process.env.FREESOUND_API_KEY?.trim() || "",
+  freesoundApiKey: /^epidemic_/.test(process.env.FREESOUND_API_KEY?.trim() ?? "") ? "" : process.env.FREESOUND_API_KEY?.trim() || "",
+  /**
+   * Epidemic Sound's Partner Content API (`epidemic_live_…`), for its licensed
+   * SFX and music. Optional. A key pasted under FREESOUND_API_KEY by mistake
+   * is recognised by its prefix.
+   */
+  epidemicApiKey:
+    process.env.EPIDEMIC_SOUND_API_KEY?.trim() ||
+    (/^epidemic_/.test(process.env.FREESOUND_API_KEY?.trim() ?? "") ? process.env.FREESOUND_API_KEY!.trim() : ""),
   openRouterBaseUrl: process.env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1",
   /** Empty = fall through to the model registry (config/models.ts). */
   llmModelOverride: process.env.LLM_MODEL || "",

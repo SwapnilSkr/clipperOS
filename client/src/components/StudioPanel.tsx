@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Brain, Clapperboard, Image as ImageIcon, Loader2, Music, Search, Sparkles, Trash2, Zap } from "lucide-react";
-import { api, mediaThumbUrl, type AudioAsset, type DirectorLesson, type GenerationJob, type GenerationKind, type MediaAsset, type SoundResult } from "@/api";
+import { api, mediaThumbUrl, type AudioAsset, type DirectorLesson, type GenerationJob, type GenerationKind, type LibrarySoundResult, type MediaAsset } from "@/api";
 import { cn } from "@/lib/utils";
 import { Panel } from "./editor-controls";
 
@@ -61,12 +61,17 @@ export function StudioPanel({
   const [rule, setRule] = useState("");
   const [describing, setDescribing] = useState(false);
   const [described, setDescribed] = useState<string | null>(null);
-  const [sources, setSources] = useState<{ freesound: boolean; fal: boolean }>({ freesound: false, fal: false });
+  const [sources, setSources] = useState<{ freesound: boolean; epidemic: boolean; fal: boolean }>({ freesound: false, epidemic: false, fal: false });
+  const [soundSource, setSoundSource] = useState<"epidemic" | "freesound" | null>(null);
+  const [soundKind, setSoundKind] = useState<"sfx" | "music">("sfx");
   const [soundQuery, setSoundQuery] = useState("");
-  const [sounds, setSounds] = useState<SoundResult[]>([]);
+  const [sounds, setSounds] = useState<LibrarySoundResult[]>([]);
   const [searching, setSearching] = useState(false);
   const [picking, setPicking] = useState<string | null>(null);
   const [picked, setPicked] = useState<Record<string, string>>({});
+  const [previews, setPreviews] = useState<Record<string, string>>({});
+  const activeSource = soundSource ?? (sources.epidemic ? "epidemic" : "freesound");
+  const soundsOn = sources.epidemic || sources.freesound;
 
   const stills = useMemo(() => mediaLibrary.filter((asset) => asset.kind === "image"), [mediaLibrary]);
   const known = useMemo(() => {
@@ -105,7 +110,7 @@ export function StudioPanel({
     setSearching(true);
     setError(null);
     try {
-      setSounds(await api.searchSounds(q));
+      setSounds(await api.searchSounds(q, { source: activeSource, kind: activeSource === "epidemic" ? soundKind : "sfx" }));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -113,7 +118,7 @@ export function StudioPanel({
     }
   }
 
-  async function pickSound(result: SoundResult) {
+  async function pickSound(result: LibrarySoundResult) {
     setPicking(result.id);
     setError(null);
     try {
@@ -124,6 +129,19 @@ export function StudioPanel({
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setPicking(null);
+    }
+  }
+
+  /** Epidemic previews are signed URLs fetched when the player is first used. */
+  async function preview(result: LibrarySoundResult, element: HTMLAudioElement) {
+    if (result.source !== "epidemic" || previews[result.id] || element.getAttribute("src")) return;
+    try {
+      const { url } = await api.previewSound(result.kind, result.id);
+      setPreviews((prev) => ({ ...prev, [result.id]: url }));
+      element.src = url;
+      await element.play().catch(() => undefined);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
     }
   }
 
@@ -363,17 +381,56 @@ export function StudioPanel({
 
       <Panel title="Find a sound" icon={Search}>
         <p className="text-meta text-muted">
-          Real recordings from freesound.org, free — only CC0 and Attribution licences (the credit is kept with the file). Play a preview before you take it.
-          {!sources.freesound ? " Needs FREESOUND_API_KEY (free at freesound.org/apiv2/apply)." : ""}
+          {sources.epidemic
+            ? "Epidemic Sound's licensed library — sound effects and tracks — and freesound.org's recordings (CC0 / Attribution, credit kept with the file). Play before you take."
+            : sources.freesound
+              ? "Real recordings from freesound.org, free — only CC0 and Attribution licences (the credit is kept with the file). Play a preview before you take it."
+              : "Needs EPIDEMIC_SOUND_API_KEY (Epidemic Sound partner key) or FREESOUND_API_KEY (free at freesound.org/apiv2/apply)."}
         </p>
+        {sources.epidemic && sources.freesound ? (
+          <div className="mt-2 flex flex-wrap items-center gap-1.5">
+            {(["epidemic", "freesound"] as const).map((source) => (
+              <button
+                key={source}
+                type="button"
+                aria-pressed={activeSource === source}
+                onClick={() => {
+                  setSoundSource(source);
+                  setSounds([]);
+                }}
+                className={cn("press text-micro rounded-full border px-2 py-0.5 font-semibold", activeSource === source ? "border-accent bg-accent/15 text-accent" : "border-border text-muted hover:border-control")}
+              >
+                {source === "epidemic" ? "Epidemic Sound" : "Freesound"}
+              </button>
+            ))}
+          </div>
+        ) : null}
+        {activeSource === "epidemic" && sources.epidemic ? (
+          <div className="mt-2 flex flex-wrap items-center gap-1.5">
+            {(["sfx", "music"] as const).map((kindOption) => (
+              <button
+                key={kindOption}
+                type="button"
+                aria-pressed={soundKind === kindOption}
+                onClick={() => {
+                  setSoundKind(kindOption);
+                  setSounds([]);
+                }}
+                className={cn("press text-micro rounded-full border px-2 py-0.5 font-semibold", soundKind === kindOption ? "border-accent bg-accent/15 text-accent" : "border-border text-muted hover:border-control")}
+              >
+                {kindOption === "sfx" ? "Sound effects" : "Music"}
+              </button>
+            ))}
+          </div>
+        ) : null}
         <div className="mt-2 flex items-center gap-1.5">
           <input
             value={soundQuery}
             onChange={(event) => setSoundQuery(event.target.value)}
             maxLength={120}
-            placeholder="glass shatter, crowd gasp, cash register…"
+            placeholder={activeSource === "epidemic" && soundKind === "music" ? "lo-fi chill laid back, cinematic tension, upbeat funk…" : "glass shatter, crowd gasp, cash register…"}
             aria-label="Search sounds"
-            disabled={!sources.freesound}
+            disabled={!soundsOn}
             onKeyDown={(event) => {
               if (event.key === "Enter") void searchSounds();
             }}
@@ -382,7 +439,7 @@ export function StudioPanel({
           <button
             type="button"
             onClick={() => void searchSounds()}
-            disabled={searching || !soundQuery.trim() || !sources.freesound}
+            disabled={searching || !soundQuery.trim() || !soundsOn}
             className="press text-ui inline-flex h-9 items-center gap-1 rounded-md border border-accent px-2 font-semibold text-accent disabled:opacity-50"
           >
             {searching ? <Loader2 className="size-3.5 animate-spin" aria-hidden="true" /> : <Search className="size-3.5" aria-hidden="true" />}
@@ -395,17 +452,25 @@ export function StudioPanel({
               <li key={result.id} className="rounded-lg border border-border bg-panel-2/50 p-1.5">
                 <div className="flex items-center gap-2">
                   <div className="min-w-0 flex-1">
-                    <p className="text-ui truncate" title={result.name}>
-                      {result.name}
+                    <p className="text-ui truncate" title={result.source === "epidemic" ? result.title : result.name}>
+                      {result.source === "epidemic" ? result.title : result.name}
                     </p>
                     <p className="text-micro text-muted">
-                      {result.durationSec.toFixed(1)} s · {result.ratings > 0 ? `${result.rating.toFixed(1)}★ (${result.ratings})` : "unrated"} · {result.needsCredit ? "credit" : "CC0"} · {result.username}
+                      {result.source === "epidemic"
+                        ? `${result.lengthSec}s${result.kind === "music" ? ` · ${result.artists?.join(", ") || "Epidemic Sound"}${result.bpm ? ` · ${result.bpm} BPM` : ""}${result.hasVocals ? " · vocals" : " · instrumental"}${result.moods?.length ? ` · ${result.moods.slice(0, 2).join(", ")}` : ""}${result.previewOnly ? " · preview tier" : ""}` : " · Epidemic Sound"}`
+                        : `${result.durationSec.toFixed(1)} s · ${result.ratings > 0 ? `${result.rating.toFixed(1)}★ (${result.ratings})` : "unrated"} · ${result.needsCredit ? "credit" : "CC0"} · ${result.username}`}
                     </p>
                   </div>
                   {picked[result.id] ? (
-                    <button type="button" onClick={() => onPlaceHit(picked[result.id]!)} className="press text-micro rounded-md border border-accent px-2 py-1 font-semibold text-accent">
-                      Drop at playhead
-                    </button>
+                    result.kind === "music" ? (
+                      <button type="button" onClick={() => onAddBed(picked[result.id]!)} className="press text-micro rounded-md border border-accent px-2 py-1 font-semibold text-accent">
+                        Lay as bed
+                      </button>
+                    ) : (
+                      <button type="button" onClick={() => onPlaceHit(picked[result.id]!)} className="press text-micro rounded-md border border-accent px-2 py-1 font-semibold text-accent">
+                        Drop at playhead
+                      </button>
+                    )
                   ) : (
                     <button
                       type="button"
@@ -417,7 +482,14 @@ export function StudioPanel({
                     </button>
                   )}
                 </div>
-                <audio controls preload="none" src={result.previewUrl} className="mt-1 h-8 w-full" aria-label={`Preview of ${result.name}`} />
+                <audio
+                  controls
+                  preload="none"
+                  src={result.source === "epidemic" ? previews[result.id] || undefined : result.previewUrl}
+                  onPointerDown={(event) => void preview(result, event.currentTarget)}
+                  className="mt-1 h-8 w-full"
+                  aria-label={`Preview of ${result.source === "epidemic" ? result.title : result.name}`}
+                />
               </li>
             ))}
           </ul>

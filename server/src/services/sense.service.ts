@@ -208,12 +208,16 @@ export async function senseAudio(asset: AudioAsset, options: { force?: boolean }
     model,
     parts: [{ type: "text", text: `${AUDIO_SENSE_PROMPT}\nThe file is labelled "${asset.label}" (${asset.kind}, ${asset.durationSec.toFixed(1)} s).` }, await audioPart(path, "m4a")],
     reasoning: "low",
-    maxTokens: 800,
+    // Gemini's reasoning counts against the cap: room for it and the JSON.
+    maxTokens: 2500,
     temperature: 0.2,
     label: "sense audio",
   });
   const sense = parseAssetSense(result.text, model);
-  if (!sense) return undefined;
+  if (!sense) {
+    console.warn(`Could not read a description for sound ${asset.id}: ${result.text.slice(-200).replace(/\s+/g, " ")}`);
+    return undefined;
+  }
   await updateAudioSense(asset.id, sense);
   return sense;
 }
@@ -232,12 +236,16 @@ export async function senseMedia(asset: MediaAsset, options: { force?: boolean }
     model,
     parts: [{ type: "text", text: `${MEDIA_SENSE_PROMPT}\nThe file is labelled "${asset.label}" (${asset.kind}${asset.durationSec ? `, ${asset.durationSec.toFixed(1)} s` : ""}).` }, part],
     reasoning: "low",
-    maxTokens: 800,
+    // Gemini's reasoning counts against the cap: room for it and the JSON.
+    maxTokens: 2500,
     temperature: 0.2,
     label: "sense media",
   });
   const sense = parseAssetSense(result.text, model);
-  if (!sense) return undefined;
+  if (!sense) {
+    console.warn(`Could not read a description for media ${asset.id}: ${result.text.slice(-200).replace(/\s+/g, " ")}`);
+    return undefined;
+  }
   await updateMediaSense(asset.id, sense);
   return sense;
 }

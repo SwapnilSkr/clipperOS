@@ -939,6 +939,15 @@ const generatedMusic = await resolveDirectorMusic({
   musicIds: new Set(["warm"]),
   generate: async (prompt) => ({ id: `custom:${prompt}`, kind: "music", label: prompt, durationSec: 30 }),
 });
+const foundMusic = await resolveDirectorMusic({
+  music: [{ query: "lo-fi chill", bpmMin: 70, bpmMax: 95, level: 0.2 }, { query: "nothing here" }, { asset: "warm" }],
+  musicIds: new Set(["warm"]),
+  findTrack: async (query, bpm) => (query === "nothing here" ? Promise.reject(new Error("no track")) : { id: `custom:${query}:${bpm.min}-${bpm.max}`, kind: "music" as const, label: query, durationSec: 120 }),
+});
+check(
+  "a bed found by query becomes a track with its BPM window; a failed lookup is dropped with a reason",
+  foundMusic.music.length === 2 && foundMusic.music[0]!.asset === "custom:lo-fi chill:70-95" && foundMusic.music[0]!.query === undefined && foundMusic.warnings.length === 1
+);
 check(
   "a generated bed becomes a track; only one per pass; catalogue beds pass through",
   generatedMusic.music.length === 2 && generatedMusic.music[0]!.asset === "custom:lo-fi bed" && generatedMusic.music[1]!.asset === "warm" && generatedMusic.warnings.length === 1

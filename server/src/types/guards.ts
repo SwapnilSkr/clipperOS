@@ -385,6 +385,24 @@ export const GenerationJobParams = t.Object({ id: t.String({ pattern: "^[0-9a-f]
 export const SoundSearchQuery = t.Object({
   q: t.String({ minLength: 1, maxLength: 120 }),
   maxSec: t.Optional(t.Numeric({ minimum: 0.2, maximum: 60 })),
+  source: t.Optional(t.Union([t.Literal("freesound"), t.Literal("epidemic")])),
+  kind: t.Optional(t.Union([t.Literal("sfx"), t.Literal("music")])),
+});
+export const EpidemicPickBody = t.Object({
+  kind: t.Union([t.Literal("sfx"), t.Literal("music")]),
+  id: t.String({ minLength: 1, maxLength: 64 }),
+  title: t.String({ minLength: 1, maxLength: 120 }),
+  lengthSec: t.Number(),
+  artists: t.Optional(t.Array(t.String({ maxLength: 80 }), { maxItems: 3 })),
+  bpm: t.Optional(t.Number()),
+  moods: t.Optional(t.Array(t.String({ maxLength: 40 }), { maxItems: 4 })),
+  genres: t.Optional(t.Array(t.String({ maxLength: 40 }), { maxItems: 3 })),
+  hasVocals: t.Optional(t.Boolean()),
+  previewOnly: t.Optional(t.Boolean()),
+});
+export const EpidemicPreviewQuery = t.Object({
+  kind: t.Union([t.Literal("sfx"), t.Literal("music")]),
+  id: t.String({ minLength: 1, maxLength: 64 }),
 });
 export const SoundPickBody = t.Object({
   id: t.String({ minLength: 1, maxLength: 16 }),
