@@ -369,22 +369,22 @@ body,
     animation: rise 260ms var(--ease-out-quart) both;
   }
 
-  /* Subtitle motion presets mirror the short, restrained ASS animations used
-     by the renderer. They restart when a new caption group mounts. */
+  /* Subtitle motion presets are the renderer's ASS tags: pop is
+     \fscx112\fscy112\t(0,140,\fscx100\fscy100) — a linear 112%→100% scale,
+     no fade — and fade is \fad(100,70)'s entrance. They restart when a new
+     caption group mounts. */
   .caption-pop {
-    animation: caption-pop 140ms var(--ease-out-quart) both;
+    animation: caption-pop 140ms linear both;
   }
   .caption-fade {
-    animation: fade-in 100ms ease-out both;
+    animation: fade-in 100ms linear both;
   }
 
   @keyframes caption-pop {
     from {
-      opacity: 0.72;
       scale: 1.12;
     }
     to {
-      opacity: 1;
       scale: 1;
     }
   }

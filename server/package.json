@@ -21,7 +21,8 @@
     "audio:generate": "bun run scripts/generate-audio-library.ts",
     "creator:validate": "bun run scripts/validate-creator.ts",
     "effects:validate": "bun run scripts/validate-effects.ts",
-    "cutaways:validate": "bun run scripts/validate-cutaways.ts"
+    "cutaways:validate": "bun run scripts/validate-cutaways.ts",
+    "text:validate": "bun run scripts/validate-text.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.958.0",

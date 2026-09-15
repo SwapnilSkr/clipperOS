@@ -94,11 +94,12 @@ import { addBeat, enablePlan, removeBeat, type BeatLane } from "@/lib/beat-plan"
 import { rememberSfx } from "./SfxPicker";
 import { lastEffect } from "./EffectPicker";
 import { CutawayLayer } from "./CutawayLayer";
+import { TextPlacement } from "./TextPlacement";
 import { activeEffectsAt, cssFilterFor, paintFxLayers } from "@/lib/fx-preview";
 import { cropTransformFor, holdCropUntilCuts, paintCropPreview, sourceTimeOnTrack, type Framing } from "@/lib/reframe";
 import { DEFAULT_VIDEO_EFFECTS, SHORT_FORM_TEMPLATES, resolveVideoEffects } from "@/lib/edit-templates";
 import { cn, formatBytes, timecode } from "@/lib/utils";
-import { CaptionSectionField, ColorControl, Panel, SegmentedButton, Slider, TimestampInput } from "./editor-controls";
+import { CaptionSectionField, ColorControl, Panel, PillToggle, SegmentedButton, Slider, TimestampInput } from "./editor-controls";
 
 /** What the editor hands back when the user saves or renders. */
 export interface ClipEditDraft {
@@ -945,7 +946,17 @@ export function ClipEditor({
     const next = addBeat(
       lane,
       { plan, sfx: soundtrack.sfx ?? [] },
-      { at, trimStart, trimEnd, windows: creatorWindows, sfx, effectId: lastEffect(), assetId: cutawayAsset }
+      {
+        at,
+        trimStart,
+        trimEnd,
+        windows: creatorWindows,
+        sfx,
+        effectId: lastEffect(),
+        assetId: cutawayAsset,
+        // A new Text beat starts with the words being spoken there.
+        text: lane === "titles" ? spokenTextBetween(at, at + 2.2) : undefined,
+      }
     );
     if (!next) return;
     if (next.plan !== creator) setCreator(next.plan);
@@ -1235,6 +1246,34 @@ export function ClipEditor({
   };
 
   const creatorPaint = creator.enabled && !isMerge;
+  // Text beats draw with the caption font catalogue; unknown families fall back like the burn's.
+  const titleFontFor = useCallback(
+    (family: string) => {
+      const font = fontChoices.find((item) => item.family === family);
+      return font
+        ? { stack: font.stack, weight: font.weight, emScale: font.emScale, baseline: font.baseline }
+        : { stack: `"${family}", Impact, sans-serif`, weight: 400 };
+    },
+    [fontChoices]
+  );
+  // The Create desk's selection, when it is something placed on the frame.
+  const selectedText =
+    desk === "create" && beatSelection?.lane === "titles" ? creator.titles?.find((item) => item.id === beatSelection.id) : undefined;
+  const placingScene =
+    desk === "create" && creator.enabled && beatSelection?.lane === "captions"
+      ? creator.captionScenes?.find((scene) => scene.id === beatSelection.id)
+      : undefined;
+  /** Transcript text spoken inside [from, to] source seconds, as the captions read (edits included). */
+  const spokenTextBetween = useCallback(
+    (from: number, to: number) =>
+      captions
+        .filter((caption) => caption.sourceEndSec > from + 0.05 && caption.sourceStartSec < to - 0.05)
+        .map((caption) => caption.text)
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim(),
+    [captions]
+  );
   const paintPreview = useCallback(
     (mediaTime?: number) => {
       const video = videoRef.current;
@@ -1271,12 +1310,7 @@ export function ClipEditor({
                       height: matte.height,
                     }
                   : null,
-              fontFor: (family) => {
-                const font = fontChoices.find((item) => item.family === family);
-                return font
-                  ? { stack: font.stack, weight: font.weight }
-                  : { stack: `"${family}", Impact, sans-serif`, weight: 400 };
-              },
+              fontFor: titleFontFor,
             }
           : {}
       );
@@ -1662,13 +1696,24 @@ export function ClipEditor({
       {/* ---- body ---- */}
       <div
         className={cn(
-          "studio-scroll grid min-h-0 flex-1 gap-4 overflow-y-auto p-3 lg:grid-cols-[minmax(0,1fr)_380px] lg:overflow-hidden lg:p-5",
-          // The create desk adds a full-width timeline row under player and rail.
-          desk === "create" ? "lg:grid-rows-[minmax(0,1fr)_auto]" : "lg:grid-rows-[minmax(0,1fr)]"
+          "studio-scroll grid min-h-0 flex-1 gap-4 overflow-y-auto p-3 lg:overflow-hidden lg:p-5",
+          // The create desk: a 9:16 preview needs height, the timeline needs
+          // width. The player takes a full-height column sized from the window's
+          // height; the rail sits over the timeline beside it.
+          desk === "create"
+            ? "lg:grid-cols-[minmax(240px,calc((100dvh_-_250px)*0.5625))_minmax(0,1fr)] lg:grid-rows-[minmax(0,1fr)_auto]"
+            : "lg:grid-cols-[minmax(0,1fr)_380px] lg:grid-rows-[minmax(0,1fr)]"
         )}
       >
         {/* player + transport stay on screen; only the right rail scrolls */}
-        <section className="flex h-full min-h-0 min-w-0 flex-col items-center gap-2 overflow-hidden">
+        <section
+          className={cn(
+            // Fixed-height column on desktop only: stacked on a phone, a clipped
+            // zero-minimum item let its grid row collapse the player to nothing.
+            "flex min-w-0 shrink-0 flex-col items-center gap-2 lg:h-full lg:min-h-0 lg:overflow-hidden",
+            desk === "create" && "lg:row-span-2"
+          )}
+        >
           {!sourceReady ? (
             <div className="w-full max-w-[340px] shrink-0 rounded-lg border border-warn/40 bg-warn/10 p-3">
               {sourceFetching ? (
@@ -1870,15 +1915,17 @@ export function ClipEditor({
                 <CaptionOverlay
                   caption={activeCaption}
                   style={activeCaptionStyle}
-                  fontStack={activeCaptionFont?.stack ?? activeCaptionStyle.fontFamily}
-                  fontWeight={activeCaptionFont?.weight ?? 900}
+                  font={activeCaptionFont}
                   frameHeight={frameHeight}
                   frameWidth={frameWidth}
                   spokenIndex={spokenIndex}
-                  positioning={positioningCaptions}
+                  positioning={positioningCaptions || Boolean(placingScene && activeCaption?.sceneId === placingScene.id)}
                   onPositionChange={(horizontalFrac, verticalFrac) => {
                     // Dragging a caption inside a scene places that scene's look.
-                    const sceneId = activeCaption?.sceneId;
+                    // On the Create desk only a scene is ever moved: the Edit
+                    // desk's own caption position stays exactly as it is.
+                    const sceneId = placingScene?.id ?? activeCaption?.sceneId;
+                    if (desk === "create" && !sceneId) return;
                     if (sceneId && creator.enabled) {
                       setCreator((prev) => ({
                         ...prev,
@@ -1903,6 +1950,20 @@ export function ClipEditor({
                       verticalFrac,
                     }));
                   }}
+                />
+              ) : null}
+              {cropPreview && selectedText ? (
+                <TextPlacement
+                  title={selectedText}
+                  frameWidth={frameWidth}
+                  frameHeight={frameHeight}
+                  fontFor={titleFontFor}
+                  onMove={(position) =>
+                    setCreator((prev) => ({
+                      ...prev,
+                      titles: (prev.titles ?? []).map((title) => (title.id === selectedText.id ? { ...title, ...position } : title)),
+                    }))
+                  }
                 />
               ) : null}
               {showCleanup && desk === "cut" && frameWidth > 0 ? (
@@ -1982,17 +2043,45 @@ export function ClipEditor({
             </div>
           </div>
 
-          {/* Framing: the crop is what renders, "fit" reveals what it cuts off. */}
-          <div className="flex w-full max-w-[340px] shrink-0 flex-col items-center gap-2">
-            {mode === "source" ? (
-              <div className="flex w-full gap-2">
-                <SegmentedButton active={fitMode === "crop"} onClick={() => setFitMode("crop")} label="9:16 crop" />
-                <SegmentedButton active={fitMode === "fit"} onClick={() => setFitMode("fit")} label="Fit source" />
+          {/* Player controls, kept compact so the preview above gets the height. */}
+          <div className="flex w-full max-w-[420px] shrink-0 flex-col items-center gap-2">
+            {/* One compact row: what the player shows, and how it frames the source. */}
+            {rendered || mode === "source" ? (
+              <div className="flex w-full flex-wrap items-center justify-center gap-2">
+                {rendered ? (
+                  <PillToggle
+                    label="Player shows"
+                    value={mode}
+                    onChange={setMode}
+                    options={[
+                      { id: "source", label: "Live edit" },
+                      {
+                        id: "output",
+                        label: "Last render",
+                        title: clip.outputBytes
+                          ? `Stored: ${formatBytes(clip.outputBytes)}${clip.reframeNote ? ` · ${clip.reframeNote}` : ""}`
+                          : undefined,
+                      },
+                    ]}
+                  />
+                ) : null}
+                {/* Framing: the crop is what renders, "fit" reveals what it cuts off. */}
+                {mode === "source" ? (
+                  <PillToggle
+                    label="Framing"
+                    value={fitMode}
+                    onChange={setFitMode}
+                    options={[
+                      { id: "crop", label: "9:16 crop" },
+                      { id: "fit", label: "Fit source" },
+                    ]}
+                  />
+                ) : null}
               </div>
             ) : null}
 
             {/* transport */}
-            <div className="flex w-full max-w-[340px] items-center justify-center gap-2">
+            <div className="flex w-full items-center gap-2">
               {isMerge ? (
                 <button
                   type="button"
@@ -2007,7 +2096,7 @@ export function ClipEditor({
               <button
                 type="button"
                 onClick={togglePlay}
-                className="press inline-flex size-12 items-center justify-center rounded-full bg-accent text-accent-fg hover:opacity-90"
+                className="press inline-flex size-10 shrink-0 items-center justify-center rounded-full bg-accent text-accent-fg hover:opacity-90"
                 aria-label={playing ? "Pause preview" : outroPlaythrough ? "Play clip and sting" : "Play window"}
               >
                 {playing ? (
@@ -2027,25 +2116,57 @@ export function ClipEditor({
                   <ArrowRight className="size-4" aria-hidden="true" />
                 </button>
               ) : null}
-              {desk === "cut" ? (
-                <>
-                  <button
-                    type="button"
-                    onClick={markIn}
-                    className="press text-ui h-9 rounded-lg border border-control px-3 font-medium hover:border-accent"
-                  >
-                    Mark in
-                  </button>
-                  <button
-                    type="button"
-                    onClick={markOut}
-                    className="press text-ui h-9 rounded-lg border border-control px-3 font-medium hover:border-accent"
-                  >
-                    Mark out
-                  </button>
-                </>
-              ) : null}
+              {/* where you are, and the scrubber, beside the play button */}
+              <div className="min-w-0 flex-1">
+                <p className="num text-micro truncate text-muted">
+                  {previewStage === "outro"
+                    ? `sting ${timecode(outroTime)} · ${outroDur.toFixed(1)}s after the window`
+                    : `source ${timecode(time)} · window ${timecode(active.startSec)}–${timecode(active.endSec)} · ${(active.endSec - active.startSec).toFixed(1)}s${
+                        creator.enabled && creatorWindows.length > 1 ? ` → ${creatorOutputSec.toFixed(1)}s cut` : ""
+                      }`}
+                  {isMerge && previewStage !== "outro" ? ` · part ${safeIndex + 1}/${previewSegments.length}` : ""}
+                </p>
+
+                {/* playhead: clip window, or clip + sting on the mix desk */}
+                <input
+                  type="range"
+                  min={outroPlaythrough ? 0 : active.startSec}
+                  max={outroPlaythrough ? playthroughDur : Math.max(active.startSec + 0.1, active.endSec)}
+                  step={0.05}
+                  value={
+                    outroPlaythrough
+                      ? Math.min(playthroughDur, Math.max(0, playheadLocal))
+                      : Math.min(Math.max(time, active.startSec), active.endSec)
+                  }
+                  onChange={(event) => {
+                    const next = Number(event.target.value);
+                    if (outroPlaythrough) seekPlaythrough(next);
+                    else seekTo(next);
+                  }}
+                  aria-label={outroPlaythrough ? "Playhead through clip and sting" : "Playhead"}
+                  className="accent-accent h-6 w-full"
+                />
+              </div>
             </div>
+
+            {desk === "cut" ? (
+              <div className="grid w-full grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={markIn}
+                  className="press text-ui h-9 rounded-lg border border-control px-3 font-medium hover:border-accent"
+                >
+                  Mark in
+                </button>
+                <button
+                  type="button"
+                  onClick={markOut}
+                  className="press text-ui h-9 rounded-lg border border-control px-3 font-medium hover:border-accent"
+                >
+                  Mark out
+                </button>
+              </div>
+            ) : null}
 
             {desk === "cut" ? (
               <div className="grid w-full max-w-[340px] grid-cols-2 gap-2">
@@ -2074,34 +2195,6 @@ export function ClipEditor({
               </div>
             ) : null}
 
-            <p className="num text-meta text-muted">
-              {previewStage === "outro"
-                ? `sting ${timecode(outroTime)} · ${outroDur.toFixed(1)}s after the window`
-                : `source ${timecode(time)} · window ${timecode(active.startSec)}–${timecode(active.endSec)} · ${(active.endSec - active.startSec).toFixed(1)}s${
-                    creator.enabled && creatorWindows.length > 1 ? ` → ${creatorOutputSec.toFixed(1)}s cut` : ""
-                  }`}
-              {isMerge && previewStage !== "outro" ? ` · part ${safeIndex + 1}/${previewSegments.length}` : ""}
-            </p>
-
-            {/* playhead: clip window, or clip + sting on the mix desk */}
-            <input
-              type="range"
-              min={outroPlaythrough ? 0 : active.startSec}
-              max={outroPlaythrough ? playthroughDur : Math.max(active.startSec + 0.1, active.endSec)}
-              step={0.05}
-              value={
-                outroPlaythrough
-                  ? Math.min(playthroughDur, Math.max(0, playheadLocal))
-                  : Math.min(Math.max(time, active.startSec), active.endSec)
-              }
-              onChange={(event) => {
-                const next = Number(event.target.value);
-                if (outroPlaythrough) seekPlaythrough(next);
-                else seekTo(next);
-              }}
-              aria-label={outroPlaythrough ? "Playhead through clip and sting" : "Playhead"}
-              className="accent-accent h-8 w-full"
-            />
             {desk === "mix" ? (
               <MixTimeline
                 soundtrack={soundtrack}
@@ -2137,7 +2230,10 @@ export function ClipEditor({
 
         {/* the beat timeline: a full-width row under player and rail on desktop */}
         {desk === "create" ? (
-          <div className="min-w-0 lg:order-last lg:col-span-2">
+          <div className="min-w-0 lg:order-last lg:col-start-2">
+            <p className="text-micro mb-1.5 px-1 text-muted">
+              Timeline · click a block to edit it · drag to move, drag an edge to resize · + adds at the playhead
+            </p>
             <BeatTimeline
               trimStart={trimStart}
               trimEnd={trimEnd}
@@ -2168,26 +2264,7 @@ export function ClipEditor({
         ) : null}
 
         {/* controls — the only pane the right scrollbar should move */}
-        <section className="studio-scroll flex min-w-0 flex-col gap-4 lg:min-h-0 lg:overflow-y-auto lg:overscroll-contain">
-          {/* source / output */}
-          <Panel title="Preview" icon={SlidersHorizontal}>
-            <div className="flex gap-2">
-              <SegmentedButton active={mode === "source"} onClick={() => setMode("source")} label="Source" />
-              <SegmentedButton
-                active={mode === "output"}
-                onClick={() => setMode("output")}
-                disabled={!rendered}
-                label="Last render"
-              />
-            </div>
-            {rendered && clip.outputBytes ? (
-              <p className="text-meta mt-2 text-muted">
-                Stored: {formatBytes(clip.outputBytes)}
-                {clip.reframeNote ? ` · ${clip.reframeNote}` : ""}
-              </p>
-            ) : null}
-          </Panel>
-
+        <section className="studio-scroll relative flex min-w-0 flex-col gap-4 lg:min-h-0 lg:overflow-y-auto lg:overscroll-contain">
           {desk === "create" ? (
             <CreatorDesk
               clipId={clip.id}
@@ -2217,6 +2294,13 @@ export function ClipEditor({
               transitions={transitions}
               onMediaChanged={refreshMediaLibrary}
               onPlaceCutaway={(assetId) => addBeatAtPlayhead("cutaways", undefined, assetId)}
+              onAdd={(lane, sfxAssetId) => addBeatAtPlayhead(lane, sfxAssetId)}
+              playhead={time}
+              spokenTextBetween={spokenTextBetween}
+              onPlayFrom={(sourceSec) => {
+                seekTo(sourceSec);
+                void videoRef.current?.play().catch(() => undefined);
+              }}
               audioLibrary={audioLibrary}
               onUploadAudio={uploadAudio}
               onDirect={directClip}

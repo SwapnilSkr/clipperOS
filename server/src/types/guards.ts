@@ -160,8 +160,15 @@ const BehindTitleBody = t.Object({
   fontFamily: t.Optional(t.String({ maxLength: 60 })),
   color: t.String({ maxLength: 9 }),
   uppercase: t.Optional(t.Boolean()),
-  animation: t.Union([t.Literal("none"), t.Literal("pop"), t.Literal("fade"), t.Literal("rise")]),
+  animation: t.Union([t.Literal("none"), t.Literal("pop"), t.Literal("fade"), t.Literal("rise"), t.Literal("zoom_in"), t.Literal("zoom_out"), t.Literal("slide_left"), t.Literal("slide_right"), t.Literal("slide_up"), t.Literal("slide_down"), t.Literal("drop"), t.Literal("words")]),
   depth: t.Union([t.Literal("behind"), t.Literal("front")]),
+  exit: t.Optional(t.Union([t.Literal("none"), t.Literal("fade"), t.Literal("pop"), t.Literal("zoom_in"), t.Literal("zoom_out"), t.Literal("slide_left"), t.Literal("slide_right"), t.Literal("slide_up"), t.Literal("slide_down"), t.Literal("sink")])),
+  enterSec: t.Optional(t.Number()),
+  exitSec: t.Optional(t.Number()),
+  motion: t.Optional(t.Union([t.Literal("none"), t.Literal("grow"), t.Literal("shrink"), t.Literal("pulse"), t.Literal("wiggle"), t.Literal("float")])),
+  rotation: t.Optional(t.Number()),
+  outline: t.Optional(t.Number()),
+  box: t.Optional(t.Object({ color: t.String({ maxLength: 9 }), opacity: t.Number() })),
 });
 
 export const CreatorPlanBody = t.Object({

@@ -24,10 +24,14 @@ import {
   type PauseCut,
   type SpeedKind,
   type SpeedSpan,
+  type TextEnter,
+  type TextExit,
+  type TextMotion,
 } from "../types/clip.types";
 import { resolveCaptionFont } from "../config/caption-fonts";
 import { EFFECTS_BY_ID, isEffectId } from "../config/effects";
 import { isTransitionId } from "../config/transitions";
+import { TEXT_ENTERS, TEXT_EXITS, TEXT_MOTIONS } from "./text-motion";
 
 // ============================================
 // CREATOR PLAN — sanitising and normalising the beat plan.
@@ -274,7 +278,7 @@ function sanitizeTitle(raw: unknown, index: number): BehindTitle {
   const text = typeof source.text === "string" ? source.text.replace(/\s+/g, " ").trim().slice(0, 120) : "";
   if (!text) throw new Error(`Title ${index + 1} has no text`);
   const animation = source.animation ?? "pop";
-  if (animation !== "none" && animation !== "pop" && animation !== "fade" && animation !== "rise") {
+  if (typeof animation !== "string" || !(TEXT_ENTERS as string[]).includes(animation)) {
     throw new Error("Unknown title animation");
   }
   const out: BehindTitle = {
@@ -286,13 +290,37 @@ function sanitizeTitle(raw: unknown, index: number): BehindTitle {
     y: round3(clampNumber(source.y ?? 0.3, 0, 1, "title y")),
     sizeScale: round3(clampNumber(source.sizeScale ?? 1, 0.3, 4, "title size")),
     color: colorOf(source.color ?? "#ffffff", "title colour"),
-    animation,
+    animation: animation as TextEnter,
     depth: source.depth === "front" ? "front" : "behind",
   };
   if (typeof source.fontFamily === "string" && source.fontFamily.trim()) {
     out.fontFamily = resolveCaptionFont(source.fontFamily);
   }
   if (source.uppercase !== undefined) out.uppercase = Boolean(source.uppercase);
+  // Motion and look; each left absent at its default so an old title round-trips.
+  if (source.exit !== undefined && source.exit !== null) {
+    if (typeof source.exit !== "string" || !(TEXT_EXITS as string[]).includes(source.exit)) throw new Error("Unknown title exit");
+    out.exit = source.exit as TextExit;
+  }
+  if (source.enterSec !== undefined && source.enterSec !== null) out.enterSec = round3(clampNumber(source.enterSec, 0.05, 3, "title enterSec"));
+  if (source.exitSec !== undefined && source.exitSec !== null) out.exitSec = round3(clampNumber(source.exitSec, 0.05, 3, "title exitSec"));
+  if (source.motion !== undefined && source.motion !== null && source.motion !== "none") {
+    if (typeof source.motion !== "string" || !(TEXT_MOTIONS as string[]).includes(source.motion)) throw new Error("Unknown title motion");
+    out.motion = source.motion as TextMotion;
+  }
+  if (source.rotation !== undefined && source.rotation !== null) {
+    const rotation = round3(clampNumber(source.rotation, -45, 45, "title rotation"));
+    if (rotation !== 0) out.rotation = rotation;
+  }
+  if (source.outline !== undefined && source.outline !== null) {
+    const outline = round3(clampNumber(source.outline, 0, 2, "title outline"));
+    if (outline !== 1) out.outline = outline;
+  }
+  if (source.box !== undefined && source.box !== null) {
+    if (typeof source.box !== "object") throw new Error("Invalid title box");
+    const box = source.box as Record<string, unknown>;
+    out.box = { color: colorOf(box.color ?? "#000000", "title box colour"), opacity: round3(clampNumber(box.opacity ?? 0.7, 0, 1, "title box opacity")) };
+  }
   return out;
 }
 

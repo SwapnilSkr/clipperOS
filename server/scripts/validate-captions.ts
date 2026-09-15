@@ -1,3 +1,8 @@
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { config } from "../src/config";
+import { captionFontBold, captionFontFile, captionFontFileFamily, listCaptionFonts } from "../src/config/caption-fonts";
 import { listCaptionStyles } from "../src/config/caption-styles";
 import { snapCleanCues, stripCaptionFillers } from "../src/services/caption-clean.service";
 import { ASS_FONT_SIZE_MATCH, CAPTION_BASE_FONT } from "../src/types/clip.types";
@@ -344,6 +349,70 @@ check(
   "every template uses a known caption font",
   templates.every((style) => renderAss([], { fontFamily: style.fontFamily }).includes(`Style: Cap,${style.fontFamily},`))
 );
+
+// ---- the faces: the burn must draw the very files the preview loads ----
+const bundled = listCaptionFonts().filter((font) => captionFontFile(font.family));
+check(
+  "every bundled font file names its family the way the catalogue does",
+  bundled.length >= 9 && bundled.every((font) => captionFontFileFamily(font.family) === font.family)
+);
+check(
+  "only bold-weight faces ask libass for Bold (a regular face would be fake-bolded, which no preview can match)",
+  listCaptionFonts().every((font) => captionFontBold(font.family) === (font.weight >= 600 ? -1 : 0)) &&
+    renderAss([], { fontFamily: "Anton" }).includes("Style: Cap,Anton,98,&H00FFFFFF,&H00FFFFFF,&H00000000,&H9A000000,0,") &&
+    renderAss([], { fontFamily: "Arial" }).includes("Style: Cap,Arial,98,&H00FFFFFF,&H00FFFFFF,&H00000000,&H9A000000,-1,")
+);
+
+/**
+ * The ink libass leaves for `family` on a black frame: a signature that tells
+ * one face from another. `asFallback` keeps the family's style — size, Bold —
+ * but names a face nothing provides, so the signature is libass's fallback.
+ */
+async function inkSignature(dir: string, family: string, asFallback = false): Promise<string> {
+  const assPath = join(dir, `${family.replace(/\W+/g, "_")}${asFallback ? "-fallback" : ""}.ass`);
+  const line = { start: 0, end: 1, text: "The quick brown fox", words: [] };
+  const ass = renderAss([line as never], { fontFamily: family });
+  await writeFile(assPath, asFallback ? ass.replaceAll(`,${family},`, ",NoSuchCaptionFace,") : ass);
+  const proc = Bun.spawnSync(
+    [
+      config.ffmpegPath, "-hide_banner", "-loglevel", "error",
+      "-f", "lavfi", "-i", "color=c=black:s=1080x1920:r=10:d=0.2",
+      "-vf", `${assVideoFilter(assPath)},format=gray,select='eq(n\\,1)'`,
+      "-fps_mode", "passthrough", "-frames:v", "1", "-f", "rawvideo", "-",
+    ],
+    { stdout: "pipe", stderr: "pipe" }
+  );
+  if (proc.exitCode !== 0) throw new Error(new TextDecoder().decode(proc.stderr).slice(0, 300));
+  const px = new Uint8Array(proc.stdout);
+  let mass = 0;
+  let minX = 1080;
+  let maxX = -1;
+  let minY = 1920;
+  let maxY = -1;
+  for (let y = 0; y < 1920; y++) {
+    for (let x = 0; x < 1080; x++) {
+      const v = px[y * 1080 + x]!;
+      if (v < 128) continue;
+      mass++;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+  }
+  return `${maxX - minX + 1}x${maxY - minY + 1}:${mass}`;
+}
+{
+  const dir = await mkdtemp(join(tmpdir(), "caption-fonts-"));
+  const found: string[] = [];
+  const missing: string[] = [];
+  for (const font of bundled) {
+    const signature = await inkSignature(dir, font.family);
+    const fallback = await inkSignature(dir, font.family, true);
+    (signature === fallback ? missing : found).push(`${font.family} ${signature}`);
+  }
+  check(`libass draws every bundled face, none as its fallback (${found.length} found${missing.length ? `; fallback: ${missing.join(", ")}` : ""})`, missing.length === 0);
+}
 
 console.log(failures === 0 ? "\nall caption checks passed" : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

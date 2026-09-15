@@ -7,6 +7,8 @@
  */
 import * as client from "../src/lib/creator-timeline";
 import * as server from "../../server/src/services/creator-timeline";
+import * as textClient from "../src/lib/text-motion";
+import * as textServer from "../../server/src/services/text-motion";
 import type { CreatorPlan, PauseCut, ReframeTrack } from "../src/api";
 
 let failures = 0;
@@ -93,6 +95,44 @@ for (let round = 0; round < 60; round++) {
 }
 
 check("windows, clock mapping and camera state agree on 60 random plans", mismatches === 0, `${mismatches} mismatches`);
+
+// ---- text motion: the preview's poses are the burn's ----
+{
+  const enters = textServer.TEXT_ENTERS;
+  const exits = textServer.TEXT_EXITS;
+  const motions = textServer.TEXT_MOTIONS;
+  let textMismatches = 0;
+  let samples = 0;
+  for (let round = 0; round < 120; round++) {
+    const start = rand() * 30;
+    const title = {
+      id: `t${round}`,
+      text: ["ONE", "TWO WORDS", "A LONGER LINE OF TEXT HERE"][Math.floor(rand() * 3)]!,
+      startSec: start,
+      endSec: start + 0.2 + rand() * 6,
+      x: rand(),
+      y: rand(),
+      sizeScale: 1,
+      color: "#ffffff",
+      animation: enters[Math.floor(rand() * enters.length)]!,
+      exit: rand() > 0.2 ? exits[Math.floor(rand() * exits.length)]! : undefined,
+      motion: motions[Math.floor(rand() * motions.length)]!,
+      enterSec: rand() > 0.5 ? 0.05 + rand() * 1.5 : undefined,
+      exitSec: rand() > 0.5 ? 0.05 + rand() * 1.5 : undefined,
+      depth: "front" as const,
+    };
+    const a = textClient.textSchedule(title);
+    const b = textServer.textSchedule(title);
+    if (JSON.stringify(a) !== JSON.stringify(b)) textMismatches++;
+    for (let i = 0; i < 25; i++) {
+      const t = rand() * (a.duration + 0.4) - 0.2;
+      samples++;
+      if (JSON.stringify(textClient.textPoseAt(a, t)) !== JSON.stringify(textServer.textPoseAt(b, t))) textMismatches++;
+      if (textClient.wordAlphaAt(a, 1, t) !== textServer.wordAlphaAt(b, 1, t)) textMismatches++;
+    }
+  }
+  check("text motion schedules, poses and word reveals agree on 120 random titles", textMismatches === 0, `${textMismatches} mismatches over ${samples} samples`);
+}
 
 if (failures > 0) {
   console.error(`\n${failures} check(s) failed`);

@@ -482,9 +482,33 @@ export interface CaptionScene {
   overrides?: CaptionOverrides;
 }
 
-export type TitleAnimation = "none" | "pop" | "fade" | "rise";
+/** How a Text beat arrives. "words" reveals it word by word. */
+export type TextEnter =
+  | "none"
+  | "pop"
+  | "fade"
+  | "rise"
+  | "zoom_in"
+  | "zoom_out"
+  | "slide_left"
+  | "slide_right"
+  | "slide_up"
+  | "slide_down"
+  | "drop"
+  | "words";
+/** How it leaves. */
+export type TextExit = "none" | "fade" | "pop" | "zoom_in" | "zoom_out" | "slide_left" | "slide_right" | "slide_up" | "slide_down" | "sink";
+/** What it does while on screen. */
+export type TextMotion = "none" | "grow" | "shrink" | "pulse" | "wiggle" | "float";
 
-/** A free-placed title. `behind` renders it between the background and the speaker. */
+/** The entrance (kept under its original name so stored titles read unchanged). */
+export type TitleAnimation = TextEnter;
+
+/**
+ * A Text beat: your own caption or title, free-placed, timed and animated
+ * (services/text-motion.ts). Separate from the transcript captions, which it
+ * never changes. `behind` renders it between the background and the speaker.
+ */
 export interface BehindTitle {
   id: string;
   text: string;
@@ -500,6 +524,19 @@ export interface BehindTitle {
   uppercase?: boolean;
   animation: TitleAnimation;
   depth: "behind" | "front";
+  /** How it leaves; absent on a title saved before exits existed (a fade, see text-motion exitOf). */
+  exit?: TextExit;
+  /** Seconds the entrance / exit take; the kind's default when absent. */
+  enterSec?: number;
+  exitSec?: number;
+  /** Motion while on screen. */
+  motion?: TextMotion;
+  /** Degrees, clockwise. */
+  rotation?: number;
+  /** Outline strength: 0 none, 1 the default, up to 2. */
+  outline?: number;
+  /** A box behind the text. */
+  box?: { color: string; opacity: number };
 }
 
 /** One Director pass: what the creator asked, what the Director said it did. */
@@ -670,9 +707,11 @@ export const OUTPUT_HEIGHT = 1920;
 export const CAPTION_BASE_FONT = 70;
 export const PEAK_BASE_FONT = 91;
 /**
- * libass Fontsize reads smaller than the same CSS px at weight 900, especially
- * after a 16:9→9:16 reframe. Applied only when writing ASS so the download
- * matches the editor overlay.
+ * ASS sizes are written as px × this. libass makes the line box exactly that
+ * tall and fits the face's Windows ascent + descent into it, so the em it
+ * draws is smaller than the ASS size by the face's own ratio — the preview
+ * applies that ratio (caption-fonts captionFontEmScale) to draw the same
+ * glyphs at the same size.
  */
 export const ASS_FONT_SIZE_MATCH = 1.4;
 export const CAPTION_SIZE_SCALE = 1;

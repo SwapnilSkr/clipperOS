@@ -46,6 +46,8 @@ export interface BeatContext {
   effectId?: string;
   /** The media asset for a new cutaway (required for that lane). */
   assetId?: string;
+  /** Words for a new Text beat (the transcript at the playhead); a placeholder when absent. */
+  text?: string;
 }
 
 export interface BeatState {
@@ -174,16 +176,18 @@ export function addBeat(lane: BeatLane, state: BeatState, ctx: BeatContext): (Be
     case "titles": {
       const title: BehindTitle = {
         id: newId("title"),
-        text: "YOUR HOOK",
+        text: (ctx.text?.trim() || "YOUR TEXT").slice(0, 120),
         startSec: at,
         endSec: until(2.2),
         x: 0.5,
-        y: 0.24,
+        y: 0.3,
         sizeScale: 1,
         color: "#ffffff",
         uppercase: true,
         animation: "pop",
-        depth: "behind",
+        exit: "fade",
+        // In front: it shows at once, no person matte needed; "Behind speaker" is one click.
+        depth: "front",
       };
       return {
         plan: { ...plan, titles: [...(plan.titles ?? []), title] },

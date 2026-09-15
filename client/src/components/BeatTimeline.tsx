@@ -4,6 +4,7 @@ import type { AudioAsset, CameraMove, CreatorPlan, SoundtrackHit } from "@/api";
 import { laneFull, type BeatLane } from "@/lib/beat-plan";
 import { outputToSource, sourceToOutput, type TimeWindow } from "@/lib/creator-timeline";
 import { cn, timecode } from "@/lib/utils";
+import { LANES } from "./lanes";
 import { lastSfx, SfxPicker } from "./SfxPicker";
 
 // ============================================================
@@ -52,20 +53,11 @@ function moveLabel(move: CameraMove): string {
   return [move.kind, zoom, move.pan ? "pan" : ""].filter(Boolean).join(" ");
 }
 
-const LANES: { id: BeatLane; label: string; add: string }[] = [
-  { id: "cuts", label: "Cuts", add: "Cut 0.4s here" },
-  { id: "camera", label: "Camera", add: "Punch in here" },
-  { id: "speed", label: "Speed", add: "Slow motion here" },
-  { id: "fx", label: "FX", add: "Effect here" },
-  { id: "cutaways", label: "B-roll", add: "Cutaway here" },
-  { id: "captions", label: "Captions", add: "Caption scene here" },
-  { id: "titles", label: "Titles", add: "Title here" },
-  { id: "sfx", label: "SFX", add: "Sound here" },
-];
 
-const LANE_HEIGHT = 28;
+/** Short lanes: eight of them must leave the preview above its room. */
+const LANE_HEIGHT = 22;
 const RULER_HEIGHT = 18;
-const LABEL_WIDTH = 92;
+const LABEL_WIDTH = 108;
 const EDGE_PX = 7;
 const MIN_SPAN_SEC = 0.1;
 
@@ -344,7 +336,11 @@ export function BeatTimeline({
                 className="flex items-center justify-between pl-2 pr-1"
                 style={{ height: LANE_HEIGHT }}
               >
-                <span className="eyebrow text-muted" title={lane.id === "cutaways" && onDropMedia ? "Drop an image or video on this lane to add it" : undefined}>
+                <span
+                  className="eyebrow flex items-center gap-1.5 text-muted"
+                  title={lane.id === "cutaways" && onDropMedia ? "Drop an image or video on this lane to add it" : lane.summary}
+                >
+                  <lane.icon className="size-3 shrink-0" aria-hidden="true" />
                   {lane.label}
                 </span>
                 <button
@@ -471,7 +467,7 @@ export function BeatTimeline({
               {lane.id === "cutaways" && (dropAt !== null || uploadingAt !== null) ? (
                 <div
                   aria-hidden="true"
-                  className="pointer-events-none absolute top-1 bottom-1 flex items-center whitespace-nowrap rounded-sm border border-dashed border-sky-400 bg-sky-400/20 px-1.5 text-micro font-semibold text-fg"
+                  className="pointer-events-none absolute top-0.5 bottom-0.5 flex items-center whitespace-nowrap rounded-sm border border-dashed border-sky-400 bg-sky-400/20 px-1.5 text-micro font-semibold text-fg"
                   style={{ left: pct(uploadingAt ?? dropAt!) }}
                 >
                   {uploadingAt !== null ? "Uploading…" : `Drop to place at ${timecode(dropAt!)}`}
@@ -501,7 +497,7 @@ export function BeatTimeline({
                         }
                       }}
                       className={cn(
-                        "absolute top-1 bottom-1 flex items-center overflow-hidden rounded-sm border px-1.5 text-micro font-semibold outline-none",
+                        "absolute top-0.5 bottom-0.5 flex items-center overflow-hidden rounded-sm border px-1.5 text-micro font-semibold outline-none",
                         block.point
                           ? "w-4 -translate-x-1/2 justify-center rounded-full"
                           : "cursor-grab active:cursor-grabbing",

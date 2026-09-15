@@ -35,15 +35,50 @@ export function Panel({
   );
 }
 
+/** A small inline choice between a few options, for toolbars where full-width buttons cost too much room. */
+export function PillToggle<T extends string>({
+  label,
+  value,
+  options,
+  onChange,
+}: {
+  label: string;
+  value: T;
+  options: { id: T; label: string; title?: string }[];
+  onChange: (value: T) => void;
+}) {
+  return (
+    <div role="group" aria-label={label} className="inline-flex rounded-lg border border-border p-0.5">
+      {options.map((option) => (
+        <button
+          key={option.id}
+          type="button"
+          aria-pressed={value === option.id}
+          title={option.title}
+          onClick={() => onChange(option.id)}
+          className={cn(
+            "press text-micro h-9 rounded-md px-2.5 font-semibold sm:h-7",
+            value === option.id ? "bg-panel-2 text-fg" : "text-muted hover:text-fg"
+          )}
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 export function SegmentedButton({
   active,
   disabled,
   label,
+  title,
   onClick,
 }: {
   active: boolean;
   disabled?: boolean;
   label: string;
+  title?: string;
   onClick: () => void;
 }) {
   return (
@@ -51,6 +86,7 @@ export function SegmentedButton({
       type="button"
       aria-pressed={active}
       disabled={disabled}
+      title={title}
       onClick={onClick}
       className={cn(
         "press text-ui h-11 flex-1 rounded-md border px-3 font-medium sm:h-8",

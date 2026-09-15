@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Navigate, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { AlertTriangle, CheckCircle2, Plus, RotateCcw, Scissors, Sparkles, X } from "lucide-react";
+import { AlertTriangle, CheckCircle2, PanelLeftClose, PanelLeftOpen, Plus, RotateCcw, Scissors, Sparkles, X } from "lucide-react";
 import {
   api,
   clipDownloadUrl,
@@ -18,6 +18,7 @@ import { OutroBuilder } from "@/components/OutroBuilder";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { PipelineRail } from "@/components/PipelineRail";
 import { ProjectList } from "@/components/ProjectList";
+import { loadCaptionFontFaces } from "@/lib/caption-font-faces";
 import { SourceBar } from "@/components/SourceBar";
 import { routes } from "@/routes";
 import { formatBytes } from "@/lib/utils";
@@ -178,6 +179,28 @@ export default function App() {
   );
 }
 
+const SIDEBAR_KEY = "clipperos.sidebarOpen";
+
+function readSidebarOpen(): boolean {
+  try {
+    return window.localStorage.getItem(SIDEBAR_KEY) !== "0";
+  } catch {
+    return true;
+  }
+}
+
+function rememberSidebarOpen(open: boolean): void {
+  try {
+    window.localStorage.setItem(SIDEBAR_KEY, open ? "1" : "0");
+  } catch {
+    // Private mode: the sidebar opens next time.
+  }
+}
+
+function isMac(): boolean {
+  return typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform);
+}
+
 export function Studio() {
   const { projectId, clipId, outroId } = useParams<{ projectId?: string; clipId?: string; outroId?: string }>();
   const [searchParams] = useSearchParams();
@@ -209,6 +232,24 @@ export function Studio() {
   const [density, setDensity] = useState<Density>("list");
   const [busy, setBusy] = useState(false);
   const [intakeOpen, setIntakeOpen] = useState(true);
+  // The projects sidebar can be hidden for more room; ⌘\ / Ctrl+\ toggles it.
+  const [sidebarOpen, setSidebarOpen] = useState(readSidebarOpen);
+  const toggleSidebar = useCallback(() => {
+    setSidebarOpen((open) => {
+      rememberSidebarOpen(!open);
+      return !open;
+    });
+  }, []);
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "\\" && (event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey) {
+        event.preventDefault();
+        toggleSidebar();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [toggleSidebar]);
   const [error, setError] = useState<string | null>(null);
   /** Create-project failures belong next to the field, not in a global banner. */
   const [sourceError, setSourceError] = useState<string | null>(null);
@@ -260,7 +301,11 @@ export function Studio() {
   useEffect(() => {
     void Promise.all([
       api.listCaptionStyles().then(setCaptionStyles),
-      api.listCaptionFonts().then(setCaptionFonts),
+      api.listCaptionFonts().then((fonts) => {
+        setCaptionFonts(fonts);
+        // The burn's own font files, so previews measure like the render.
+        void loadCaptionFontFaces(fonts);
+      }),
     ]).catch((err) => setError(messageOf(err)));
   }, []);
 
@@ -707,7 +752,10 @@ export function Studio() {
   return (
     <div className="safe-x flex h-full">
       {/* ---- sidebar ---- */}
-      <aside className="hidden w-72 shrink-0 flex-col border-r border-border bg-panel/60 lg:flex">
+      <aside
+        className={`hidden w-72 shrink-0 flex-col border-r border-border bg-panel/60 ${sidebarOpen ? "lg:flex" : ""}`}
+        aria-hidden={!sidebarOpen}
+      >
         <div className="flex items-center gap-2 border-b border-border px-4 py-3">
           <Scissors className="size-4 text-accent" aria-hidden="true" />
           <div>
@@ -736,7 +784,21 @@ export function Studio() {
               without it the title holds its full width and pushes the switcher
               past the viewport edge on a phone. */}
           <div className="flex min-w-0 flex-1 items-center gap-2">
-            <Scissors className="size-4 shrink-0 text-accent lg:hidden" aria-hidden="true" />
+            <button
+              type="button"
+              onClick={toggleSidebar}
+              aria-label={sidebarOpen ? "Hide sidebar" : "Show sidebar"}
+              aria-expanded={sidebarOpen}
+              title={`${sidebarOpen ? "Hide" : "Show"} sidebar (${isMac() ? "⌘" : "Ctrl+"}\\)`}
+              className="press -ml-1.5 hidden size-8 shrink-0 items-center justify-center rounded-md text-muted hover:bg-panel-2 hover:text-fg lg:inline-flex"
+            >
+              {sidebarOpen ? (
+                <PanelLeftClose className="size-4" aria-hidden="true" />
+              ) : (
+                <PanelLeftOpen className="size-4" aria-hidden="true" />
+              )}
+            </button>
+            <Scissors className={`size-4 shrink-0 text-accent ${sidebarOpen ? "lg:hidden" : ""}`} aria-hidden="true" />
             <h1 className="text-body truncate font-semibold" title={project?.title}>
               {project ? project.title : "clipperOS"}
             </h1>

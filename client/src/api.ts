@@ -176,8 +176,25 @@ export interface CaptionScene {
   overrides?: CaptionOverrides;
 }
 
-export type TitleAnimation = "none" | "pop" | "fade" | "rise";
+/** How a Text beat arrives. "words" reveals it word by word. */
+export type TextEnter =
+  | "none"
+  | "pop"
+  | "fade"
+  | "rise"
+  | "zoom_in"
+  | "zoom_out"
+  | "slide_left"
+  | "slide_right"
+  | "slide_up"
+  | "slide_down"
+  | "drop"
+  | "words";
+export type TextExit = "none" | "fade" | "pop" | "zoom_in" | "zoom_out" | "slide_left" | "slide_right" | "slide_up" | "slide_down" | "sink";
+export type TextMotion = "none" | "grow" | "shrink" | "pulse" | "wiggle" | "float";
+export type TitleAnimation = TextEnter;
 
+/** A Text beat: your own caption or title on screen, separate from the transcript captions. */
 export interface BehindTitle {
   id: string;
   text: string;
@@ -191,6 +208,15 @@ export interface BehindTitle {
   uppercase?: boolean;
   animation: TitleAnimation;
   depth: "behind" | "front";
+  exit?: TextExit;
+  enterSec?: number;
+  exitSec?: number;
+  motion?: TextMotion;
+  /** Degrees, clockwise. */
+  rotation?: number;
+  /** 0 none, 1 default, up to 2. */
+  outline?: number;
+  box?: { color: string; opacity: number };
 }
 
 /** One Director pass: what the creator asked, what the Director said it did. */
@@ -495,6 +521,12 @@ export interface CaptionFontInfo {
   family: string;
   stack: string;
   weight: number;
+  /** The bundled file the burn uses, when there is one. */
+  fileUrl?: string;
+  /** CSS px of em per output px of our font size, as libass draws this face. */
+  emScale?: number;
+  /** The baseline's place in a libass line box, from its top (0..1). */
+  baseline?: number;
 }
 
 /** A caption look, served by GET /api/caption-styles — never hardcoded here. */

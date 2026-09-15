@@ -490,7 +490,8 @@ client/src/
   routes.ts                        the URL map (/projects/:id, /projects/:id/clips/:id)
   components/ClipEditor.tsx        the editor page (trim, live captions, cleanup, merge parts)
   components/BeatTimeline.tsx      creator mode's lane timeline
-  components/CreatorDesk.tsx       creator mode's right rail (Director, add-at-playhead, inspector)
+  components/CreatorDesk.tsx       creator mode's right rail: Add & edit · Whole clip · AI Director tabs
+  components/lanes.ts              one name, icon and summary per beat lane (timeline, Add list, inspectors)
   components/DirectorPanel.tsx     notes, lane locks, and the conversation with the Director
   components/FramingWidget.tsx     drag the 9:16 window and zoom anchor over the source
   components/CutawayLayer.tsx      cutaways over the preview, transitions as CSS

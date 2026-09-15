@@ -4,11 +4,23 @@ import type { BehindTitle } from "@/api";
 // TITLES — the preview's port of server/src/services/title.service.ts.
 //
 // Sizes are in the 1080×1920 output space; the canvas scales them by its own
-// height. Entrance animations are evaluated per paint from the title's start,
-// matching the ASS tags the burn uses.
+// height. Motion comes from lib/text-motion.ts — the same schedule the burn
+// writes as ASS — so what plays here is what renders.
 // ============================================================
 
 export const TITLE_BASE_FONT = 118;
+/** ASS sizes are written as px × this; libass lines are exactly that tall (server ASS_FONT_SIZE_MATCH). */
+export const ASS_FONT_SIZE_MATCH = 1.4;
+/** The title style's ASS `Spacing`, output pixels between letters. */
+export const TITLE_LETTER_SPACING = 2;
+
+/** A face as the preview draws it: the stack, weight, and how libass sizes and seats it. */
+export interface TitleFont {
+  stack: string;
+  weight: number;
+  emScale?: number;
+  baseline?: number;
+}
 export const TITLE_DEFAULT_FONT = "Anton";
 const OUTPUT_WIDTH = 1080;
 const TITLE_MAX_WIDTH_FRAC = 0.86;
@@ -36,35 +48,9 @@ export function wrapTitle(text: string, fontSizePx: number): string[] {
   return lines;
 }
 
-export interface TitleEntrance {
-  /** 0-1 opacity. */
-  alpha: number;
-  /** Scale about the title's centre. */
-  scale: number;
-  /** Vertical offset in output pixels. */
-  dy: number;
-}
-
-/** The entrance/exit state at `sourceSec`, mirroring the ASS `\t`/`\fad`/`\move` tags. */
-export function titleEntranceAt(title: BehindTitle, sourceSec: number): TitleEntrance {
-  const since = sourceSec - title.startSec;
-  const until = title.endSec - sourceSec;
-  const fade = (inMs: number, outMs: number) =>
-    Math.max(0, Math.min(1, Math.min(since / (inMs / 1000), until / (outMs / 1000))));
-  switch (title.animation) {
-    case "pop": {
-      const u = Math.max(0, Math.min(1, since / 0.17));
-      return { alpha: fade(50, 110), scale: 0.78 + 0.22 * u, dy: 0 };
-    }
-    case "fade":
-      return { alpha: fade(180, 160), scale: 1, dy: 0 };
-    case "rise": {
-      const u = Math.max(0, Math.min(1, since / 0.24));
-      return { alpha: fade(110, 120), scale: 1, dy: 70 * (1 - u) };
-    }
-    default:
-      return { alpha: 1, scale: 1, dy: 0 };
-  }
+/** The box's padding around each line, output pixels — the burn's `Outline` in BorderStyle 3. */
+export function titleBoxPad(title: BehindTitle): number {
+  return Math.round(titleFontPx(title) * 0.16);
 }
 
 /** Titles on screen at `sourceSec`. */

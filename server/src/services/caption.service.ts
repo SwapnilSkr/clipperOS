@@ -12,7 +12,7 @@ import {
   type VttWordTiming,
 } from "../types/clip.types";
 import type { CaptionStyle } from "../config/caption-styles";
-import { resolveCaptionFont } from "../config/caption-fonts";
+import { captionFontBold, resolveCaptionFont } from "../config/caption-fonts";
 import { expandWordTimings } from "./transcript.service";
 
 // ============================================
@@ -473,14 +473,15 @@ function resolveLook(suffix: string, options: AssOptions): ResolvedLook {
   const outline = background === "box" ? 14 : 6;
   const shadow = background === "box" ? 0 : 3;
   const primary = assColor(textColor);
+  const bold = captionFontBold(font);
   const capStyle = `Cap${suffix}`;
   const peakStyle = `Peak${suffix}`;
   return {
     capStyle,
     peakStyle,
     styleRows:
-      `Style: ${capStyle},${font},${captionSize},${primary},${primary},&H00000000,&H9A000000,-1,0,0,0,100,100,0,0,${borderStyle},${outline},${shadow},2,80,80,${marginV},1\n` +
-      `Style: ${peakStyle},${font},${peakSize},${assColor(peakColor)},${assColor(peakColor)},&H00000000,&H9A000000,-1,0,0,0,100,100,0,0,${borderStyle},${background === "box" ? 16 : 7},${background === "box" ? 0 : 4},2,60,60,${marginV},1`,
+      `Style: ${capStyle},${font},${captionSize},${primary},${primary},&H00000000,&H9A000000,${bold},0,0,0,100,100,0,0,${borderStyle},${outline},${shadow},2,80,80,${marginV},1\n` +
+      `Style: ${peakStyle},${font},${peakSize},${assColor(peakColor)},${assColor(peakColor)},&H00000000,&H9A000000,${bold},0,0,0,100,100,0,0,${borderStyle},${background === "box" ? 16 : 7},${background === "box" ? 0 : 4},2,60,60,${marginV},1`,
     positionX: Math.round(Math.max(0.05, Math.min(0.95, horizontalFrac)) * OUTPUT_WIDTH),
     positionY: Math.round((1 - Math.max(0.05, Math.min(0.95, verticalFrac))) * OUTPUT_HEIGHT),
     motion:

@@ -21,6 +21,9 @@ import type {
   ReframeTrack,
   SoundtrackHit,
   SpeedSpan,
+  TextEnter,
+  TextExit,
+  TextMotion,
   VttWordTiming,
 } from "../types/clip.types";
 import {
@@ -46,6 +49,7 @@ import { listBuiltinAudio, listCustomAudio, MAX_SOUNDTRACK_HITS } from "./soundt
 import { updateClipEdit } from "./clip.service";
 import { listMediaAssets } from "./media-library.service";
 import { stockForQuery, stockSources } from "./stock.service";
+import { TEXT_ENTERS, TEXT_EXITS, TEXT_MOTIONS } from "./text-motion";
 
 // ============================================
 // THE DIRECTOR — one call that writes the whole beat plan.
@@ -382,6 +386,8 @@ EDITING RULES
 - Speed (lane "speed"): the voice FADES OUT during slow motion and a freeze (music and SFX carry on), so only on a beat that carries without words — a reaction, a gesture, the breath after the payoff — ≤ 1.2s, rate 0.4–0.6, never on the hook words (first 2s) and never over a word the line needs. "freeze" 0.3–0.8s on a punchline reaction. "fast" (1.5–2×, voice kept) only to rush a setup. At most 1 speed span unless the notes ask. "smooth": true only for motion (a gesture, a head turn). "captions": true keeps captions on through it.
 - Effects (lane "effects"): accents, not wallpaper — at most 3 per 30s, one look per caption scene, amount 0.4–0.8. Glitch/strobe/flicker/rgbsplit/shake/pulse are 0.2–1s hits on a cut, a punch or a hard word; colour and texture looks (bw, vhs, oldfilm…) can hold a short scene (a flashback, an "old way" line). Never cover the whole clip unless the notes ask.
 - Cutaways (lane "cutaways"): B-roll laid over the speaker while the voice runs on. At most 2 per clip, 1.2–3s each, starting on the onset of the word that names what is shown, never in the first 1.5s and never over the peak line. Media: ${cutawaySource}. Transitions ≤ 0.4s ("dissolve" or "cut" by default; a slide or zoom for energy). fit "cover" for portrait media, "blur" for a wide shot you want to see whole.
+- Caption scenes: 2–4 scenes. The hook (first 2–4s) big and bold; the peak line its own scene with highlight "word" and a warm accent; the rest calm. Scenes must not overlap.
+- Titles (lane "titles", the creator's own text on screen, separate from the transcript captions): exactly 1 (the hook, 0–2.5s) unless the notes ask for more, depth "behind", placed where it peeks out around the head: y between the face's y and 0.62, large (sizeScale 1.6–2.4), uppercase. A second title only for a payoff punchline. "animation" is how it arrives: pop, fade, rise, zoom_in (grows from small), zoom_out (shrinks from big), slide_left / slide_right / slide_up / slide_down, drop, words (word by word); "exit" how it leaves: none, fade, pop, zoom_in, zoom_out, slide_left / slide_right / slide_up / slide_down, sink; "motion" while on screen: none, grow, shrink, pulse, wiggle, float. Default "pop" in, "fade" out, no motion; a punchline can "zoom_out" in and "pulse".
 - SFX: a "swoosh" or "whoosh" on each camera move start (gain 0.6–0.9), a "riser" 0.6s before the peak punch, a "boom" or "thud" on the peak, a "pop" on the hook title's start, a "tick" on each applied cut (optional), a "whoosh" on a cutaway's arrival. At most ${MAX_SOUNDTRACK_HITS} hits.
 - Times must land on word onsets from the WORDS list where possible.
 - A key you leave out of your answer leaves that lane exactly as it is in the current plan; an empty list clears the lane. Respect every KEEP instruction exactly.
@@ -401,7 +407,7 @@ Return ONLY JSON, no prose, with this shape (all times clip-relative source seco
   "effects": [{ "effect": "vhs", "start": 0, "end": 1.8, "amount": 0.6 }],
   "cutaways": [{ "query": "server room racks", "kind": "video", "start": 12.4, "end": 14.6, "fit": "cover", "motion": "in", "in": { "transition": "dissolve", "sec": 0.3 }, "out": { "transition": "dissolve", "sec": 0.3 } }],
   "captionScenes": [{ "label": "hook", "start": 0, "end": 2.8, "styleId": "creator_hook", "overrides": { "highlight": "word", "uppercase": true, "peakColor": "#fde047", "fontFamily": "Anton", "sizeScale": 1.3 } }],
-  "titles": [{ "text": "THE ONE RULE", "start": 0.1, "end": 2.4, "x": 0.5, "y": 0.5, "sizeScale": 1.9, "depth": "behind", "animation": "pop", "color": "#ffffff", "fontFamily": "Anton" }],
+  "titles": [{ "text": "THE ONE RULE", "start": 0.1, "end": 2.4, "x": 0.5, "y": 0.5, "sizeScale": 1.9, "depth": "behind", "animation": "pop", "exit": "fade", "motion": "none", "color": "#ffffff", "fontFamily": "Anton" }],
   "sfx": [{ "asset": "swoosh", "at": 0.0, "gain": 0.8 }]
 }
 (A cutaway from the library carries "asset": "<library id>" in place of "query" and "kind".)`;
@@ -663,8 +669,10 @@ export function applyDirectorAnswer(input: {
         fontFamily: typeof title.fontFamily === "string" ? title.fontFamily : undefined,
         color: typeof title.color === "string" && /^#[0-9a-f]{6}$/i.test(title.color) ? title.color : "#ffffff",
         uppercase: title.uppercase === undefined ? true : Boolean(title.uppercase),
-        animation: title.animation === "fade" || title.animation === "rise" || title.animation === "none" ? title.animation : "pop",
+        animation: (TEXT_ENTERS as unknown[]).includes(title.animation) ? (title.animation as TextEnter) : "pop",
         depth: title.depth === "front" ? "front" : "behind",
+        ...((TEXT_EXITS as unknown[]).includes(title.exit) ? { exit: title.exit as TextExit } : {}),
+        ...((TEXT_MOTIONS as unknown[]).includes(title.motion) && title.motion !== "none" ? { motion: title.motion as TextMotion } : {}),
       }));
   }
 

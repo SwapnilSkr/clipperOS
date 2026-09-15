@@ -1,6 +1,16 @@
 import type { BehindTitle, CropKeyframe, ReframeTrack } from "@/api";
 import { followCx, type CameraState, type PanPx } from "@/lib/creator-timeline";
-import { activeTitles, titleEntranceAt, titleFontPx, wrapTitle, TITLE_DEFAULT_FONT } from "@/lib/titles";
+import {
+  activeTitles,
+  ASS_FONT_SIZE_MATCH,
+  titleBoxPad,
+  titleFontPx,
+  wrapTitle,
+  TITLE_DEFAULT_FONT,
+  TITLE_LETTER_SPACING,
+  type TitleFont,
+} from "@/lib/titles";
+import { textPoseAt, textSchedule, wordAlphaAt } from "@/lib/text-motion";
 
 // ============================================================
 // CROP PREVIEW
@@ -230,7 +240,7 @@ export interface PaintExtras {
   /** The person matte video (source space, small), kept in step with the source. */
   matte?: { video: HTMLVideoElement; width: number; height: number } | null;
   /** CSS font stack + weight for a title's family. */
-  fontFor?: (family: string) => { stack: string; weight: number };
+  fontFor?: (family: string) => TitleFont;
   /** Lead room and pan on the crop, as the burn applies them. */
   framing?: Framing;
 }
@@ -286,40 +296,95 @@ function lumaToAlphaMask(
   return maskCanvas;
 }
 
-function drawTitle(
+function hexToRgba(hex: string, alpha: number): string {
+  const clean = hex.replace("#", "");
+  const r = parseInt(clean.slice(0, 2), 16) || 0;
+  const g = parseInt(clean.slice(2, 4), 16) || 0;
+  const b = parseInt(clean.slice(4, 6), 16) || 0;
+  return `rgba(${r},${g},${b},${Math.max(0, Math.min(1, alpha))})`;
+}
+
+/**
+ * One Text beat at `sourceSec`, posed by the motion schedule the burn uses:
+ * position, scale and rotation about its centre, the line's opacity, and for
+ * a word-by-word reveal each word's own. Outline and box follow the title's
+ * settings the way the ASS style draws them.
+ */
+export function drawTitle(
   ctx: CanvasRenderingContext2D,
   canvas: HTMLCanvasElement,
   title: BehindTitle,
   sourceSec: number,
   fontFor?: PaintExtras["fontFor"]
 ): void {
-  const entrance = titleEntranceAt(title, sourceSec);
-  if (entrance.alpha <= 0) return;
+  const schedule = textSchedule(title);
+  const local = sourceSec - title.startSec;
+  const pose = textPoseAt(schedule, local);
+  if (pose.alpha <= 0.002) return;
   const scale = canvas.height / 1920;
   const px = titleFontPx(title);
   const font = fontFor?.(title.fontFamily ?? TITLE_DEFAULT_FONT);
   const lines = wrapTitle(title.uppercase ? title.text.toUpperCase() : title.text, px);
-  const lineHeight = px * 1.12 * scale;
-  const cx = title.x * canvas.width;
-  const cy = title.y * canvas.height + entrance.dy * scale;
+  // libass's geometry: a line box exactly the ASS size tall, the em inside it
+  // scaled by the face's own metrics, the baseline where the face seats it.
+  const lineHeight = px * ASS_FONT_SIZE_MATCH * scale;
+  const em = px * scale * (font?.emScale ?? 1);
+  const baseline = font?.baseline ?? 0.8;
+  // The burn clamps the anchor into the frame; so does the preview.
+  const cx = (Math.max(0.05, Math.min(0.95, title.x)) * 1080 + pose.dx) * scale;
+  const cy = (Math.max(0.05, Math.min(0.95, title.y)) * 1920 + pose.dy) * scale;
+  const outline = title.outline ?? 1;
   ctx.save();
-  ctx.globalAlpha = entrance.alpha;
   ctx.translate(cx, cy);
-  ctx.scale(entrance.scale, entrance.scale);
-  ctx.font = `${font?.weight ?? 400} ${px * scale}px ${font?.stack ?? `${TITLE_DEFAULT_FONT}, Impact, sans-serif`}`;
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
+  ctx.rotate((((title.rotation ?? 0) + pose.rotation) * Math.PI) / 180);
+  ctx.scale(pose.scale, pose.scale);
+  ctx.font = `${font?.weight ?? 400} ${em}px ${font?.stack ?? `${TITLE_DEFAULT_FONT}, Impact, sans-serif`}`;
+  // The burn's ASS sets no Kerning, so libass shapes without kern pairs.
+  ctx.fontKerning = "none";
+  (ctx as CanvasRenderingContext2D & { letterSpacing?: string }).letterSpacing = `${TITLE_LETTER_SPACING * scale}px`;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
   ctx.lineJoin = "round";
-  ctx.lineWidth = Math.max(2, px * scale * 0.09);
-  ctx.strokeStyle = "rgba(0,0,0,0.9)";
-  ctx.fillStyle = title.color;
-  ctx.shadowColor = "rgba(0,0,0,0.6)";
-  ctx.shadowBlur = 6 * scale;
-  ctx.shadowOffsetY = 4 * scale;
+  const words = schedule.enter === "words";
+  let wordIndex = 0;
   lines.forEach((line, index) => {
-    const y = (index - (lines.length - 1) / 2) * lineHeight;
-    ctx.strokeText(line, 0, y);
-    ctx.fillText(line, 0, y);
+    const top = (index - lines.length / 2) * lineHeight;
+    const y = top + lineHeight * baseline;
+    const width = ctx.measureText(line).width;
+    const left = -width / 2;
+    const lineWords = line.split(" ");
+    if (title.box) {
+      // BorderStyle 3: the line's whole box (advance × line height), padded.
+      const pad = titleBoxPad(title) * scale;
+      // Word by word, the box shows once any word of its line has.
+      const shown = words ? Math.max(...lineWords.map((_, k) => wordAlphaAt(schedule, wordIndex + k, local))) : 1;
+      ctx.globalAlpha = 1;
+      ctx.shadowColor = "transparent";
+      ctx.fillStyle = hexToRgba(title.box.color, title.box.opacity * pose.alpha * shown);
+      ctx.fillRect(left - pad, top - pad, width + pad * 2, lineHeight + pad * 2);
+    }
+    ctx.shadowColor = outline > 0 && !title.box ? "rgba(0,0,0,0.6)" : "transparent";
+    ctx.shadowBlur = 6 * scale;
+    ctx.shadowOffsetY = 4 * scale;
+    ctx.lineWidth = Math.max(0, px * scale * 0.09 * outline);
+    ctx.strokeStyle = "rgba(0,0,0,0.9)";
+    ctx.fillStyle = title.color;
+    const paint = (text: string, x: number, alpha: number) => {
+      if (alpha <= 0.002) return;
+      ctx.globalAlpha = alpha;
+      if (outline > 0 && !title.box) ctx.strokeText(text, x, y);
+      ctx.fillText(text, x, y);
+    };
+    if (!words) {
+      paint(line, left, pose.alpha);
+    } else {
+      let x = left;
+      for (const word of lineWords) {
+        paint(word, x, pose.alpha * wordAlphaAt(schedule, wordIndex, local));
+        x += ctx.measureText(`${word} `).width;
+        wordIndex++;
+      }
+    }
   });
   ctx.restore();
 }

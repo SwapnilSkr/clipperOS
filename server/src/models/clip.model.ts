@@ -212,8 +212,17 @@ const behindTitleSchema = new Schema(
     fontFamily: { type: String, trim: true },
     color: { type: String, required: true, trim: true },
     uppercase: { type: Boolean },
-    animation: { type: String, enum: ["none", "pop", "fade", "rise"], required: true },
+    animation: { type: String, enum: ["none", "pop", "fade", "rise", "zoom_in", "zoom_out", "slide_left", "slide_right", "slide_up", "slide_down", "drop", "words"], required: true },
     depth: { type: String, enum: ["behind", "front"], required: true },
+    exit: { type: String, enum: ["none", "fade", "pop", "zoom_in", "zoom_out", "slide_left", "slide_right", "slide_up", "slide_down", "sink"] },
+    enterSec: { type: Number, min: 0.05, max: 3 },
+    exitSec: { type: Number, min: 0.05, max: 3 },
+    motion: { type: String, enum: ["none", "grow", "shrink", "pulse", "wiggle", "float"] },
+    rotation: { type: Number, min: -45, max: 45 },
+    outline: { type: Number, min: 0, max: 2 },
+    box: {
+      type: new Schema({ color: { type: String, trim: true }, opacity: { type: Number, min: 0, max: 1 } }, { _id: false }),
+    },
   },
   { _id: false }
 );

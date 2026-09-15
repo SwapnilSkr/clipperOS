@@ -820,6 +820,9 @@ check(
   prompt.includes("vhs (texture) — Tape. [variants: worn]") &&
     prompt.includes("dissolve — Cross-fades.") &&
     prompt.includes("\n7.33 California and he was like") &&
+    prompt.includes("\n- Caption scenes: 2–4 scenes.") &&
+    prompt.includes("\n- Titles (lane \"titles\"") &&
+    prompt.includes("zoom_out (shrinks from big)") &&
     prompt.includes('lib1 — video "Server room racks" 1080x1920 12s') &&
     prompt.includes("speed slow 0.5× 20.00–21.00") &&
     prompt.includes('cutaway asset lib1 "Server room racks" 25.00–27.00') &&
