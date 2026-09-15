@@ -30,6 +30,7 @@ import {
   projectOutroPreviewUrl,
   type CaptionFontInfo,
   type CaptionOverrides,
+  type CaptionScene,
   type CaptionStyleInfo,
   type CaptionTextOverride,
   type CaptionWordOverride,
@@ -2291,6 +2292,7 @@ export function ClipEditor({
               peakSec={clip.peakSec}
               sourceReady={sourceReady}
               styles={styles}
+              clipStyle={style}
               fonts={fontChoices}
               videoEffects={resolvedEffects}
               selected={beatSelection}
@@ -2315,6 +2317,7 @@ export function ClipEditor({
                 void videoRef.current?.play().catch(() => undefined);
               }}
               audioLibrary={audioLibrary}
+              outroSec={outroPlaythrough ? outroDur : 0}
               onUploadAudio={uploadAudio}
               onDirect={directClip}
             />
@@ -2552,6 +2555,17 @@ export function ClipEditor({
                     label="Match others"
                   />
                 </div>
+
+                {sceneLooks.length > 0 ? (
+                  <SceneNote
+                    sceneLooks={sceneLooks}
+                    time={time}
+                    onOpen={(id) => {
+                      setBeatSelection({ lane: "captions", id });
+                      setDesk("create");
+                    }}
+                  />
+                ) : null}
 
                 <label className="mt-3 block">
                   <span className="eyebrow text-muted">Caption style</span>
@@ -3396,5 +3410,44 @@ function SegmentList({
         </li>
       ))}
     </ol>
+  );
+}
+
+/**
+ * Create's caption scenes carry their own look, so the Subtitles panel's
+ * controls hold only outside them (and inside scenes set to "Clip's own").
+ * Says so, and names the scene under the playhead — the usual reason a
+ * setting here seems not to take.
+ */
+function SceneNote({
+  sceneLooks,
+  time,
+  onOpen,
+}: {
+  sceneLooks: { scene: CaptionScene; style: CaptionStyleInfo }[];
+  time: number;
+  onOpen: (sceneId: string) => void;
+}) {
+  const here = sceneLooks.find(({ scene }) => time >= scene.startSec && time < scene.endSec);
+  const styled = sceneLooks.filter(({ scene }) => scene.styleId).length;
+  if (here?.scene.styleId) {
+    const words = here.style.chunkWords;
+    return (
+      <p className="text-meta mt-3 rounded-md bg-warn/10 px-2 py-1.5 text-warn">
+        At the playhead, the <span className="font-semibold">{here.scene.label || "caption"}</span> scene from Create uses the{" "}
+        {here.style.label} look — {words} word{words === 1 ? "" : "s"} at a time, {here.style.fontFamily}. The controls below
+        do not reach it.{" "}
+        <button type="button" onClick={() => onOpen(here.scene.id)} className="font-semibold underline">
+          Edit that scene
+        </button>
+      </p>
+    );
+  }
+  if (styled === 0) return null;
+  return (
+    <p className="text-meta mt-3 text-muted">
+      {styled} Create scene{styled === 1 ? " sets its" : "s set their"} own look; these controls hold outside{" "}
+      {styled === 1 ? "it" : "them"}.
+    </p>
   );
 }

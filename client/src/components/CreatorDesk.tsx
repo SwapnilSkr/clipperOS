@@ -55,6 +55,7 @@ import {
   type VideoEffects,
 } from "@/api";
 import { exitOf, textSchedule } from "@/lib/text-motion";
+import { sceneStyleFor } from "@/lib/captions";
 import { enablePlan, laneFull, removeBeat, type BeatLane } from "@/lib/beat-plan";
 import {
   FOLLOW_MIN_ZOOM,
@@ -98,6 +99,8 @@ export interface CreatorDeskProps {
   peakSec: number;
   sourceReady: boolean;
   styles: CaptionStyleInfo[];
+  /** The Edit desk's look, which a scene without a preset starts from. */
+  clipStyle: CaptionStyleInfo;
   fonts: CaptionFontInfo[];
   /** The clip-wide motion, migrated into a move when creator mode turns on. */
   videoEffects: VideoEffects;
@@ -134,6 +137,8 @@ export interface CreatorDeskProps {
   cropOrigin: number;
   /** Built-in and uploaded audio: beds for the Sound panel, one-shots for the SFX lane. */
   audioLibrary: AudioAsset[];
+  /** Sting length after the clip, so a bed's out point means the same here as on the Sound desk. */
+  outroSec?: number;
   /** Upload a file into the shared library; the editor refreshes `audioLibrary`. */
   onUploadAudio: (file: File, kind: "music" | "sfx") => Promise<void>;
   /** Flush the draft, run the Director, adopt its plan. Rejects with a message. */
@@ -159,6 +164,7 @@ export function CreatorDesk({
   peakSec,
   sourceReady,
   styles,
+  clipStyle,
   fonts,
   videoEffects,
   selected,
@@ -180,6 +186,7 @@ export function CreatorDesk({
   track,
   cropOrigin,
   audioLibrary: library,
+  outroSec = 0,
   onUploadAudio,
   onDirect,
 }: CreatorDeskProps) {
@@ -333,6 +340,9 @@ export function CreatorDesk({
   const selectedEffect = selected?.lane === "fx" ? effects.find((span) => span.id === selected.id) : undefined;
   const selectedCutaway = selected?.lane === "cutaways" ? cutaways.find((item) => item.id === selected.id) : undefined;
   const selectedScene = selected?.lane === "captions" ? scenes.find((scene) => scene.id === selected.id) : undefined;
+  // What the scene actually renders with — its preset (or the Edit desk's
+  // look) under its fine-tuning — so every control shows the value in force.
+  const sceneLook = selectedScene ? sceneStyleFor(styles, clipStyle, selectedScene) : clipStyle;
   const selectedTitle = selected?.lane === "titles" ? titles.find((title) => title.id === selected.id) : undefined;
   const selectedHit = selected?.lane === "sfx" ? sfx.find((hit) => hit.id === selected.id) : undefined;
   const fontChoices =
@@ -891,12 +901,29 @@ export function CreatorDesk({
                   ))}
                 </select>
               </Field>
+              <p className="text-micro mt-2 text-muted">
+                {selectedScene.styleId
+                  ? `The ${sceneLook.label} look: ${sceneLook.chunkWords} word${sceneLook.chunkWords === 1 ? "" : "s"} at a time, ${sceneLook.fontFamily}.`
+                  : `The Edit desk's look: ${sceneLook.chunkWords} word${sceneLook.chunkWords === 1 ? "" : "s"} at a time, ${sceneLook.fontFamily}.`}{" "}
+                Fine-tune changes only this scene.
+              </p>
               <details
                 className="mt-3 rounded-lg border border-border bg-panel-2/40"
                 open={Boolean(selectedScene.overrides)}
               >
-                <summary className="text-ui cursor-pointer px-3 py-2 font-semibold text-muted">Fine-tune</summary>
+                <summary className="text-ui cursor-pointer px-3 py-2 font-semibold text-muted">
+                  Fine-tune{selectedScene.overrides && Object.keys(selectedScene.overrides).length > 0 ? " · changed" : ""}
+                </summary>
                 <div className="border-t border-border px-3 pb-3">
+                  {selectedScene.overrides && Object.keys(selectedScene.overrides).length > 0 ? (
+                    <button
+                      type="button"
+                      onClick={() => updateScene(selectedScene.id, { overrides: undefined })}
+                      className="press text-micro mt-2 rounded border border-border px-2 py-1 font-semibold text-muted hover:border-control hover:text-fg"
+                    >
+                      Back to the look
+                    </button>
+                  ) : null}
                   <Field label="Font">
                     <select
                       value={selectedScene.overrides?.fontFamily ?? ""}
@@ -907,7 +934,7 @@ export function CreatorDesk({
                       }
                       className={FIELD}
                     >
-                      <option value="">Look's font</option>
+                      <option value="">Look's font ({sceneLook.fontFamily})</option>
                       {fontChoices.map((font) => (
                         <option key={font.id} value={font.family} style={{ fontFamily: font.stack }}>
                           {font.label}
@@ -917,7 +944,7 @@ export function CreatorDesk({
                   </Field>
                   <Slider
                     label="Size"
-                    value={selectedScene.overrides?.sizeScale ?? 1}
+                    value={sceneLook.sizeScale}
                     min={0.6}
                     max={2.2}
                     step={0.05}
@@ -930,7 +957,7 @@ export function CreatorDesk({
                   />
                   <Slider
                     label="Across"
-                    value={selectedScene.overrides?.horizontalFrac ?? 0.5}
+                    value={sceneLook.horizontalFrac}
                     min={0.05}
                     max={0.95}
                     step={0.005}
@@ -943,7 +970,7 @@ export function CreatorDesk({
                   />
                   <Slider
                     label="Height"
-                    value={selectedScene.overrides?.verticalFrac ?? 0.25}
+                    value={sceneLook.verticalFrac}
                     min={0.05}
                     max={0.8}
                     step={0.005}
@@ -956,7 +983,7 @@ export function CreatorDesk({
                   />
                   <Slider
                     label="Words at a time"
-                    value={selectedScene.overrides?.chunkWords ?? 3}
+                    value={sceneLook.chunkWords}
                     min={1}
                     max={8}
                     step={1}
@@ -966,19 +993,19 @@ export function CreatorDesk({
                   <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2">
                     <ColorControl
                       label="Text"
-                      value={selectedScene.overrides?.textColor ?? "#ffffff"}
+                      value={sceneLook.textColor}
                       onChange={(textColor) => updateSceneOverrides(selectedScene.id, { textColor })}
                     />
                     <ColorControl
                       label="Accent"
-                      value={selectedScene.overrides?.peakColor ?? "#fde047"}
+                      value={sceneLook.peakColor}
                       onChange={(peakColor) => updateSceneOverrides(selectedScene.id, { peakColor })}
                     />
                   </div>
                   <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2">
                     <Check
                       label="Box"
-                      checked={selectedScene.overrides?.background === "box"}
+                      checked={sceneLook.background === "box"}
                       onChange={(on) =>
                         updateSceneOverrides(selectedScene.id, {
                           background: on ? "box" : "none",
@@ -987,12 +1014,12 @@ export function CreatorDesk({
                     />
                     <Check
                       label="Uppercase"
-                      checked={selectedScene.overrides?.uppercase === true}
+                      checked={sceneLook.uppercase}
                       onChange={(on) => updateSceneOverrides(selectedScene.id, { uppercase: on })}
                     />
                     <Check
                       label="Karaoke"
-                      checked={selectedScene.overrides?.highlight === "word"}
+                      checked={sceneLook.highlight === "word"}
                       onChange={(on) =>
                         updateSceneOverrides(selectedScene.id, {
                           highlight: on ? "word" : "none",
@@ -1561,6 +1588,7 @@ export function CreatorDesk({
                   assets={musicAssets}
                   localTime={sourceToOutput(windows, playhead)}
                   clipEndSec={Math.max(0.1, outputDuration(windows))}
+                  outroSec={outroSec}
                 />
                 {uploadError ? <p className="text-meta mt-2 text-bad">{uploadError}</p> : null}
               </Panel>
