@@ -575,23 +575,6 @@ export interface EpidemicResult {
 }
 export type LibrarySoundResult = SoundResult | EpidemicResult;
 
-export interface PackInstall {
-  slug: string;
-  status: "running" | "done" | "failed";
-  done: number;
-  total: number;
-  error?: string;
-  startedAt: string;
-}
-/** A free CC0 sound pack on offer (server SOUND_PACKS), with what is installed. */
-export interface SoundPackInfo {
-  slug: string;
-  label: string;
-  covers: string;
-  count: number;
-  installed: number;
-  install?: PackInstall;
-}
 
 /**
  * A crop keyframe on the clip's timeline. Each holds until the next, so a shot
@@ -1004,8 +987,6 @@ export const api = {
   listGenerationJobs: () => request<GenerationJob[]>("/studio/jobs"),
   senseLibrary: () => request<{ described: number; failed: number; audio: number; media: number }>("/studio/sense-library", { method: "POST" }),
   studioSources: () => request<{ freesound: boolean; epidemic: boolean; fal: boolean }>("/studio/sources"),
-  listSoundPacks: () => request<SoundPackInfo[]>("/studio/packs"),
-  installSoundPack: (slug: string) => request<PackInstall>(`/studio/packs/${slug}/install`, { method: "POST" }),
   searchLocalSounds: (q: string, kind?: "sfx" | "music") => request<AudioAsset[]>(`/studio/sounds/local?q=${encodeURIComponent(q)}${kind ? `&kind=${kind}` : ""}`),
   searchSounds: (q: string, options: { source?: "freesound" | "epidemic"; kind?: "sfx" | "music"; maxSec?: number } = {}) => {
     const params = new URLSearchParams({ q, maxSec: String(options.maxSec ?? 8) });

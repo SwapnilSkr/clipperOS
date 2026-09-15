@@ -11,7 +11,7 @@
 import { parseAssetSense, parseClipSense, parseRenderReview } from "../src/services/sense.service";
 import { describeLessons } from "../src/services/taste.service";
 import { framePrompt } from "../src/services/ai-assets.service";
-import { searchLocalSounds } from "../src/services/sound-packs.service";
+import { searchLocalSounds } from "../src/services/sound-search.service";
 import { directorModel, imageModel, musicModel, senseModel, videoModel } from "../src/config/models";
 
 let failures = 0;

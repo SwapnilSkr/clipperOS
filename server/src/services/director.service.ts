@@ -55,8 +55,6 @@ import { describeLessons, lessonsFor } from "./taste.service";
 import { ensureProjectMedia } from "./ingest.service";
 import { freesoundConfigured, sfxForQuery } from "./freesound.service";
 import { epidemicConfigured, epidemicSfxForQuery, epidemicTrackForQuery } from "./epidemic.service";
-import { packCounts, searchLocalSounds, SOUND_PACKS } from "./sound-packs.service";
-import { USABLE_RECORDING } from "../types/clip.types";
 import { updateClipEdit } from "./clip.service";
 import { listMediaAssets } from "./media-library.service";
 import { stockForQuery, stockSources } from "./stock.service";
@@ -324,8 +322,6 @@ export interface DirectorBrief {
   freesound?: boolean;
   /** Epidemic Sound is configured, so a bed may be found by a query too. */
   epidemic?: boolean;
-  /** Installed CC0 packs, summarised: hundreds of sounds reachable by query rather than listed. */
-  packs?: { label: string; covers: string; count: number }[];
   /** Where B-roll may come from this pass. */
   assets: DirectorAssetMode;
   /** Whether this pass may lay music. */
@@ -493,7 +489,7 @@ EDITING RULES
 - Cutaways (lane "cutaways"): B-roll laid over the speaker while the voice runs on. At most 2 per clip, 1.2–3s each, starting on the onset of the word that names what is shown, never in the first 1.5s and never over the peak line. Media: ${cutawaySource}. Transitions ≤ 0.4s ("dissolve" or "cut" by default; a slide or zoom for energy). fit "cover" for portrait media, "blur" for a wide shot you want to see whole.
 - Caption scenes: 2–4 scenes. The hook (first 2–4s) big and bold; the peak line its own scene with highlight "word" and a warm accent; the rest calm. Scenes must not overlap.
 - Titles (lane "titles", the creator's own text on screen, separate from the transcript captions): exactly 1 (the hook, 0–2.5s) unless the notes ask for more, depth "behind", placed where it peeks out around the head: y between the face's y and 0.62, large (sizeScale 1.6–2.4), uppercase. A second title only for a payoff punchline. "animation" is how it arrives: pop, fade, rise, zoom_in (grows from small), zoom_out (shrinks from big), slide_left / slide_right / slide_up / slide_down, drop, words (word by word); "exit" how it leaves: none, fade, pop, zoom_in, zoom_out, slide_left / slide_right / slide_up / slide_down, sink; "motion" while on screen: none, grow, shrink, pulse, wiggle, float. Default "pop" in, "fade" out, no motion; a punchline can "zoom_out" in and "pulse".
-- SFX: a whoosh-type sound on each camera move start (gain 0.6–0.9), a riser 0.6s before the peak punch, a low impact on the peak, a pop on the hook title's start, a tick on each applied cut (optional), a whoosh on a cutaway's arrival — choose by what each sound IS in the catalogue, including the creator's own uploads. At most ${MAX_SOUNDTRACK_HITS} hits.${brief.freesound || brief.packs?.length ? ` A sound the catalogue lacks that the picture calls for (glass shattering, a door slam, a coin drop, a crowd gasp) may be a { "query": "2–4 concrete words", "at": …, "gain": … } instead of an "asset": it is searched${brief.packs?.length ? ` in the installed packs (${brief.packs.map((pack) => `${pack.label}: ${pack.covers}`).join("; ")})` : ""}${brief.freesound ? `${brief.packs?.length ? ", then" : ""} in ${brief.epidemic ? "Epidemic Sound" : "Freesound"}` : ""}, listened to, and only placed if the recording is clean — at most 3 per pass, and never for a plain whoosh, hit or tick the catalogue already has.` : ""}
+- SFX: a whoosh-type sound on each camera move start (gain 0.6–0.9), a riser 0.6s before the peak punch, a low impact on the peak, a pop on the hook title's start, a tick on each applied cut (optional), a whoosh on a cutaway's arrival — choose by what each sound IS in the catalogue, including the creator's own uploads. At most ${MAX_SOUNDTRACK_HITS} hits.${brief.freesound ? ` A sound the catalogue lacks that the picture calls for (glass shattering, a door slam, a coin drop, a crowd gasp) may be a { "query": "2–4 concrete words", "at": …, "gain": … } instead of an "asset": it is searched in ${brief.epidemic ? "Epidemic Sound" : "Freesound"}, listened to, and only placed if the recording is clean — at most 3 per pass, and never for a plain whoosh, hit or tick the catalogue already has.` : ""}
 ${musicRules}
 - Times must land on word onsets from the WORDS list where possible.
 - A key you leave out of your answer leaves that lane exactly as it is in the current plan; an empty list clears the lane. Respect every KEEP instruction exactly.
@@ -1143,12 +1139,8 @@ export async function directClip(clipId: string, input: DirectInput = {}): Promi
     }),
     lessonsFor(String(project._id)).catch(() => [] as DirectorLesson[]),
   ]);
-  const allSounds = catalogue.audio.filter((asset) => asset.kind === "sfx");
-  // Packs are hundreds of sounds: reachable by query, not listed one by one.
-  const sounds = allSounds.filter((asset) => asset.source !== "pack");
-  const beds = catalogue.audio.filter((asset) => asset.kind === "music" && asset.source !== "pack");
-  const installed = await packCounts().catch(() => ({}) as Record<string, number>);
-  const packs = SOUND_PACKS.filter((pack) => (installed[pack.slug] ?? 0) > 0).map((pack) => ({ label: pack.label, covers: pack.covers, count: installed[pack.slug]! }));
+  const sounds = catalogue.audio.filter((asset) => asset.kind === "sfx");
+  const beds = catalogue.audio.filter((asset) => asset.kind === "music");
   const library = catalogue.media;
   const current = clip.edit?.creator;
   const currentBeds = musicBeds(clip.edit?.soundtrack);
@@ -1204,7 +1196,6 @@ export async function directClip(clipId: string, input: DirectInput = {}): Promi
     stock,
     freesound: freesoundConfigured() || epidemicConfigured(),
     epidemic: epidemicConfigured(),
-    packs,
     assets,
     wantsMusic,
     sense,
@@ -1293,19 +1284,10 @@ export async function directClip(clipId: string, input: DirectInput = {}): Promi
     warnings.push(...resolved.warnings);
     pendingVideos.push(...resolved.pending);
   }
-  const sfxIds = new Set(allSounds.map((sound) => sound.id));
+  const sfxIds = new Set(sounds.map((sound) => sound.id));
   if (answer.sfx !== undefined && !keep.includes("sfx")) {
-    // Installed packs first (free, instant), then a library online when one is configured.
-    const online = epidemicConfigured() ? (query: string) => epidemicSfxForQuery(query) : freesoundConfigured() ? (query: string) => sfxForQuery(query) : undefined;
-    const findSound =
-      packs.length > 0 || online
-        ? async (query: string) => {
-            const local = searchLocalSounds(query, allSounds, { kind: "sfx", limit: 3 }).find((asset) => asset.sense?.quality === undefined || asset.sense.quality >= USABLE_RECORDING);
-            if (local) return local;
-            if (online) return online(query);
-            throw new Error("nothing in the installed packs");
-          }
-        : undefined;
+    // A sound the catalogue lacks comes from the library online: Freesound, or Epidemic Sound when configured.
+    const findSound = epidemicConfigured() ? (query: string) => epidemicSfxForQuery(query) : freesoundConfigured() ? (query: string) => sfxForQuery(query) : undefined;
     const resolved = await resolveDirectorSfx({ sfx: answer.sfx, sfxIds, findSound });
     answer.sfx = resolved.sfx;
     for (const asset of resolved.assets) sfxIds.add(asset.id);

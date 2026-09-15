@@ -4,9 +4,7 @@ import {
   deleteLessonRoute,
   generateAssetRoute,
   getGenerationJobRoute,
-  installSoundPackRoute,
   listGenerationJobsRoute,
-  listSoundPacksRoute,
   searchLocalSoundsRoute,
   listLessonsRoute,
   pickEpidemicRoute,
@@ -24,7 +22,6 @@ import {
   LessonBody,
   LessonParams,
   LocalSoundSearchQuery,
-  SoundPackParams,
   SoundPickBody,
   SoundSearchQuery,
 } from "../types/guards";
@@ -37,8 +34,6 @@ export const studioRoutes = new Elysia({ prefix: "/api/studio" })
   .post("/sense-library", senseLibraryRoute)
   .get("/sources", studioSourcesRoute)
   .get("/sounds/local", searchLocalSoundsRoute, { query: LocalSoundSearchQuery })
-  .get("/packs", listSoundPacksRoute)
-  .post("/packs/:slug/install", installSoundPackRoute, { params: SoundPackParams })
   .get("/sounds/search", searchSoundsRoute, { query: SoundSearchQuery })
   .post("/sounds/pick", pickSoundRoute, { body: SoundPickBody })
   .get("/sounds/preview", previewSoundRoute, { query: EpidemicPreviewQuery })
