@@ -238,13 +238,26 @@ export interface BehindTitle {
 }
 
 /** One Director pass: what the creator asked, what the Director said it did. */
+/** A question the Director asks before it cuts: 2–4 options (none for an open question), one recommended. */
+export interface DirectorAsk {
+  question: string;
+  header?: string;
+  options?: { label: string; detail?: string }[];
+  recommended?: number;
+}
+
 export interface DirectorTurn {
   notes?: string;
   summary: string;
   at: string;
-  /** A "plan" turn proposed and asked; nothing was applied. */
-  kind?: "pass" | "plan";
+  /** A "plan" turn proposed and asked; a "reply" answered a question; an "undo" took a pass back. */
+  kind?: "pass" | "plan" | "reply" | "undo";
+  /** Pass turns: the lanes it changed — present when the pass can be taken back. */
+  changed?: DirectorLane[];
+  /** Pass turns: taken back since. */
+  undone?: boolean;
   questions?: string[];
+  asks?: DirectorAsk[];
 }
 
 export interface DirectorNotes {
@@ -295,8 +308,40 @@ export interface DirectInput {
   music?: boolean;
   /** Attach the clip so the model watches it (default true). */
   see?: boolean;
-  /** Plan first: propose and ask, apply nothing; the next pass carries the answers. */
+  /** Plan first: propose and ask, apply nothing; the next pass carries the answers. A note can switch it. */
   plan?: boolean;
+  /** Options picked for the waiting proposal's questions. */
+  answers?: { question: string; choice: string }[];
+}
+
+/** A stage of a Director pass, streamed while it works (server DirectorEvent). */
+export type DirectorStepId = "read" | "undo" | "look" | "think" | "broll" | "sound" | "music" | "save";
+
+export interface DirectorStep {
+  id: DirectorStepId;
+  state: "run" | "done" | "fail";
+  label: string;
+  detail?: string;
+}
+
+export type DirectorEvent =
+  | ({ type: "step" } & DirectorStep)
+  /** A piece of the model's thinking. */
+  | { type: "thinking"; text: string }
+  /** Characters of the answer written so far. */
+  | { type: "writing"; chars: number };
+
+export interface DirectClipResult {
+  clip: ClipPayload;
+  summary: string;
+  model: string;
+  warnings?: string[];
+  pending?: string[];
+  sense?: ClipSense;
+  questions?: string[];
+  asks?: DirectorAsk[];
+  planned?: boolean;
+  followed?: string[];
 }
 
 /** What the harness saw and heard in the clip window (server ClipSense). */
@@ -947,12 +992,64 @@ export const api = {
     return request<PauseDetectResult>(`/clips/${id}/pauses${query ? `?${query}` : ""}`);
   },
 
-  /** One Director pass: writes a beat plan (SFX hits and music beds too) for the clip. */
-  directClip: (id: string, input: DirectInput = {}) =>
-    request<{ clip: ClipPayload; summary: string; model: string; warnings?: string[]; pending?: string[]; sense?: ClipSense; questions?: string[]; planned?: boolean }>(`/clips/${id}/direct`, {
-      method: "POST",
-      body: JSON.stringify(input),
-    }),
+  /**
+   * One Director pass: writes a beat plan (SFX hits and music beds too) for
+   * the clip. Streamed — each step, its thinking and how far the answer has
+   * got arrive through `onEvent` while it works; the promise holds the result.
+   */
+  directClip: async (id: string, input: DirectInput = {}, onEvent?: (event: DirectorEvent) => void): Promise<DirectClipResult> => {
+    let res: Response;
+    try {
+      res = await fetch(`${BASE}/clips/${id}/direct/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+        body: JSON.stringify(input),
+      });
+    } catch {
+      throw new ApiError("API unavailable — is the server running on :8787?");
+    }
+    if (!res.ok || !res.body || !res.headers.get("content-type")?.includes("text/event-stream")) {
+      const payload = (await res.json().catch(() => null)) as { error?: unknown; message?: unknown } | null;
+      throw new ApiError(
+        typeof payload?.error === "string" ? payload.error : typeof payload?.message === "string" ? payload.message : `Request failed (${res.status})`
+      );
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    for (;;) {
+      let chunk: ReadableStreamReadResult<Uint8Array>;
+      try {
+        chunk = await reader.read();
+      } catch {
+        break;
+      }
+      if (chunk.done) break;
+      buffer += decoder.decode(chunk.value, { stream: true });
+      let end = buffer.indexOf("\n\n");
+      while (end >= 0) {
+        const data = buffer
+          .slice(0, end)
+          .split("\n")
+          .filter((line) => line.startsWith("data:"))
+          .map((line) => line.slice(5).trimStart())
+          .join("\n");
+        buffer = buffer.slice(end + 2);
+        end = buffer.indexOf("\n\n");
+        if (!data) continue;
+        let event: DirectorEvent | { type: "done"; data: DirectClipResult } | { type: "error"; message: string };
+        try {
+          event = JSON.parse(data);
+        } catch {
+          continue;
+        }
+        if (event.type === "done") return event.data;
+        if (event.type === "error") throw new ApiError(event.message);
+        onEvent?.(event);
+      }
+    }
+    throw new ApiError("The connection to the server dropped before the Director finished (a server restart does this). Run it again.");
+  },
   /** The harness watches the clip window (again, with force). */
   senseClip: (id: string, force = false) => request<ClipSense>(`/clips/${id}/sense${force ? "?force=1" : ""}`, { method: "POST" }),
   /** The harness watches the last render and critiques it. */
@@ -960,6 +1057,8 @@ export const api = {
   /** A thumbs up / down on the last pass, learned as a lesson. */
   directorFeedback: (id: string, input: { verdict: "up" | "down"; note?: string; scope?: "global" | "project" }) =>
     request<{ lessons: DirectorLesson[] }>(`/clips/${id}/director/feedback`, { method: "POST", body: JSON.stringify(input) }),
+  /** Take back the Director's last pass standing: its lanes, hits and beds go back to how they were before it. */
+  undoDirectorPass: (id: string) => request<{ clip: ClipPayload; summary: string }>(`/clips/${id}/director/undo`, { method: "POST" }),
   listLessons: () => request<DirectorLesson[]>("/studio/lessons"),
   addLesson: (input: { text: string; scope?: string }) => request<DirectorLesson>("/studio/lessons", { method: "POST", body: JSON.stringify(input) }),
   deleteLesson: (id: string) => request<{ deleted: boolean }>(`/studio/lessons/${id}`, { method: "DELETE" }),

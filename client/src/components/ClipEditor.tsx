@@ -34,6 +34,7 @@ import {
   type CaptionStyleInfo,
   type ClipSense,
   type DirectInput,
+  type DirectorEvent,
   type RenderReview,
   type CaptionTextOverride,
   type CaptionWordOverride,
@@ -1003,32 +1004,60 @@ export function ClipEditor({
     return { url: result.url, durationSec: result.durationSec };
   }
 
-  async function directClip(input: DirectInput): Promise<{ warnings: string[]; pending: string[]; questions?: string[]; planned?: boolean }> {
+  async function directClip(
+    input: DirectInput,
+    onEvent?: (event: DirectorEvent) => void
+  ): Promise<{ warnings: string[]; pending: string[]; questions?: string[]; planned?: boolean; followed?: string[]; at?: string }> {
     await onSave(buildDraft());
     setSaved(snapshot());
-    const result = await api.directClip(clip.id, input);
-    const next = result.clip.edit?.creator;
-    if (next) setCreator(next);
+    const result = await api.directClip(clip.id, input, onEvent);
+    if (result.sense) setHarness((prev) => ({ ...prev, sense: result.sense }));
+    adoptDirected(result.clip);
+    const turns = result.clip.edit?.creator?.director?.turns ?? [];
+    return {
+      warnings: result.warnings ?? [],
+      pending: result.pending ?? [],
+      questions: result.questions,
+      planned: result.planned,
+      followed: result.followed,
+      at: turns[turns.length - 1]?.at,
+    };
+  }
+
+  /**
+   * What the Director saved becomes the draft: the plan, its hits and beds, and
+   * the caption length a note fixed — left stale, the next save before a pass
+   * would quietly put the old count back.
+   */
+  function adoptDirected(next: Awaited<ReturnType<typeof api.directClip>>["clip"]): void {
+    const creator = next.edit?.creator;
+    if (creator) setCreator(creator);
     setSoundtrack((prev) => ({
       ...prev,
-      sfx: result.clip.edit?.soundtrack?.sfx ?? [],
-      beds: result.clip.edit?.soundtrack?.beds ?? [],
+      sfx: next.edit?.soundtrack?.sfx ?? [],
+      beds: next.edit?.soundtrack?.beds ?? [],
     }));
-    if (result.sense) setHarness((prev) => ({ ...prev, sense: result.sense }));
+    setOverrides(next.edit?.captionOverrides ?? {});
     setBeatSelection(null);
-    onClipUpdated?.(result.clip);
+    onClipUpdated?.(next);
     // A cutaway the Director found on stock or made to order is a new library asset; a bed it made, a new track.
-    if (next?.cutaways?.some((cutaway) => !mediaLibrary.some((asset) => asset.id === cutaway.assetId))) {
+    if (creator?.cutaways?.some((cutaway) => !mediaLibrary.some((asset) => asset.id === cutaway.assetId))) {
       void refreshMediaLibrary();
     }
-    if ((result.clip.edit?.soundtrack?.beds ?? []).some((bed) => !audioLibrary.some((asset) => asset.id === bed.assetId))) {
+    if ((next.edit?.soundtrack?.beds ?? []).some((bed) => !audioLibrary.some((asset) => asset.id === bed.assetId))) {
       void refreshAudioLibrary();
     }
-    return { warnings: result.warnings ?? [], pending: result.pending ?? [], questions: result.questions, planned: result.planned };
   }
 
   async function directorFeedback(verdict: "up" | "down", note?: string): Promise<void> {
     await api.directorFeedback(clip.id, { verdict, note });
+  }
+
+  /** Take the Director's last pass back; the draft is flushed first, like a pass. */
+  async function directorUndo(): Promise<void> {
+    await onSave(buildDraft());
+    setSaved(snapshot());
+    adoptDirected((await api.undoDirectorPass(clip.id)).clip);
   }
 
   async function senseNow(): Promise<void> {
@@ -2344,6 +2373,7 @@ export function ClipEditor({
               onUploadAudio={uploadAudio}
               onDirect={directClip}
               onDirectorFeedback={directorFeedback}
+              onDirectorUndo={directorUndo}
               onSense={senseNow}
               onReview={reviewNow}
               sense={harness.sense}

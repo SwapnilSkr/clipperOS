@@ -34,6 +34,7 @@ import {
   type CaptionStyleInfo,
   type CreatorPlan,
   type DirectInput,
+  type DirectorEvent,
   type ClipSense,
   type RenderReview,
   type PauseCandidate,
@@ -146,9 +147,11 @@ export interface CreatorDeskProps {
   /** Upload a file into the shared library; the editor refreshes `audioLibrary`. */
   onUploadAudio: (file: File, kind: "music" | "sfx") => Promise<void>;
   /** Flush the draft, run the Director, adopt its plan. Rejects with a message. */
-  onDirect: (input: DirectInput) => Promise<{ warnings: string[]; pending: string[]; questions?: string[]; planned?: boolean }>;
+  onDirect: (input: DirectInput, onEvent?: (event: DirectorEvent) => void) => Promise<{ warnings: string[]; pending: string[]; questions?: string[]; planned?: boolean; followed?: string[]; at?: string }>;
   /** A thumbs up / down on the last pass, learned. */
   onDirectorFeedback: (verdict: "up" | "down", note?: string) => Promise<void>;
+  /** Take the Director's last pass back. Rejects with a message. */
+  onDirectorUndo: () => Promise<void>;
   /** The harness watches the window / the last render on demand. */
   onSense: () => Promise<void>;
   onReview: () => Promise<void>;
@@ -206,6 +209,7 @@ export function CreatorDesk({
   onUploadAudio,
   onDirect,
   onDirectorFeedback,
+  onDirectorUndo,
   onSense,
   onReview,
   sense,
@@ -1368,6 +1372,7 @@ export function CreatorDesk({
           rendered={rendered}
           onDirect={onDirect}
           onFeedback={onDirectorFeedback}
+          onUndo={onDirectorUndo}
           onSense={onSense}
           onReview={onReview}
         />

@@ -207,8 +207,26 @@ export const CreatorPlanBody = t.Object({
             notes: t.Optional(t.String({ maxLength: 600 })),
             summary: t.String({ maxLength: 1200 }),
             at: t.String({ maxLength: 40 }),
+            // Without these, a save from the editor strips a waiting proposal back to a plain pass.
+            kind: t.Optional(t.Union([t.Literal("pass"), t.Literal("plan"), t.Literal("reply"), t.Literal("undo")])),
+            changed: t.Optional(t.Array(t.String({ maxLength: 24 }), { maxItems: 9 })),
+            undone: t.Optional(t.Boolean()),
+            questions: t.Optional(t.Array(t.String({ maxLength: 300 }), { maxItems: 4 })),
+            asks: t.Optional(
+              t.Array(
+                t.Object({
+                  question: t.String({ maxLength: 300 }),
+                  header: t.Optional(t.String({ maxLength: 24 })),
+                  options: t.Optional(
+                    t.Array(t.Object({ label: t.String({ maxLength: 80 }), detail: t.Optional(t.String({ maxLength: 200 })) }), { maxItems: 4 })
+                  ),
+                  recommended: t.Optional(t.Number()),
+                }),
+                { maxItems: 4 }
+              )
+            ),
           }),
-          { maxItems: 6 }
+          { maxItems: 12 }
         )
       ),
     })
@@ -357,6 +375,8 @@ export const DirectClipBody = t.Object({
   see: t.Optional(t.Boolean()),
   /** Plan first: propose and ask, apply nothing. */
   plan: t.Optional(t.Boolean()),
+  /** Options picked for the waiting proposal's questions. */
+  answers: t.Optional(t.Array(t.Object({ question: t.String({ maxLength: 300 }), choice: t.String({ maxLength: 300 }) }), { maxItems: 4 })),
 });
 
 export const DirectorFeedbackBody = t.Object({

@@ -13,9 +13,11 @@ import type {
   ClipSense,
   CreatorPlan,
   Cutaway,
+  DirectorAsk,
   DirectorAssetMode,
   DirectorLesson,
   DirectorTurn,
+  DirectorUndo,
   MusicBed,
   EffectSpan,
   MediaAsset,
@@ -45,11 +47,11 @@ import { getErrorMessage } from "../types";
 import { buildWordTimeline } from "./mining.service";
 import { expandWordTimings } from "./transcript.service";
 import { detectClipPauses, type PauseCandidate } from "./pause-detect.service";
-import { faceAnchorAt, headTravel, sourceToOutput, windowsFor } from "./creator-timeline";
+import { faceAnchorAt, headTravel, outputToSource, sourceToOutput, windowsFor } from "./creator-timeline";
 import { plainCreatorPlan, sanitizeCreatorPlan } from "./creator-plan.service";
 import { DEFAULT_BED_DIP, DEFAULT_BED_GAIN, listBuiltinAudio, listCustomAudio, MAX_MUSIC_BEDS, MAX_SOUNDTRACK_HITS, musicBeds, type AudioAsset } from "./soundtrack.service";
 import { generateImageNow, generateMusicNow, startGeneration } from "./ai-assets.service";
-import { fileDataUrl, chat, type ChatPart } from "./openrouter.service";
+import { fileDataUrl, chatStream, type ChatPart } from "./openrouter.service";
 import { proxyClip, senseClip, senseLibrary } from "./sense.service";
 import { describeLessons, lessonsFor } from "./taste.service";
 import { ensureProjectMedia } from "./ingest.service";
@@ -58,6 +60,9 @@ import { updateClipEdit } from "./clip.service";
 import { listMediaAssets } from "./media-library.service";
 import { stockForQuery, stockSources } from "./stock.service";
 import { TEXT_ENTERS, TEXT_EXITS, TEXT_MOTIONS } from "./text-motion";
+import { ASK_FORMAT, cleanDirectorAsks, PROPOSAL_FORMAT } from "./director-asks";
+import { editorKnowledge } from "./director-knowledge.service";
+import { readRequest } from "./director-request.service";
 
 // ============================================
 // THE DIRECTOR — one call that writes the whole beat plan.
@@ -101,11 +106,14 @@ export interface DirectInput {
   see?: boolean;
   /**
    * Plan first: the Director says what it would do, lane by lane, and asks
-   * up to three questions it cannot settle from the brief. Nothing is
-   * applied; the proposal and the questions are kept as a turn, and the next
-   * pass (with the answers in its notes) carries them.
+   * up to four questions it cannot settle from the brief, each with options
+   * and the one it recommends. Nothing is applied; the proposal is kept as a
+   * turn, and the next pass (with the answers) carries it. A note can switch
+   * a pass either way (director-request.service).
    */
   plan?: boolean;
+  /** Options picked for the waiting proposal's questions. */
+  answers?: { question: string; choice: string }[];
 }
 
 export interface DirectResult {
@@ -120,7 +128,11 @@ export interface DirectResult {
   sense?: ClipSense;
   /** A plan turn: what it asked, and that nothing was applied. */
   questions?: string[];
+  /** The same questions with their options and the recommended one. */
+  asks?: DirectorAsk[];
   planned?: boolean;
+  /** Every panel setting the creator's note overrode this pass (and a switch between proposing and cutting). */
+  followed: string[];
 }
 
 /** Cap on the word grid handed to the model; a 60 s clip is ~180 words. */
@@ -129,6 +141,8 @@ const MAX_WORDS = 420;
 const SNAP_SEC = 0.18;
 
 export interface DirectorPlanJson {
+  /** In Auto, a Director that stopped to ask: { why, proposal, asks } instead of a plan. */
+  decide?: unknown;
   summary?: unknown;
   cuts?: unknown;
   music?: unknown;
@@ -145,18 +159,36 @@ function round3(value: number): number {
   return Math.round(value * 1000) / 1000;
 }
 
-function extractJson(text: string): DirectorPlanJson | null {
+export function extractJson(text: string): DirectorPlanJson | null {
   const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(text);
   const body = fenced?.[1] ?? text;
   const start = body.indexOf("{");
   const end = body.lastIndexOf("}");
   if (start < 0 || end <= start) return null;
+  const slice = body.slice(start, end + 1);
   try {
-    return JSON.parse(body.slice(start, end + 1)) as DirectorPlanJson;
+    return JSON.parse(slice) as DirectorPlanJson;
   } catch {
-    return null;
+    // Models slip a trailing comma in now and then; nothing else is guessed at.
+    try {
+      return JSON.parse(slice.replace(/,(\s*[}\]])/g, "$1")) as DirectorPlanJson;
+    } catch {
+      return null;
+    }
   }
 }
+
+/** One stage of a pass, as the panel shows it while the Director works. */
+export type DirectorStepId = "read" | "undo" | "look" | "think" | "broll" | "sound" | "music" | "save";
+
+export type DirectorEvent =
+  | { type: "step"; id: DirectorStepId; state: "run" | "done" | "fail"; label: string; detail?: string }
+  /** The model's thinking, as it streams (Gemini sends short summaries). */
+  | { type: "thinking"; text: string }
+  /** How much of the answer has been written so far. */
+  | { type: "writing"; chars: number };
+
+export type DirectorProgress = (event: DirectorEvent) => void;
 
 function num(value: unknown): number | undefined {
   const n = Number(value);
@@ -235,61 +267,92 @@ function snapToWord(t: number, onsets: number[]): number {
   return best;
 }
 
+/**
+ * The stored plan lane by lane, in clip-relative seconds. With `trimEnd`, hits
+ * and beds are told on the source clock as well — the clock the model answers
+ * in — so a lane copied back from here lands where it already is.
+ */
+export function describePlanLanes(
+  plan: CreatorPlan | undefined,
+  sfx: SoundtrackHit[] | undefined,
+  trimStart: number,
+  mediaLabels: Map<string, string> = new Map(),
+  beds: MusicBed[] = [],
+  trimEnd?: number
+): Record<DirectorLane, string[]> {
+  const lanes: Record<DirectorLane, string[]> = { cuts: [], camera: [], speed: [], fx: [], cutaways: [], captions: [], titles: [], sfx: [], music: [] };
+  const rel = (t: number) => (t - trimStart).toFixed(2);
+  const cuts = (plan?.cuts ?? []).filter((cut) => cut.enabled);
+  if (cuts.length) lanes.cuts.push(`cuts applied: ${cuts.map((cut) => `${cut.id} ${rel(cut.startSec)}–${rel(cut.endSec)}`).join(", ")}`);
+  if (plan?.camera?.follow) {
+    const follow = plan.camera.follow;
+    lanes.camera.push(
+      `follow: ${follow.enabled ? `on, tightness ${follow.tightness}, zoom ${follow.zoom ?? 1}, response ${follow.response ?? "natural"}, axis ${follow.axis ?? "both"}, lead ${follow.lead ?? 0}` : "off"}`
+    );
+  }
+  for (const move of plan?.camera?.moves ?? []) {
+    const framing = [
+      move.zoomFrom !== undefined ? `zoomFrom ${move.zoomFrom}` : "",
+      move.pan ? `pan (${move.pan.x}, ${move.pan.y})` : "",
+      move.rampSec !== undefined ? `ramp ${move.rampSec}s` : "",
+    ].filter(Boolean);
+    lanes.camera.push(
+      `move ${move.kind} ${rel(move.startSec)}–${rel(move.endSec)} zoom ${move.zoom}${framing.length ? ` ${framing.join(" ")}` : ""} anchor ${typeof move.anchor === "string" ? move.anchor : "custom"} ease ${move.ease}`
+    );
+  }
+  for (const span of plan?.speed ?? []) {
+    const flags = [span.smooth ? "smooth" : "", span.captions ? "captions on" : ""].filter(Boolean).join(" ");
+    lanes.speed.push(`speed ${span.kind}${span.kind === "freeze" ? "" : ` ${span.rate}×`} ${rel(span.startSec)}–${rel(span.endSec)}${flags ? ` ${flags}` : ""}`);
+  }
+  for (const effect of plan?.effects ?? []) {
+    lanes.fx.push(`effect ${effect.effectId} ${rel(effect.startSec)}–${rel(effect.endSec)} amount ${effect.amount}${effect.variant ? ` variant ${effect.variant}` : ""}`);
+  }
+  for (const cutaway of plan?.cutaways ?? []) {
+    const label = mediaLabels.get(cutaway.assetId);
+    lanes.cutaways.push(
+      `cutaway asset ${cutaway.assetId}${label ? ` "${label}"` : ""} ${rel(cutaway.startSec)}–${rel(cutaway.endSec)} fit ${cutaway.fit} motion ${cutaway.motion} in ${cutaway.in.transitionId} ${cutaway.in.sec}s out ${cutaway.out.transitionId} ${cutaway.out.sec}s`
+    );
+  }
+  for (const scene of plan?.captionScenes ?? []) {
+    // A plain copy with its keys sorted: the same overrides read the same whichever path stored them.
+    const overrides = JSON.parse(JSON.stringify(scene.overrides ?? {})) as Record<string, unknown>;
+    lanes.captions.push(`caption scene "${scene.label ?? ""}" ${rel(scene.startSec)}–${rel(scene.endSec)} look ${scene.styleId ?? "clip"} ${JSON.stringify(overrides, Object.keys(overrides).sort())}`);
+  }
+  for (const title of plan?.titles ?? []) {
+    const look = [title.exit ? `exit ${title.exit}` : "", title.motion ? `motion ${title.motion}` : "", title.color ? `color ${title.color}` : "", title.fontFamily ? `font ${title.fontFamily}` : ""].filter(Boolean);
+    lanes.titles.push(
+      `title "${title.text}" ${rel(title.startSec)}–${rel(title.endSec)} at (${title.x}, ${title.y}) size ${title.sizeScale} ${title.depth} ${title.animation}${look.length ? ` ${look.join(" ")}` : ""}`
+    );
+  }
+  const windows = trimEnd !== undefined ? windowsFor(trimStart, trimEnd, plan?.cuts, plan?.speed) : undefined;
+  const clock = (outputSec: number) => (windows ? `${(outputToSource(windows, outputSec) - trimStart).toFixed(2)} source (${outputSec.toFixed(2)} output clock)` : `${outputSec.toFixed(2)} (output clock)`);
+  const named = (id: string) => `${id}${mediaLabels.get(id) ? ` "${mediaLabels.get(id)}"` : ""}`;
+  for (const hit of sfx ?? []) lanes.sfx.push(`sfx ${named(hit.assetId)} at ${clock(hit.atSec)} gain ${hit.gain ?? 0.9}`);
+  for (const bed of beds) {
+    lanes.music.push(
+      `music bed ${named(bed.assetId)} level ${bed.gain ?? DEFAULT_BED_GAIN} dip ${bed.dip ?? DEFAULT_BED_DIP} in ${clock(bed.inSec ?? 0)}${bed.outSec != null ? ` out ${clock(bed.outSec)}` : ""}${bed.offsetSec ? ` offset ${bed.offsetSec}` : ""}`
+    );
+  }
+  return lanes;
+}
+
 /** The stored plan, described in clip-relative seconds so the model can iterate on it. */
 export function describeCurrentPlan(
   plan: CreatorPlan | undefined,
   sfx: SoundtrackHit[] | undefined,
   trimStart: number,
   mediaLabels: Map<string, string> = new Map(),
-  beds: MusicBed[] = []
+  beds: MusicBed[] = [],
+  trimEnd?: number
 ): string {
   if (!plan) return "";
-  const rel = (t: number) => (t - trimStart).toFixed(2);
-  const lines: string[] = [];
-  const cuts = (plan.cuts ?? []).filter((cut) => cut.enabled);
-  if (cuts.length) lines.push(`cuts applied: ${cuts.map((cut) => `${cut.id} ${rel(cut.startSec)}–${rel(cut.endSec)}`).join(", ")}`);
-  if (plan.camera?.follow) {
-    const follow = plan.camera.follow;
-    lines.push(
-      `follow: ${follow.enabled ? `on, tightness ${follow.tightness}, zoom ${follow.zoom ?? 1}, response ${follow.response ?? "natural"}, axis ${follow.axis ?? "both"}, lead ${follow.lead ?? 0}` : "off"}`
-    );
-  }
-  for (const move of plan.camera?.moves ?? []) {
-    const framing = [
-      move.zoomFrom !== undefined ? `zoomFrom ${move.zoomFrom}` : "",
-      move.pan ? `pan (${move.pan.x}, ${move.pan.y})` : "",
-      move.rampSec !== undefined ? `ramp ${move.rampSec}s` : "",
-    ].filter(Boolean);
-    lines.push(
-      `move ${move.kind} ${rel(move.startSec)}–${rel(move.endSec)} zoom ${move.zoom}${framing.length ? ` ${framing.join(" ")}` : ""} anchor ${typeof move.anchor === "string" ? move.anchor : "custom"} ease ${move.ease}`
-    );
-  }
-  for (const span of plan.speed ?? []) {
-    const flags = [span.smooth ? "smooth" : "", span.captions ? "captions on" : ""].filter(Boolean).join(" ");
-    lines.push(`speed ${span.kind}${span.kind === "freeze" ? "" : ` ${span.rate}×`} ${rel(span.startSec)}–${rel(span.endSec)}${flags ? ` ${flags}` : ""}`);
-  }
-  for (const effect of plan.effects ?? []) {
-    lines.push(`effect ${effect.effectId} ${rel(effect.startSec)}–${rel(effect.endSec)} amount ${effect.amount}${effect.variant ? ` variant ${effect.variant}` : ""}`);
-  }
-  for (const cutaway of plan.cutaways ?? []) {
-    const label = mediaLabels.get(cutaway.assetId);
-    lines.push(
-      `cutaway asset ${cutaway.assetId}${label ? ` "${label}"` : ""} ${rel(cutaway.startSec)}–${rel(cutaway.endSec)} fit ${cutaway.fit} motion ${cutaway.motion} in ${cutaway.in.transitionId} ${cutaway.in.sec}s out ${cutaway.out.transitionId} ${cutaway.out.sec}s`
-    );
-  }
-  for (const scene of plan.captionScenes ?? []) {
-    lines.push(`caption scene "${scene.label ?? ""}" ${rel(scene.startSec)}–${rel(scene.endSec)} look ${scene.styleId ?? "clip"} ${JSON.stringify(scene.overrides ?? {})}`);
-  }
-  for (const title of plan.titles ?? []) {
-    lines.push(`title "${title.text}" ${rel(title.startSec)}–${rel(title.endSec)} at (${title.x}, ${title.y}) size ${title.sizeScale} ${title.depth} ${title.animation}`);
-  }
-  for (const hit of sfx ?? []) lines.push(`sfx ${hit.assetId} at ${hit.atSec.toFixed(2)} (output clock) gain ${hit.gain ?? 0.9}`);
-  for (const bed of beds) {
-    lines.push(
-      `music bed ${bed.assetId} level ${bed.gain ?? DEFAULT_BED_GAIN} dip ${bed.dip ?? DEFAULT_BED_DIP} in ${(bed.inSec ?? 0).toFixed(2)}${bed.outSec != null ? ` out ${bed.outSec.toFixed(2)}` : ""}${bed.offsetSec ? ` offset ${bed.offsetSec}` : ""} (output clock)`
-    );
-  }
-  return lines.join("\n");
+  const lanes = describePlanLanes(plan, sfx, trimStart, mediaLabels, beds, trimEnd);
+  return DIRECTOR_LANES.flatMap((lane) => lanes[lane]).join("\n");
+}
+
+/** The lanes that read differently between two states of the edit. */
+export function changedLanes(before: Record<DirectorLane, string[]>, after: Record<DirectorLane, string[]>): DirectorLane[] {
+  return DIRECTOR_LANES.filter((lane) => before[lane].join("\n") !== after[lane].join("\n"));
 }
 
 export interface DirectorBrief {
@@ -323,6 +386,8 @@ export interface DirectorBrief {
   assets: DirectorAssetMode;
   /** Whether this pass may lay music. */
   wantsMusic: boolean;
+  /** The creator asked for a bed made to order. */
+  composeMusic?: boolean;
   /** What the harness saw and heard in the clip (sense.service). */
   sense?: ClipSense;
   /** What the Director has learned about this creator's taste. */
@@ -333,6 +398,22 @@ export interface DirectorBrief {
   notes?: string;
   keep: DirectorLane[];
   turns?: DirectorTurn[];
+  /** The note revises an edit the Director already made: change what it asks, leave the rest. */
+  followUp?: boolean;
+  /** The lanes the note reads as touching (director-request), a hint for a follow-up. */
+  touches?: DirectorLane[];
+  /** Lanes the creator changed by hand since the Director's last pass. */
+  handEdited?: DirectorLane[];
+  /** The editor, its tools and the models behind them (director-knowledge). */
+  knowledge?: string;
+  /** The clip's own caption look, used wherever no caption scene is set. */
+  captions?: { styleId: string; chunkWords: number };
+  /** The note fixed the caption words on screen at a time for the whole clip. */
+  wordsPerLine?: number;
+  /** Panel settings the note overrode, so the model knows what it may now use. */
+  followed?: string[];
+  /** In Auto, the model may stop and ask instead of cutting when the notes leave the direction open. */
+  mayAsk?: boolean;
 }
 
 /**
@@ -379,17 +460,51 @@ export function buildDirectorPrompt(brief: DirectorBrief): string {
       )}% of the frame wide (${brief.face.presence}); the head travels ${Math.round(brief.face.travel.x * 100)}% of the frame across and ${Math.round(brief.face.travel.y * 100)}% up within a shot (under 3% is a still speaker — choose "smooth" or "natural"; over 8% is animated — "snappy" reads well).${brief.face.gaze ? ` The speaker ${brief.face.gaze}.` : ""} The head and shoulders below it fill most of the width down to the bottom. A behind-title is only visible where it clears the body: put it at the face's height with a width well past both sides of the head (sizeScale ≥ 2 for 1–2 short words), or above the head (y ≈ face y − 0.22) if there is room.`
     : "No face track: anchor camera moves on \"center\" and keep titles in front.";
   const keep = brief.keep.length ? `KEEP these lanes exactly as they are in the current plan (leave their keys out of your answer): ${brief.keep.join(", ")}.` : "";
-  const mediaLabels = new Map(brief.media.map((item) => [item.id, item.label]));
-  const described = describeCurrentPlan(brief.current, brief.currentSfx, brief.trimStart, mediaLabels, brief.currentBeds ?? []);
-  const current = described ? `\nCURRENT PLAN (clip-relative seconds):\n${described.slice(0, 6000)}` : "";
+  const mediaLabels = new Map([...brief.media, ...brief.sfx, ...brief.music].map((item) => [item.id, item.label]));
+  const described = describeCurrentPlan(brief.current, brief.currentSfx, brief.trimStart, mediaLabels, brief.currentBeds ?? [], brief.trimStart + brief.duration);
+  const handEdited = brief.handEdited?.length
+    ? `\nSINCE YOUR LAST PASS THE CREATOR CHANGED THESE LANES BY HAND: ${brief.handEdited.join(", ")}. CURRENT PLAN already holds their changes — keep them unless the notes ask otherwise.`
+    : "";
+  const current = described ? `\nCURRENT PLAN (clip-relative seconds; hits and beds on both clocks — answer in source seconds):\n${described.slice(0, 7000)}${handEdited}` : "";
+  const turnKind = (turn: DirectorTurn) =>
+    turn.kind === "plan"
+      ? " PROPOSED"
+      : turn.kind === "reply"
+        ? " ANSWERED (nothing changed)"
+        : turn.kind === "undo"
+          ? " TOOK BACK A PASS (the edit went back to how it was before it)"
+          : `${turn.changed ? ` CUT [changed: ${turn.changed.join(", ") || "nothing"}]` : ""}${turn.undone ? " — LATER TAKEN BACK by the creator: none of it is in CURRENT PLAN; do not bring it back unless asked" : ""}`;
   const turns = brief.turns?.length
-    ? `\nEARLIER TURNS ON THIS CLIP (oldest first). This pass builds on them: keep what earlier notes asked for unless the new notes change it. A turn marked PROPOSED is a plan you laid out and questions you asked without cutting; the creator's notes after it are the answers — apply that plan with those answers now.\n${brief.turns
-        .map((turn, index) => `${index + 1}. creator: ${turn.notes ? `"${turn.notes}"` : "(no notes)"} → you${turn.kind === "plan" ? " PROPOSED" : ""}: ${turn.summary.slice(0, 700)}${turn.questions?.length ? ` You asked: ${turn.questions.join(" | ")}` : ""}`)
+    ? `\nTHE CONVERSATION SO FAR ON THIS CLIP (oldest first). This pass builds on it: keep what earlier notes asked for unless the new notes change it, and read "that", "it", "again", "more", "less", "like before" against it. A turn marked PROPOSED is a plan you laid out and questions you asked without cutting; the creator's notes after it are the answers — apply that plan with those answers now.\n${brief.turns
+        .map((turn, index) => `${index + 1}. creator: ${turn.notes ? `"${turn.notes}"` : "(no notes)"} → you${turnKind(turn)}: ${turn.summary.slice(0, 700)}${
+            turn.asks?.length
+              ? ` You asked: ${turn.asks
+                  .map((ask) => `${ask.question}${ask.options.length ? ` [${ask.options.map((option, index) => `${option.label}${index === (ask.recommended ?? 0) ? " (recommended)" : ""}`).join(" / ")}]` : ""}`)
+                  .join(" | ")}`
+              : turn.questions?.length
+                ? ` You asked: ${turn.questions.join(" | ")}`
+                : ""
+          }`)
         .join("\n")}\n`
     : "";
-  const notes = brief.notes
-    ? `\nTHE CREATOR'S NOTES FOR THIS PASS — these override every default rule below, and every lane not under KEEP must change where they ask:\n"${brief.notes}"\n`
+  const count = brief.wordsPerLine ?? 0;
+  const wordsPerLine = count
+    ? `CAPTIONS HOLD ${count} WORD${count === 1 ? "" : "S"} ON SCREEN AT A TIME FOR THE WHOLE CLIP: every caption scene's overrides carry "chunkWords": ${count}. A peak scene still grips — bigger, bolder, uppercase, a warm highlight — but keeps ${count}.\n`
     : "";
+  const followUp =
+    brief.followUp && brief.notes
+      ? `THIS NOTE REVISES THE EDIT YOU ALREADY MADE (CURRENT PLAN below) — take it the way an editor takes a client's notes on a cut:
+- Change ONLY what the note asks for${brief.touches?.length ? ` (it reads as touching: ${brief.touches.join(", ")})` : ""}, plus what that change forces (a hit that sat on a moved camera move moves with it). Leave the key of every other lane OUT of your answer so it stays exactly as it is — do not re-time, re-roll or "improve" a lane the note does not ask about.
+- A lane you do return replaces that lane whole: start from its items in CURRENT PLAN and change only what the note asks, so nothing else in it is lost.
+- The EDITING RULES below are how to lay a lane from scratch; for a revision the note and CURRENT PLAN come first.
+- "summary": 1–3 sentences on what you changed this turn and why — not the whole edit again.
+`
+      : "";
+  const notes = brief.notes
+    ? `\nTHE CREATOR'S NOTES FOR THIS PASS — the most important part of this brief. Do EVERYTHING they ask, in their words' meaning: they override every default rule and rule of thumb below (a rule says "at most 2 cutaways" and the notes want B-roll throughout: lay more). Every lane not under KEEP must change where they ask. If they ask a question, answer it at the start of "summary" from EDITOR KNOWLEDGE. If something they ask cannot be done with the tools here, say so in "summary" rather than skipping it silently:\n"${brief.notes}"\n${
+        brief.followed?.length ? `The panel's settings were changed to follow them: ${brief.followed.join(" ")}\n` : ""
+      }${followUp}${wordsPerLine}`
+    : wordsPerLine;
   const effects = brief.effects
     .map((effect) => `${effect.id} (${effect.group}) — ${effect.summary}${effect.variants?.length ? ` [variants: ${effect.variants.join(", ")}]` : ""}`)
     .join("; ");
@@ -433,9 +548,11 @@ B-roll that would earn its place: ${brief.sense.broll.map((idea) => `${idea.t.to
         )
         .join("\n")
     : "(none)";
-  const musicSource =
-    brief.assets === "ai" || brief.assets === "both"
-      ? ` A bed may also be made to order: { "generate": { "prompt": "..." }, ... } with a music brief (genre, mood, tempo, instrumentation, 15–40 words, instrumental) in place of "asset" — only when nothing in the catalogue fits the clip's tone.`
+  const generateBed = ` { "generate": { "prompt": "..." }, ... } with a music brief (genre, mood, tempo, instrumentation, 15–40 words, instrumental) in place of "asset"`;
+  const musicSource = brief.composeMusic
+    ? ` THE CREATOR ASKED FOR MUSIC MADE TO ORDER: lay one bed as${generateBed}, written for this clip's tone, energy and pacing (it is generated, kept in the library for later, and replaces the catalogue pick) — unless the notes name a catalogue track.`
+    : brief.assets === "ai" || brief.assets === "both"
+      ? ` A bed may also be made to order:${generateBed} — only when nothing in the catalogue fits the clip's tone (a bed made on an earlier pass is in the catalogue: reuse it when it fits).`
       : "";
   const musicRules = brief.wantsMusic
     ? `- Music (lane "music"): 0–2 beds under the voice, on the OUTPUT clock like SFX. Pick by what the catalogue says the bed sounds like, matched to the genre, the speaker's energy and the harness's read of the tone — a calm story wants a low-energy pad, a hype peak a driving loop. Usually one bed for the whole clip at level 0.15–0.3 with dip 0.55–0.8 so it sits under speech; a second bed can take over at the peak (in at the peak punch, the first going out there) for a lift. Set "offset" to start a bed past a quiet intro. No music when the source already has music (see Audio) or the genre is music/performance.${musicSource}`
@@ -445,8 +562,10 @@ B-roll that would earn its place: ${brief.sense.broll.map((idea) => `${idea.t.to
     : "";
 
   return `You are the editor of a short-form vertical clip (a YouTube Short / Reel). You write the BEAT PLAN a professional editor would build for retention: tighten dead air, punch the camera in on the lines that matter, let the camera ride the speaker, style the captions per scene, put a hook title behind the speaker for the first beat, drop sound effects on every move, lay a music bed that serves the voice — and, where they earn it, slow motion, looks and B-roll cutaways.${brief.sense ? " You have WATCHED the clip: use what you saw (a gesture, a look, a laugh, a prop, a cut in the source) to time and choose the beats, not only the words." : ""}
-${notes}${turns}${lessons}
-Genre: ${brief.genre.label} — ${brief.genre.summary}
+${notes}${turns}${lessons}${brief.knowledge ? `\n${brief.knowledge}\n` : ""}
+Genre: ${brief.genre.label} — ${brief.genre.summary}${
+    brief.captions ? `\nClip captions (wherever no caption scene is set): look ${brief.captions.styleId}, ${brief.captions.chunkWords} word${brief.captions.chunkWords === 1 ? "" : "s"} at a time. A scene without "chunkWords" uses its own look's count instead.` : ""
+  }
 Clip length: ${brief.duration.toFixed(1)}s. All times below and in your answer are CLIP-RELATIVE SOURCE seconds (0 = the first frame), even inside slow motion.
 The mined PEAK (the payoff line) is at ${brief.peak.at.toFixed(2)}s${brief.peak.line ? `: "${brief.peak.line}"` : ""}.
 Shot changes (camera cuts in the source) at: ${cuts}.
@@ -473,7 +592,7 @@ ${keep}
 
 EDITING RULES
 - The first 2 seconds decide everything. Open with a "pull" camera move (start tight, settle) or a hard "punch", a hook caption scene, and a short TITLE (2–4 words, a curiosity gap, NOT the first caption's words) behind the speaker.
-- Cut dead air: apply the candidates that save ≥ 0.25s unless the pause is a deliberate dramatic beat before the peak.
+- Cut dead air: apply the candidates that save ≥ 0.25s unless the pause is a deliberate dramatic beat before the peak. When the notes ask to remove dead air, pauses, silences or unnecessary cuts, apply EVERY candidate, however short, except a deliberate beat right before the peak line.
 - Camera: 3–7 moves total for a 30–45s clip. "punch" on the peak line and on 1–3 other strong lines (zoom 1.15–1.3, anchor "face", ease "cut" for impact or "out" for a softer landing). A "push" (slow creep, zoom 1.08–1.14) under a build-up. Never overlap moves; leave at least 0.8s between them. follow.enabled true for talking-head footage: it pins the head and lets the room drift, so use tightness 0.7–0.9 and zoom 1.12–1.22 (below 1.08 there is no room to pin). follow.response is how fast the camera answers the head: "snappy" rides every nod (energetic, animated speakers), "natural" (default) keeps leans, "smooth" keeps only posture (calm, interview). follow.axis "both" unless the footage only moves one way. follow.lead 0–1 leans the frame toward where the speaker faces (0.3–0.6 for someone talking to an off-camera host).
 - A "frame" move sets a framing and holds it to its end: "pan" { x, y } moves the 9:16 window over the wider source, −1..1 of the room either side (x −1 shows the source's left edge, +1 its right; ${brief.verticalPan ? "y moves it up (−) or down (+)" : "y has no room on this 16:9 source, keep it 0"}); "zoom" is where it ends, "zoomFrom" where it starts (zoomFrom 1.3 → zoom 1 is a reveal: a zoom OUT, down to 0.75 shows past the follow zoom), "rampSec" how long it takes to get there (0.3–0.8). Use it to show what the speaker looks or points at (pan toward the side they face), or for a reveal. anchor "look" converges ahead of the face, the way it faces.
 - A "hold" move locks the camera off for its span: the follow stops riding the head (at the move's zoom, 1 for none) and glides back after. Use it for a still, weighty beat — a stare, a pause before the payoff — on an animated speaker; 1–3s.
@@ -506,14 +625,28 @@ Return ONLY JSON, no prose, with this shape (all times clip-relative source seco
   "sfx": [{ "asset": "swoosh", "at": 0.0, "gain": 0.8 }],
   "music": [{ "asset": "warm", "level": 0.22, "dip": 0.65, "in": 0, "out": null, "offset": 0 }]
 }
-(A cutaway from the library carries "asset": "<library id>" in place of "query" and "kind"; a generated one carries "generate". A bed's "out" is null for the end of the clip.)`;
+(A cutaway from the library carries "asset": "<library id>" in place of "query" and "kind"; a generated one carries "generate". A bed's "out" is null for the end of the clip.)${brief.mayAsk ? DECIDE_INSTRUCTION : ""}`;
 }
+
+/**
+ * In Auto, a note that leaves the direction open may be answered with
+ * questions instead of a plan. Offered only when stopping can make sense:
+ * there is a note, it did not say go ahead, and no proposal is being answered.
+ */
+export const DECIDE_INSTRUCTION = `
+
+STOP AND ASK INSTEAD — only when the creator's notes leave a real fork in direction that the brief cannot settle and a wrong guess would waste the pass (two very different tones, asks that pull against each other, a change of direction with several distinct ways to go). Precise requests, anything the rules or the lessons settle, and small choices are NEVER a reason to stop: make the call yourself and cut. When you do stop, return ONLY:
+{ "decide": { "why": "3–8 words on what forks", "proposal": "...", "asks": [...] } }
+"proposal": ${PROPOSAL_FORMAT}
+"asks": ${ASK_FORMAT}`;
 
 /** In plan mode the same brief ends here instead of with the plan's JSON shape. */
 export const PLAN_MODE_INSTRUCTION = `
 
-PLAN FIRST — do NOT write the plan yet. Read the brief, then answer as the editor talking to the creator before touching the timeline:
-Return ONLY JSON: { "proposal": "6–10 short lines, one per lane you would touch, each saying WHAT you would do and WHERE (clip-relative seconds or the words) and why — cuts, camera, captions, title, SFX, music, B-roll, effects, speed. Concrete, an editor's voice, no hedging.", "questions": ["up to 3 questions whose answers would change the cut — only what you genuinely cannot decide from the brief (a tone call, whether to use a specific asset, how hard to push). Ask nothing if the brief settles it."] }`;
+PLAN FIRST — do NOT write the plan yet. Read the brief, then answer as the editor talking to the creator before touching the timeline.
+Return ONLY JSON: { "proposal": "...", "asks": [...] }
+"proposal": ${PROPOSAL_FORMAT}
+"asks": ${ASK_FORMAT}`;
 
 /** The brief with the plan's JSON shape replaced by the proposal's: the rules stay, the answer changes. */
 export function planPrompt(fullPrompt: string): string {
@@ -521,13 +654,13 @@ export function planPrompt(fullPrompt: string): string {
   return (cut > 0 ? fullPrompt.slice(0, cut) : fullPrompt) + PLAN_MODE_INSTRUCTION;
 }
 
-export function parsePlanProposal(text: string): { proposal: string; questions: string[] } | null {
+/** A proposal: what it would do, and its questions with options (an older answer's plain questions too). */
+export function parsePlanProposal(text: string): { proposal: string; asks: DirectorAsk[]; questions: string[]; why?: string } | null {
   const raw = extractJson(text) as unknown as Record<string, unknown> | null;
   if (!raw || typeof raw.proposal !== "string" || !raw.proposal.trim()) return null;
-  const questions = Array.isArray(raw.questions)
-    ? (raw.questions as unknown[]).filter((q): q is string => typeof q === "string" && q.trim().length > 0).map((q) => q.trim().slice(0, 300)).slice(0, 3)
-    : [];
-  return { proposal: raw.proposal.trim().slice(0, 1200), questions };
+  const asks = cleanDirectorAsks(Array.isArray(raw.asks) && raw.asks.length ? raw.asks : raw.questions);
+  const why = typeof raw.why === "string" && raw.why.trim() ? raw.why.trim().slice(0, 160) : undefined;
+  return { proposal: raw.proposal.trim().slice(0, 1200), asks, questions: asks.map((ask) => ask.question), ...(why ? { why } : {}) };
 }
 
 const CUTAWAY_MOTIONS: Cutaway["motion"][] = ["none", "in", "out", "left", "right", "up", "down"];
@@ -822,8 +955,10 @@ export function applyDirectorAnswer(input: {
   if (rewrite("music", "music")) {
     const users = beds.filter((bed) => !bed.id.startsWith("dir_"));
     const musicIds = input.musicIds ?? new Set<string>();
+    // A track the creator already laid is not laid again: it would play on top of itself.
+    const playing = new Set(users.map((bed) => bed.assetId));
     const placed: MusicBed[] = list(answer.music)
-      .filter((bed) => typeof bed.asset === "string" && musicIds.has(bed.asset as string))
+      .filter((bed) => typeof bed.asset === "string" && musicIds.has(bed.asset as string) && !playing.has(bed.asset as string))
       .slice(0, MAX_MUSIC_BEDS)
       .map((bed, index) => {
         const inSec = round3(Math.max(0, input.windowsOutput(abs(num(bed.in) ?? 0, false))));
@@ -1081,7 +1216,89 @@ export async function resolveDirectorMusic(input: {
   return { music, assets, warnings };
 }
 
-export async function directClip(clipId: string, input: DirectInput = {}): Promise<DirectResult> {
+/** The clip's stored turns, field by field: the stored plan is a mongoose subdocument. */
+function storedTurns(current: CreatorPlan | undefined): DirectorTurn[] {
+  return (current?.director?.turns ?? []).map((turn) => ({
+    ...(turn.notes ? { notes: turn.notes } : {}),
+    summary: turn.summary,
+    at: turn.at,
+    ...(turn.kind === "plan" ? { kind: "plan" as const, ...(turn.questions?.length ? { questions: turn.questions } : {}) } : {}),
+    ...(turn.kind === "plan" && turn.asks?.length ? { asks: cleanDirectorAsks(JSON.parse(JSON.stringify(turn.asks))) } : {}),
+    ...(turn.kind === "reply" ? { kind: "reply" as const } : {}),
+    ...(turn.kind === "undo" ? { kind: "undo" as const } : {}),
+    ...(turn.changed ? { changed: [...turn.changed] } : {}),
+    ...(turn.undone ? { undone: true } : {}),
+  }));
+}
+
+const plainCopy = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
+
+/** The latest pass still standing, and the edit as it was before it when that was kept. */
+function standingPass(turns: DirectorTurn[], kept: DirectorUndo[] | undefined): { index: number; turn: DirectorTurn; before?: DirectorUndo } | undefined {
+  for (let index = turns.length - 1; index >= 0; index--) {
+    const turn = turns[index]!;
+    if ((turn.kind && turn.kind !== "pass") || turn.undone) continue;
+    return { index, turn, ...(kept?.some((item) => item.at === turn.at) ? { before: kept.find((item) => item.at === turn.at) } : {}) };
+  }
+  return undefined;
+}
+
+/**
+ * Take back the Director's latest standing pass: its lanes, hits, beds and
+ * caption length go back to how they were before it. The conversation keeps
+ * the pass, marked taken back, so the next pass knows not to bring it back.
+ * A pass taken back makes the one before it the next to take back.
+ */
+export async function undoDirectorPass(clipId: string, notes?: string, options: { turn?: boolean } = {}): Promise<{ clip: IClip; summary: string }> {
+  const clip = await Clip.findById(clipId);
+  if (!clip) throw new Error("Clip not found");
+  const current = clip.edit?.creator;
+  const turns = storedTurns(current);
+  const kept = plainCopy((clip.directorUndo ?? []) as DirectorUndo[]);
+  const standing = standingPass(turns, kept);
+  if (!standing) throw new Error("There is no pass of the Director's left to take back.");
+  if (!standing.before) throw new Error("That pass was made before passes could be taken back — change it with a note instead.");
+  const before = standing.before;
+  const asked = standing.turn.notes;
+  const summary = `Took back ${asked ? `“${asked.length > 90 ? `${asked.slice(0, 90)}…` : asked}”` : "the last pass"} — the edit is as it was before it.`;
+  const plain = current ? plainCreatorPlan(current as unknown as Record<string, unknown>) : undefined;
+  const director = {
+    ...(plain?.director ?? {}),
+    turns: [
+      ...turns.map((turn, index) => (index === standing.index ? { ...turn, undone: true } : turn)),
+      ...(options.turn === false ? [] : [{ ...(notes ? { notes: notes.slice(0, 600) } : {}), summary, at: new Date().toISOString(), kind: "undo" as const }]),
+    ].slice(-MAX_DIRECTOR_TURNS),
+  };
+  const overrides = clip.edit?.captionOverrides ? (plainCopy(clip.edit.captionOverrides) as Record<string, unknown>) : {};
+  const chunkChanged = overrides.chunkWords !== before.chunkWords;
+  if (before.chunkWords === undefined) delete overrides.chunkWords;
+  else overrides.chunkWords = before.chunkWords;
+  const updated = await updateClipEdit(clipId, {
+    edit: {
+      creator: { ...(before.creator ?? { enabled: false, version: 1 as const }), director },
+      soundtrack: { ...(clip.edit?.soundtrack ? plainCopy(clip.edit.soundtrack) : {}), sfx: before.sfx, beds: before.beds },
+      // An empty map resets the clip to its look.
+      ...(chunkChanged ? { captionOverrides: overrides as NonNullable<typeof clip.edit>["captionOverrides"] } : {}),
+    },
+  });
+  await Clip.updateOne(
+    { _id: clipId },
+    {
+      $set: { directorUndo: kept.filter((item) => item.at !== standing.turn.at), ...(before.directed ? { directed: before.directed } : {}) },
+      ...(before.directed ? {} : { $unset: { directed: 1 } }),
+    }
+  );
+  console.log(`🎬 Took back a pass on clip ${clip.rank} (${standing.turn.at})`);
+  return { clip: updated, summary };
+}
+
+export async function directClip(
+  clipId: string,
+  input: DirectInput = {},
+  progress: DirectorProgress = () => {},
+  /** A note that also took the last pass back: its reading, carried into the pass on the edit as it was. */
+  carried?: { request: Awaited<ReturnType<typeof readRequest>>; tookBack: string }
+): Promise<DirectResult> {
   if (!config.openRouterApiKey) throw new Error("OPENROUTER_API_KEY is not set — the Director needs a model");
   const clip = await Clip.findById(clipId);
   if (!clip) throw new Error("Clip not found");
@@ -1098,8 +1315,8 @@ export async function directClip(clipId: string, input: DirectInput = {}): Promi
   const lines = linesFor(project, trimStart, trimEnd);
   // A cue's start is a real onset too, often of a word the grid dropped.
   const onsets = [...words.map((word) => word.t), ...lines.map((line) => line.t)];
-  const pauses = await detectClipPauses(clipId, { startSec: trimStart, endSec: trimEnd }).catch(() => null);
-  const candidates = pauses?.candidates ?? [];
+  // Dead air is found while the note is read below.
+  const pausesFound = detectClipPauses(clipId, { startSec: trimStart, endSec: trimEnd }).catch(() => null);
   const track: ReframeTrack | undefined = clip.reframeTrack?.track;
   const cuts = (track?.cuts ?? [])
     .map((cut) => round3(cut + (track?.originSec ?? 0) - trimStart))
@@ -1110,15 +1327,147 @@ export async function directClip(clipId: string, input: DirectInput = {}): Promi
   const faceWidth = firstFace?.fw && firstFace.width ? Math.min(0.9, firstFace.fw / firstFace.width) : 0.3;
   const profile = resolveGenreProfile(project.genreId);
   const stock = stockSources().length > 0;
-  const assets: DirectorAssetMode = input.assets ?? (stock ? "stock" : "library");
-  const wantsMusic = input.music !== false;
-  const see = input.see !== false;
-  const keep = (input.keep ?? []).filter((lane): lane is DirectorLane => DIRECTOR_LANES.includes(lane));
   const warnings: string[] = [];
+  // The note outranks the panel: it is read first, and switches the B-roll
+  // source, music, watching, locks — and between proposing and cutting —
+  // wherever it asks.
+  const knowledge = editorKnowledge();
+  const current = clip.edit?.creator;
+  const previousTurns = storedTurns(current);
+  // The edit as it stands, lane by lane: what a pass changes, and what the creator changed by hand, are read against it.
+  const plainCurrent = current ? plainCreatorPlan(current as unknown as Record<string, unknown>) : undefined;
+  const currentBeds = musicBeds(clip.edit?.soundtrack);
+  const lanesNow = describePlanLanes(plainCurrent, clip.edit?.soundtrack?.sfx, trimStart, new Map(), currentBeds);
+  const standing = standingPass(previousTurns, clip.directorUndo);
+  // The editor saves before every pass, so whatever differs from the Director's last pass is the creator's own hand.
+  const handEdited =
+    clip.directed?.plan && standing && clip.directed.at === standing.turn.at
+      ? changedLanes(describePlanLanes(plainCopy(clip.directed.plan), clip.directed.sfx, trimStart, new Map(), clip.directed.beds ?? []), lanesNow)
+      : [];
+  // A question asked while a proposal waits is answered in between; the proposal still waits.
+  const last = [...previousTurns].reverse().find((turn) => turn.kind !== "reply" && turn.kind !== "undo");
+  const waiting =
+    last?.kind === "plan" ? { proposal: last.summary, asks: last.asks ?? (last.questions ?? []).map((question) => ({ question, options: [] })) } : undefined;
+  // Answers picked for a waiting proposal travel with the note: in full to
+  // the models, in short on the turn.
+  const answers = (input.answers ?? []).filter((item) => item.question?.trim() && item.choice?.trim());
+  const typed = input.notes?.trim() || undefined;
+  const notesForModel =
+    [typed, answers.length ? `My answers to your questions: ${answers.map((item) => `${item.question.trim()} → ${item.choice.trim()}`).join("; ")}` : ""]
+      .filter(Boolean)
+      .join("\n") || undefined;
+  const turnNotes = [typed, answers.length ? `Picked: ${answers.map((item) => item.choice.trim()).join(" · ")}` : ""].filter(Boolean).join(" — ").slice(0, 600) || undefined;
+  if (notesForModel && !carried) progress({ type: "step", id: "read", state: "run", label: "Reading your note" });
+  // The note is read in the light of the conversation and the edit as it stands.
+  const context =
+    notesForModel && !carried
+      ? {
+          turns: previousTurns,
+          plan: describeCurrentPlan(
+            plainCurrent,
+            clip.edit?.soundtrack?.sfx,
+            trimStart,
+            // Names, not ids: the reader answers the creator in words.
+            new Map(
+              (
+                await Promise.all([
+                  listCustomAudio().catch(() => [] as AudioAsset[]),
+                  plainCurrent?.cutaways?.length ? listMediaAssets().catch(() => [] as MediaAsset[]) : Promise.resolve([] as MediaAsset[]),
+                ])
+              )
+                .flat()
+                .concat(listBuiltinAudio())
+                .map((asset): [string, string] => [asset.id, asset.label])
+            ),
+            currentBeds,
+            trimEnd
+          ),
+          undoable: Boolean(standing?.before),
+        }
+      : undefined;
+  const request =
+    carried?.request ??
+    (await readRequest(
+      notesForModel,
+      {
+        assets: input.assets ?? (stock ? "stock" : "library"),
+        music: input.music !== false,
+        see: input.see !== false,
+        keep: (input.keep ?? []).filter((lane): lane is DirectorLane => DIRECTOR_LANES.includes(lane)),
+        plan: input.plan === true,
+      },
+      stock,
+      knowledge,
+      waiting,
+      context
+    ));
+  if (request.warning) warnings.push(request.warning);
+  const { assets, keep, followed, wordsPerLine, mayAsk } = request.pass;
+  const wantsMusic = request.pass.music;
+  const see = request.pass.see;
+  const planFirst = request.pass.plan;
+  if (notesForModel && !carried) {
+    progress({
+      type: "step",
+      id: "read",
+      state: request.warning ? "fail" : "done",
+      label: "Read your note",
+      detail:
+        request.warning ??
+        (request.pass.undo
+          ? request.pass.edits
+            ? "Take the last pass back, then the rest of the note"
+            : "Take the last pass back"
+          : !request.pass.edits && request.pass.reply
+            ? "A question — nothing to change"
+            : followed.length
+              ? followed.join(" · ")
+              : "The panel settings stand"),
+    });
+  }
+
+  // "Undo that" takes the last pass back first; whatever else the note asks is
+  // then a pass on the edit as it was.
+  if (request.pass.undo && !carried) {
+    progress({ type: "step", id: "undo", state: "run", label: "Taking back the last pass" });
+    let undone: Awaited<ReturnType<typeof undoDirectorPass>> | undefined;
+    try {
+      undone = await undoDirectorPass(clipId, turnNotes, { turn: !request.pass.edits });
+      progress({ type: "step", id: "undo", state: "done", label: "Took back the last pass", detail: undone.summary });
+    } catch (error: unknown) {
+      const message = getErrorMessage(error);
+      progress({ type: "step", id: "undo", state: "fail", label: "Could not take it back", detail: message });
+      if (request.pass.edits) warnings.push(message);
+      else request.pass.reply = message;
+    }
+    if (undone && !request.pass.edits) return { clip: undone.clip, summary: undone.summary, model: directorModel(), warnings, pending: [], followed: [] };
+    if (undone) return directClip(clipId, input, progress, { request, tookBack: undone.summary });
+  }
+
+  if (!request.pass.edits && request.pass.reply) {
+    // A note that only asks something is answered; the clip stays as it is.
+    const plain = current ? plainCreatorPlan(current as unknown as Record<string, unknown>) : undefined;
+    const summary = request.pass.reply;
+    const director = {
+      ...(plain?.director?.summary ? { summary: plain.director.summary } : {}),
+      ...(plain?.director?.generatedAt ? { generatedAt: plain.director.generatedAt } : {}),
+      notes: turnNotes,
+      model: directorModel(),
+      turns: [...previousTurns, { ...(turnNotes ? { notes: turnNotes } : {}), summary, at: new Date().toISOString(), kind: "reply" as const }].slice(-MAX_DIRECTOR_TURNS),
+    };
+    const updated = await updateClipEdit(clipId, {
+      edit: { creator: { ...(plain ?? { enabled: false, version: 1 as const }), director } },
+    });
+    console.log(`🎬 Answered a question on clip ${clip.rank} of ${project._id} (${directorModel()})`);
+    return { clip: updated, summary, model: directorModel(), warnings, pending: [], followed: [] };
+  }
 
   // The harness looks and listens first: the clip (cached per trim), and
   // every sound and picture it has not described yet.
-  const [sense, catalogue, lessons] = await Promise.all([
+  const lookStarted = Date.now();
+  progress({ type: "step", id: "look", state: "run", label: see ? "Watching the clip, listening to the library" : "Listening to the library" });
+  const [candidates, sense, catalogue, lessons] = await Promise.all([
+    pausesFound.then((found) => found?.candidates ?? []),
     see
       ? senseClip(clipId).catch((error: unknown) => {
           warnings.push(`The Director could not watch the clip (${getErrorMessage(error)}); it worked from the words.`);
@@ -1135,14 +1484,22 @@ export async function directClip(clipId: string, input: DirectInput = {}): Promi
   const sounds = catalogue.audio.filter((asset) => asset.kind === "sfx");
   const beds = catalogue.audio.filter((asset) => asset.kind === "music");
   const library = catalogue.media;
-  const current = clip.edit?.creator;
-  const currentBeds = musicBeds(clip.edit?.soundtrack);
-  const previousTurns: DirectorTurn[] = (current?.director?.turns ?? []).map((turn) => ({
-    ...(turn.notes ? { notes: turn.notes } : {}),
-    summary: turn.summary,
-    at: turn.at,
-    ...(turn.kind === "plan" ? { kind: "plan" as const, ...(turn.questions?.length ? { questions: turn.questions } : {}) } : {}),
-  }));
+  progress({
+    type: "step",
+    id: "look",
+    state: "done",
+    label: see && sense ? "Watched the clip" : "Read the words",
+    detail: [
+      sense ? `${sense.shots.length} shots, ${sense.moments.length} moments` : see ? "could not watch — working from the words" : "",
+      `${candidates.length} pause${candidates.length === 1 ? "" : "s"}`,
+      `${sounds.length} sounds, ${beds.length} beds, ${library.length} pictures${catalogue.described ? ` (${catalogue.described} newly described)` : ""}`,
+      lessons.length ? `${lessons.length} lesson${lessons.length === 1 ? "" : "s"}` : "",
+      // Cached looks are instant; only real work gets a time.
+      Date.now() - lookStarted >= 1000 ? `${((Date.now() - lookStarted) / 1000).toFixed(1)}s` : "",
+    ]
+      .filter(Boolean)
+      .join(" · "),
+  });
 
   const brief: DirectorBrief = {
     duration,
@@ -1190,42 +1547,100 @@ export async function directClip(clipId: string, input: DirectInput = {}): Promi
     freesound: freesoundConfigured(),
     assets,
     wantsMusic,
+    composeMusic: request.pass.composeMusic,
     sense,
     lessons,
-    current,
+    current: plainCurrent,
     currentSfx: clip.edit?.soundtrack?.sfx,
     currentBeds,
-    notes: input.notes?.trim() || undefined,
+    notes: notesForModel,
     keep,
     turns: previousTurns,
+    // Revising a standing pass, not answering a proposal.
+    followUp: Boolean(standing) && !waiting,
+    touches: request.pass.lanes,
+    handEdited,
+    knowledge,
+    captions: {
+      styleId: clip.edit?.captionStyleId ?? "clean",
+      chunkWords:
+        clip.edit?.captionOverrides?.chunkWords ?? listCaptionStyles().find((style) => style.id === (clip.edit?.captionStyleId ?? "clean"))?.chunkWords ?? 3,
+    },
+    wordsPerLine,
+    followed,
+    mayAsk,
   };
 
   const model = directorModel();
   const startedAt = Date.now();
-  const planFirst = input.plan === true;
-  let text: string;
-  try {
-    // The model gets the clip itself alongside the brief when it can watch,
-    // so a beat can land on something it saw, not only on a word.
-    const parts: ChatPart[] = [{ type: "text", text: planFirst ? planPrompt(buildDirectorPrompt(brief)) : buildDirectorPrompt(brief) }];
-    if (see && sense) {
-      const proxy = await proxyClip(await ensureProjectMedia(String(project._id)), trimStart, trimEnd);
-      parts.push({ type: "video_url", video_url: { url: await fileDataUrl(proxy, "video/mp4") } });
-    }
-    const result = await chat({ model, parts, temperature: 0.45, maxTokens: planFirst ? 3000 : 9000, reasoning: "medium", label: "director" });
-    text = result.text ?? "";
-  } catch (error: unknown) {
-    throw new Error(`The Director could not reach the model: ${getErrorMessage(error)}`);
+  // The model gets the clip itself alongside the brief when it can watch,
+  // so a beat can land on something it saw, not only on a word.
+  const parts: ChatPart[] = [{ type: "text", text: planFirst ? planPrompt(buildDirectorPrompt(brief)) : buildDirectorPrompt(brief) }];
+  if (see && sense) {
+    const proxy = await proxyClip(await ensureProjectMedia(String(project._id)), trimStart, trimEnd);
+    parts.push({ type: "video_url", video_url: { url: await fileDataUrl(proxy, "video/mp4") } });
   }
-
-  if (planFirst) {
-    // Nothing is cut: the proposal and its questions become a turn the next pass reads.
-    const proposal = parsePlanProposal(text);
-    if (!proposal) {
-      console.warn(`Director plan mode: no proposal in the answer — ${text.slice(0, 300).replace(/\s+/g, " ")}`);
-      throw new Error("The Director returned something that was not a proposal. Try again.");
+  const readable = (text: string) => (planFirst ? parsePlanProposal(text) !== null : extractJson(text) !== null);
+  const thinkLabel = planFirst ? "Thinking through a proposal" : "Directing";
+  progress({ type: "step", id: "think", state: "run", label: thinkLabel });
+  // max_tokens covers the thinking as well as the answer: a full plan runs to
+  // several thousand tokens after the model has thought, so the ceiling is
+  // generous (only what is written is billed). An answer that still comes back
+  // cut off or unreadable is asked for once more, thinking less.
+  let text = "";
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let written = 0;
+    let lastWriting = 0;
+    try {
+      const result = await chatStream({
+        model,
+        parts,
+        temperature: 0.45,
+        maxTokens: planFirst ? 12_000 : 32_000,
+        reasoning: attempt === 0 ? "medium" : "low",
+        label: "director",
+        timeoutMs: 300_000,
+        onReasoning: (delta) => progress({ type: "thinking", text: delta }),
+        onContent: (delta) => {
+          written += delta.length;
+          if (Date.now() - lastWriting < 250) return;
+          lastWriting = Date.now();
+          progress({ type: "writing", chars: written });
+        },
+      });
+      text = result.text;
+      const ok = readable(text);
+      console.log(
+        `🎬 Director answer for clip ${clip.rank}: ${result.finishReason ?? "no finish reason"}, ${result.usage.completionTokens} tokens ` +
+          `(${result.usage.reasoningTokens ?? 0} thinking), ${text.length} chars${ok ? "" : " — UNREADABLE"}`
+      );
+      if (ok) break;
+      console.warn(`Director answer unreadable (${result.finishReason}): ${text.slice(0, 200).replace(/\s+/g, " ")} … ${text.slice(-200).replace(/\s+/g, " ")}`);
+      if (attempt === 0) {
+        progress({
+          type: "step",
+          id: "think",
+          state: "run",
+          label: thinkLabel,
+          detail: result.finishReason === "length" ? "The answer ran out of room — asking again" : "The answer did not come back as a plan — asking again",
+        });
+      }
+    } catch (error: unknown) {
+      if (attempt === 1) throw new Error(`The Director could not reach the model: ${getErrorMessage(error)}`);
+      progress({ type: "step", id: "think", state: "run", label: thinkLabel, detail: `The model stalled (${getErrorMessage(error)}) — asking again` });
     }
-    const notes = input.notes?.trim() || undefined;
+  }
+  progress({ type: "step", id: "think", state: readable(text) ? "done" : "fail", label: thinkLabel, detail: `${((Date.now() - startedAt) / 1000).toFixed(1)}s` });
+
+  // Plan first — or, in Auto, a Director that stopped to ask because the note
+  // leaves the direction open — lays out the cut and asks. Nothing is cut:
+  // the proposal and its questions become a turn the next pass reads.
+  const answer = planFirst ? null : extractJson(text);
+  const stopped = mayAsk && answer?.decide ? parsePlanProposal(JSON.stringify(answer.decide)) : null;
+  if (planFirst || stopped) {
+    const proposal = stopped ?? parsePlanProposal(text);
+    if (!proposal) throw new Error("The Director's proposal came back unreadable twice. Try again — the server log has what it sent.");
+    if (stopped) followed.push(`Stopped to ask before cutting — ${stopped.why ?? "your note leaves the direction open"}.`);
     const at = new Date().toISOString();
     const summary = proposal.proposal;
     // Field by field off a plain copy: the stored plan is a mongoose subdocument.
@@ -1233,71 +1648,105 @@ export async function directClip(clipId: string, input: DirectInput = {}): Promi
     const director = {
       ...(plain?.director?.summary ? { summary: plain.director.summary } : {}),
       ...(plain?.director?.generatedAt ? { generatedAt: plain.director.generatedAt } : {}),
-      notes,
+      notes: turnNotes,
       model,
-      turns: [...previousTurns, { ...(notes ? { notes } : {}), summary, at, kind: "plan" as const, ...(proposal.questions.length ? { questions: proposal.questions } : {}) }].slice(-MAX_DIRECTOR_TURNS),
+      turns: [
+        ...previousTurns,
+        { ...(turnNotes ? { notes: turnNotes } : {}), summary, at, kind: "plan" as const, ...(proposal.asks.length ? { questions: proposal.questions, asks: proposal.asks } : {}) },
+      ].slice(-MAX_DIRECTOR_TURNS),
     };
     const updated = await updateClipEdit(clipId, {
       edit: { creator: { ...(plain ?? { enabled: false, version: 1 as const }), director } },
     });
-    console.log(`🎬 Planned clip ${clip.rank} of ${project._id} in ${((Date.now() - startedAt) / 1000).toFixed(1)}s (${model}): ${proposal.questions.length} question(s)`);
-    return { clip: updated, summary, model, warnings, pending: [], sense, questions: proposal.questions, planned: true };
+    console.log(
+      `🎬 ${stopped ? "Stopped to ask on" : "Planned"} clip ${clip.rank} of ${project._id} in ${((Date.now() - startedAt) / 1000).toFixed(1)}s (${model}): ${proposal.asks.length} question(s)`
+    );
+    return { clip: updated, summary, model, warnings, pending: [], sense, questions: proposal.questions, asks: proposal.asks, planned: true, followed };
   }
 
-  const answer = extractJson(text);
-  if (!answer) throw new Error("The Director returned something that was not a plan. Try again.");
+  if (!answer) throw new Error("The Director's plan came back unreadable twice. Try again — the server log has what it sent.");
 
-  // Stock queries and generation requests become library assets before anything is applied.
+  // Stock queries, Freesound lookups and generation requests become library
+  // assets before anything is applied — all three at once, since each only
+  // touches its own lane.
   const mediaIds = new Set(library.map((asset) => asset.id));
   const stillIds = new Set(library.filter((asset) => asset.kind === "image").map((asset) => asset.id));
+  const sfxIds = new Set(sounds.map((sound) => sound.id));
+  const musicIds = new Set(beds.map((bed) => bed.id));
   const pending: string[] = [];
   const pendingVideos: { assetId: string; prompt: string }[] = [];
   const mayGenerate = assets === "ai" || assets === "both";
-  if (answer.cutaways !== undefined && !keep.includes("cutaways")) {
-    const resolved = await resolveDirectorMedia({
-      cutaways: answer.cutaways,
-      library,
-      findStock: stock && assets !== "ai" && assets !== "library" ? stockForQuery : undefined,
-      generate: mayGenerate
-        ? async (prompt, kind) => {
-            // A still now, in every case, matched to the footage's look and
-            // checked by the harness; a video is a job that replaces it when done.
-            const still = await generateImageNow(prompt, "9:16", { look: sense?.overall });
-            if (!still) throw new Error("no image came back");
-            return { asset: still, pendingVideo: kind === "video" };
-          }
-        : undefined,
-    });
-    answer.cutaways = resolved.cutaways;
-    for (const asset of resolved.assets) {
-      mediaIds.add(asset.id);
-      if (asset.kind === "image") stillIds.add(asset.id);
+  // A bed may be made to order in AI / Both, or whenever the note asks for one.
+  const mayGenerateMusic = mayGenerate || request.pass.composeMusic === true;
+  if (!wantsMusic) delete answer.music;
+  // Only an item that has to be fetched or made is worth a line in the panel.
+  const fetches = (items: unknown, known: Set<string>, key: string) =>
+    Array.isArray(items) &&
+    items.some((item) => typeof item === "object" && item !== null && !known.has(String((item as Record<string, unknown>)[key])));
+  // Every lane is resolved; only one that fetches or makes something shows a step.
+  const sourcing = async (
+    id: DirectorStepId,
+    labels: [string, string],
+    shown: boolean,
+    run: () => Promise<{ warnings: string[]; found: string }>
+  ) => {
+    if (shown) progress({ type: "step", id, state: "run", label: labels[0] });
+    const result = await run();
+    warnings.push(...result.warnings);
+    if (shown) {
+      progress({ type: "step", id, state: result.found || !result.warnings.length ? "done" : "fail", label: labels[1], detail: [result.found, ...result.warnings].filter(Boolean).join(" · ") });
     }
-    warnings.push(...resolved.warnings);
-    pendingVideos.push(...resolved.pending);
-  }
-  const sfxIds = new Set(sounds.map((sound) => sound.id));
-  if (answer.sfx !== undefined && !keep.includes("sfx")) {
-    // A sound the catalogue lacks comes from Freesound, when configured.
-    const findSound = freesoundConfigured() ? (query: string) => sfxForQuery(query) : undefined;
-    const resolved = await resolveDirectorSfx({ sfx: answer.sfx, sfxIds, findSound });
-    answer.sfx = resolved.sfx;
-    for (const asset of resolved.assets) sfxIds.add(asset.id);
-    warnings.push(...resolved.warnings);
-  }
-  const musicIds = new Set(beds.map((bed) => bed.id));
-  if (wantsMusic && answer.music !== undefined && !keep.includes("music")) {
-    const resolved = await resolveDirectorMusic({
-      music: answer.music,
-      musicIds,
-      generate: mayGenerate ? (prompt) => generateMusicNow(prompt) : undefined,
-    });
-    answer.music = resolved.music;
-    for (const asset of resolved.assets) musicIds.add(asset.id);
-    warnings.push(...resolved.warnings);
-  } else if (!wantsMusic) {
-    delete answer.music;
-  }
+  };
+  const named = (list: { label?: string; id: string }[]) => (list.length ? list.map((asset) => asset.label ?? asset.id).join(", ") : "");
+  await Promise.all([
+    answer.cutaways !== undefined && !keep.includes("cutaways")
+      ? sourcing("broll", ["Finding B-roll", "B-roll"], fetches(answer.cutaways, mediaIds, "asset"), async () => {
+          const resolved = await resolveDirectorMedia({
+            cutaways: answer.cutaways,
+            library,
+            findStock: stock && assets !== "ai" && assets !== "library" ? stockForQuery : undefined,
+            generate: mayGenerate
+              ? async (prompt, kind) => {
+                  // A still now, in every case, matched to the footage's look and
+                  // checked by the harness; a video is a job that replaces it when done.
+                  const still = await generateImageNow(prompt, "9:16", { look: sense?.overall });
+                  if (!still) throw new Error("no image came back");
+                  return { asset: still, pendingVideo: kind === "video" };
+                }
+              : undefined,
+          });
+          answer.cutaways = resolved.cutaways;
+          for (const asset of resolved.assets) {
+            mediaIds.add(asset.id);
+            if (asset.kind === "image") stillIds.add(asset.id);
+          }
+          pendingVideos.push(...resolved.pending);
+          return { warnings: resolved.warnings, found: named(resolved.assets) };
+        })
+      : undefined,
+    answer.sfx !== undefined && !keep.includes("sfx")
+      ? sourcing("sound", ["Finding sounds on Freesound", "Sounds"], freesoundConfigured() && fetches(answer.sfx, sfxIds, "asset"), async () => {
+          // A sound the catalogue lacks comes from Freesound, when configured.
+          const findSound = freesoundConfigured() ? (query: string) => sfxForQuery(query) : undefined;
+          const resolved = await resolveDirectorSfx({ sfx: answer.sfx, sfxIds, findSound });
+          answer.sfx = resolved.sfx;
+          for (const asset of resolved.assets) sfxIds.add(asset.id);
+          return { warnings: resolved.warnings, found: named(resolved.assets) };
+        })
+      : undefined,
+    wantsMusic && answer.music !== undefined && !keep.includes("music")
+      ? sourcing("music", mayGenerateMusic ? ["Making a music bed", "Music"] : ["Choosing music", "Music"], fetches(answer.music, musicIds, "asset"), async () => {
+          const resolved = await resolveDirectorMusic({
+            music: answer.music,
+            musicIds,
+            generate: mayGenerateMusic ? (prompt) => generateMusicNow(prompt) : undefined,
+          });
+          answer.music = resolved.music;
+          for (const asset of resolved.assets) musicIds.add(asset.id);
+          return { warnings: resolved.warnings, found: named(resolved.assets) };
+        })
+      : undefined,
+  ]);
 
   // SFX and beds are placed on the output clock, which depends on the cuts and speed the plan applies.
   const applyWith = (windowsOutput: (sourceSec: number) => number) =>
@@ -1344,32 +1793,81 @@ export async function directClip(clipId: string, input: DirectInput = {}): Promi
 
   // The model describes what it meant to do; say what could not be done, so
   // the creator and the next pass are not told about a cutaway that is not there.
-  const summary = warnings.length ? `${applied.summary} (Not done: ${warnings.join(" ")})`.slice(0, 1200) : applied.summary;
-  const notes = input.notes?.trim() || undefined;
+  const said = warnings.length ? `${applied.summary} (Not done: ${warnings.join(" ")})` : applied.summary;
+  const summary = (carried ? `${carried.tookBack} ${said}` : said).slice(0, 1200);
+  const notes = turnNotes;
   const at = new Date().toISOString();
+
+  // A note that fixed the caption length holds it everywhere: on every scene
+  // (a look's own count would otherwise take over inside it) and on the clip.
+  if (wordsPerLine && plan.captionScenes) {
+    plan.captionScenes = plan.captionScenes.map((scene) => ({ ...scene, overrides: { ...scene.overrides, chunkWords: wordsPerLine } }));
+  }
+  // What this pass changed, lane by lane, against the edit it started from.
+  const changedNow = changedLanes(lanesNow, describePlanLanes(plan, sfx, trimStart, new Map(), applied.beds));
+  const changed = DIRECTOR_LANES.filter(
+    (lane) => changedNow.includes(lane) || (lane === "captions" && wordsPerLine !== undefined && wordsPerLine !== clip.edit?.captionOverrides?.chunkWords)
+  );
   plan.director = {
     notes,
     summary,
     model,
     generatedAt: at,
-    turns: [...previousTurns, { ...(notes ? { notes } : {}), summary: summary || "(no summary)", at, kind: "pass" as const }].slice(-MAX_DIRECTOR_TURNS),
+    turns: [...previousTurns, { ...(notes ? { notes } : {}), summary: summary || "(no summary)", at, kind: "pass" as const, changed }].slice(-MAX_DIRECTOR_TURNS),
   };
-
+  progress({ type: "step", id: "save", state: "run", label: "Laying it on the timeline" });
   const updated = await updateClipEdit(clipId, {
     edit: {
       creator: plan,
       soundtrack: { ...(clip.edit?.soundtrack ?? {}), sfx, beds: applied.beds },
+      ...(wordsPerLine
+        ? { captionOverrides: { ...(clip.edit?.captionOverrides ? JSON.parse(JSON.stringify(clip.edit.captionOverrides)) : {}), chunkWords: wordsPerLine } }
+        : {}),
     },
   });
   // What was directed, kept apart from what the creator goes on to edit, so
   // the difference can be read as taste when the clip is rendered.
-  await Clip.updateOne({ _id: clipId }, { $set: { directed: { plan, sfx, beds: applied.beds, at } } });
+  // And the edit as it was before this pass, so the pass can be taken back.
+  const before: DirectorUndo = plainCopy({
+    at,
+    ...(plainCurrent ? { creator: { ...plainCurrent, director: undefined } } : {}),
+    sfx: clip.edit?.soundtrack?.sfx ?? [],
+    beds: currentBeds,
+    ...(clip.edit?.captionOverrides?.chunkWords !== undefined ? { chunkWords: clip.edit.captionOverrides.chunkWords } : {}),
+    ...(clip.directed ? { directed: clip.directed } : {}),
+  });
+  await Clip.updateOne(
+    { _id: clipId },
+    { $set: { directed: { plan, sfx, beds: applied.beds, at }, directorUndo: [...plainCopy(clip.directorUndo ?? []), before].slice(-MAX_DIRECTOR_TURNS) } }
+  );
+  const count = (n: number, one: string, many = `${one}s`) => (n ? `${n} ${n === 1 ? one : many}` : "");
+  progress({
+    type: "step",
+    id: "save",
+    state: "done",
+    label: "Laid it on the timeline",
+    detail:
+      [
+        count(plan.cuts?.filter((cut) => cut.enabled).length ?? 0, "cut"),
+        count(plan.camera?.moves.length ?? 0, "camera move"),
+        count(plan.speed?.length ?? 0, "speed change"),
+        count(plan.effects?.length ?? 0, "effect"),
+        count(plan.cutaways?.length ?? 0, "cutaway"),
+        count(plan.captionScenes?.length ?? 0, "caption scene"),
+        count(plan.titles?.length ?? 0, "title"),
+        count(sfx.length, "hit"),
+        count(applied.beds.length, "music bed"),
+      ]
+        .filter(Boolean)
+        .join(" · ") || "nothing changed",
+  });
   console.log(
     `🎬 Directed clip ${clip.rank} of ${project._id} in ${((Date.now() - startedAt) / 1000).toFixed(1)}s ` +
       `(${model}${see && sense ? ", watched" : ""}, ${catalogue.described} new descriptions, ${lessons.length} lessons): ${plan.cuts?.filter((cut) => cut.enabled).length ?? 0} cuts, ${plan.camera?.moves.length ?? 0} moves, ` +
       `${plan.speed?.length ?? 0} speed, ${plan.effects?.length ?? 0} fx, ${plan.cutaways?.length ?? 0} cutaways, ` +
       `${plan.captionScenes?.length ?? 0} scenes, ${plan.titles?.length ?? 0} titles, ${sfx.length} hits, ${applied.beds.length} beds` +
+      ` — changed ${changed.join(", ") || "nothing"}${handEdited.length ? ` — hand-edited since the last pass: ${handEdited.join(", ")}` : ""}` +
       (warnings.length ? ` — ${warnings.join(" ")}` : "")
   );
-  return { clip: updated, summary, model, warnings, pending, sense };
+  return { clip: updated, summary, model, warnings, pending, sense, followed };
 }

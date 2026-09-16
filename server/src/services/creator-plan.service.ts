@@ -3,6 +3,7 @@ import {
   MAX_CAMERA_ZOOM,
   MAX_CAPTION_SCENES,
   MAX_CUTAWAYS,
+  MAX_DIRECTOR_ASKS,
   MAX_DIRECTOR_TURNS,
   MAX_EFFECT_SPANS,
   MAX_FOLLOW_ZOOM,
@@ -32,6 +33,7 @@ import { resolveCaptionFont } from "../config/caption-fonts";
 import { EFFECTS_BY_ID, isEffectId } from "../config/effects";
 import { isTransitionId } from "../config/transitions";
 import { TEXT_ENTERS, TEXT_EXITS, TEXT_MOTIONS } from "./text-motion";
+import { cleanDirectorAsks } from "./director-asks";
 
 // ============================================
 // CREATOR PLAN — sanitising and normalising the beat plan.
@@ -433,10 +435,20 @@ export function sanitizeCreatorPlan(raw: unknown): CreatorPlan {
           ...(typeof turn.notes === "string" && turn.notes.trim() ? { notes: turn.notes.trim().slice(0, 600) } : {}),
           summary: String(turn.summary).trim().slice(0, 1200),
           at: typeof turn.at === "string" ? turn.at.slice(0, 40) : "",
-          ...(turn.kind === "plan" ? { kind: "plan" as const } : {}),
-          ...(turn.kind === "plan" && Array.isArray(turn.questions)
-            ? { questions: (turn.questions as unknown[]).filter((q): q is string => typeof q === "string" && q.trim().length > 0).map((q) => q.trim().slice(0, 300)).slice(0, 3) }
+          ...(turn.kind === "plan" || turn.kind === "reply" || turn.kind === "undo" ? { kind: turn.kind as "plan" | "reply" | "undo" } : {}),
+          ...(!turn.kind || turn.kind === "pass"
+            ? {
+                ...(Array.isArray(turn.changed)
+                  ? { changed: (turn.changed as unknown[]).filter((lane): lane is string => typeof lane === "string" && lane.length > 0).map((lane) => lane.slice(0, 24)).slice(0, 9) }
+                  : {}),
+                ...(turn.undone === true ? { undone: true } : {}),
+              }
             : {}),
+          ...(turn.kind === "plan" && Array.isArray(turn.questions)
+            ? { questions: (turn.questions as unknown[]).filter((q): q is string => typeof q === "string" && q.trim().length > 0).map((q) => q.trim().slice(0, 300)).slice(0, MAX_DIRECTOR_ASKS) }
+            : {}),
+          // A copy first: a stored turn's asks are mongoose subdocuments.
+          ...(turn.kind === "plan" && Array.isArray(turn.asks) && turn.asks.length ? { asks: cleanDirectorAsks(JSON.parse(JSON.stringify(turn.asks))) } : {}),
         }))
         .slice(-MAX_DIRECTOR_TURNS);
       if (turns.length > 0) out.turns = turns;

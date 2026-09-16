@@ -26,10 +26,9 @@ import { generateClipShareCopy } from "../services/share-copy.service";
 import { cleanClipCaptions } from "../services/caption-clean.service";
 import { detectClipPauses } from "../services/pause-detect.service";
 import { ensureClipMatte, matteAvailable } from "../services/matte.service";
-import { directClip, type DirectorLane } from "../services/director.service";
+import { directClip, undoDirectorPass, type DirectInput, type DirectorEvent, type DirectResult } from "../services/director.service";
 import { reviewRender, senseClip } from "../services/sense.service";
 import { recordFeedback } from "../services/taste.service";
-import type { DirectorAssetMode } from "../types/clip.types";
 
 type Ctx = ApiContext;
 
@@ -261,26 +260,97 @@ export async function streamClipMatte({ params, set }: Ctx) {
   }
 }
 
+function directInput(body: unknown): DirectInput {
+  const input = (body ?? {}) as DirectInput;
+  return {
+    notes: input.notes,
+    keep: input.keep,
+    assets: input.assets,
+    music: input.music,
+    see: input.see,
+    plan: input.plan,
+    answers: input.answers,
+  };
+}
+
+function directPayload(result: DirectResult) {
+  return {
+    clip: serializeClip(result.clip),
+    summary: result.summary,
+    model: result.model,
+    warnings: result.warnings,
+    pending: result.pending,
+    sense: result.sense,
+    questions: result.questions,
+    asks: result.asks,
+    planned: result.planned,
+    followed: result.followed,
+  };
+}
+
 /** POST /api/clips/:id/direct — one Director pass; writes the plan and returns the clip. */
 export async function directClipRoute({ params, body, set }: Ctx) {
   try {
-    const input = (body ?? {}) as { notes?: string; keep?: DirectorLane[]; assets?: DirectorAssetMode; music?: boolean; see?: boolean; plan?: boolean };
-    const result = await directClip(params.id, { notes: input.notes, keep: input.keep, assets: input.assets, music: input.music, see: input.see, plan: input.plan });
-    return ok({
-      clip: serializeClip(result.clip),
-      summary: result.summary,
-      model: result.model,
-      warnings: result.warnings,
-      pending: result.pending,
-      sense: result.sense,
-      questions: result.questions,
-      planned: result.planned,
-    });
+    return ok(directPayload(await directClip(params.id, directInput(body))));
   } catch (error: unknown) {
     const message = getErrorMessage(error);
     set.status = message === "Clip not found" ? 404 : 500;
     return fail(message);
   }
+}
+
+/**
+ * POST /api/clips/:id/direct/stream — the same pass as server-sent events, so
+ * the panel shows the Director working: `step`, `thinking` and `writing`
+ * events while it runs, then one `done` (the /direct payload) or `error`.
+ * A comment line every few seconds keeps proxies and Bun's idle timeout from
+ * closing a quiet stretch. A creator who leaves mid-pass does not stop it:
+ * the plan is still saved, and is there when the clip is opened again.
+ */
+export function directClipStreamRoute({ params, body }: Ctx) {
+  const encoder = new TextEncoder();
+  let open = true;
+  let ping: ReturnType<typeof setInterval> | undefined;
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const write = (chunk: string) => {
+        if (!open) return;
+        try {
+          controller.enqueue(encoder.encode(chunk));
+        } catch {
+          open = false;
+        }
+      };
+      const send = (event: DirectorEvent | { type: "done"; data: ReturnType<typeof directPayload> } | { type: "error"; message: string }) =>
+        write(`data: ${JSON.stringify(event)}\n\n`);
+      ping = setInterval(() => write(": ping\n\n"), 5_000);
+      directClip(params.id, directInput(body), send)
+        .then((result) => send({ type: "done", data: directPayload(result) }))
+        .catch((error: unknown) => send({ type: "error", message: getErrorMessage(error) }))
+        .finally(() => {
+          clearInterval(ping);
+          if (!open) return;
+          open = false;
+          try {
+            controller.close();
+          } catch {
+            // Already closed by the client.
+          }
+        });
+    },
+    cancel() {
+      open = false;
+      clearInterval(ping);
+    },
+  });
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    },
+  });
 }
 
 /** POST /api/clips/:id/sense — the harness watches the window (again, with force). */
@@ -339,6 +409,18 @@ export async function directorFeedbackRoute({ params, body, set }: Ctx) {
   } catch (error: unknown) {
     const message = getErrorMessage(error);
     set.status = message === "Clip not found" ? 404 : 500;
+    return fail(message);
+  }
+}
+
+/** POST /api/clips/:id/director/undo — take back the Director's last pass standing. */
+export async function undoDirectorPassRoute({ params, set }: Ctx) {
+  try {
+    const result = await undoDirectorPass(params.id);
+    return ok({ clip: serializeClip(result.clip), summary: result.summary });
+  } catch (error: unknown) {
+    const message = getErrorMessage(error);
+    set.status = message === "Clip not found" ? 404 : 409;
     return fail(message);
   }
 }

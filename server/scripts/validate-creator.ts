@@ -773,14 +773,14 @@ check(
   noStock.warnings[0]?.includes("no stock search is configured") === true && noStockPlan.plan.cutaways === undefined && noStockPlan.plan.enabled
 );
 
-// Conversation turns: the sanitiser keeps the last six, field by field.
+// Conversation turns: the sanitiser keeps the last twelve, field by field.
 const turned = sanitizeCreatorPlan({
   enabled: true,
-  director: { turns: Array.from({ length: 8 }, (_, i) => ({ notes: i % 2 ? `note ${i}` : "", summary: `did ${i}`, at: `t${i}`, junk: true })).concat([{ summary: "  " } as never]) },
+  director: { turns: Array.from({ length: 14 }, (_, i) => ({ notes: i % 2 ? `note ${i}` : "", summary: `did ${i}`, at: `t${i}`, junk: true })).concat([{ summary: "  " } as never]) },
 });
 check(
-  "director turns: last six kept, blank summaries and stray fields dropped",
-  turned.director?.turns?.length === 6 && turned.director.turns[0]!.summary === "did 2" && turned.director.turns[0]!.notes === undefined && turned.director.turns[1]!.notes === "note 3" && !("junk" in turned.director.turns[5]!)
+  "director turns: last twelve kept, blank summaries and stray fields dropped",
+  turned.director?.turns?.length === 12 && turned.director.turns[0]!.summary === "did 2" && turned.director.turns[0]!.notes === undefined && turned.director.turns[1]!.notes === "note 3" && !("junk" in turned.director.turns[11]!)
 );
 
 const gazeTrack: ReframeTrack = {
@@ -854,7 +854,7 @@ check(
     prompt.includes("Slow push over racks of blinking servers.") &&
     prompt.includes('warm — "Warm pad" 16s — A soft synth pad, unhurried. 80 BPM energy 2/5 suits: under a calm story') &&
     prompt.includes("- Fewer camera moves. (the creator said so)") &&
-    prompt.includes("music bed warm level 0.2") &&
+    prompt.includes('music bed warm "Warm pad" level 0.2') &&
     prompt.includes('- Music (lane "music")') &&
     prompt.includes("You have WATCHED the clip")
 );
@@ -893,6 +893,17 @@ check(
 );
 const keptMusic = applyDirectorAnswer({ ...baseDirect, keep: ["music"], currentBeds: [{ id: "dir_bed_1", assetId: "warm" }], musicIds: new Set(["pulse"]), answer: { music: [{ asset: "pulse" }] } });
 check("a locked music lane keeps its beds", keptMusic.beds.length === 1 && keptMusic.beds[0]!.assetId === "warm");
+const sameTrack = applyDirectorAnswer({
+  ...baseDirect,
+  currentBeds: [{ id: "bed-user", assetId: "warm", gain: 0.22 }],
+  musicIds: new Set(["warm", "pulse"]),
+  answer: { music: [{ asset: "warm", level: 0.3 }, { asset: "pulse", level: 0.2 }] },
+});
+check(
+  "a track the creator already laid is not laid again on top of itself",
+  sameTrack.beds.length === 2 && sameTrack.beds.filter((bed) => bed.assetId === "warm").length === 1 && sameTrack.beds[0]!.id === "bed-user",
+  JSON.stringify(sameTrack.beds)
+);
 
 // ---- generated cutaways: a still stands in, a video is pending ----
 const generatedStill: MediaAsset = { id: "gen-still", kind: "image", source: "ai", label: "✦ neon city", width: 768, height: 1376 };

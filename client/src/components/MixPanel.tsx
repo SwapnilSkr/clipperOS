@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
-import { Music, Trash2, Upload, Volume2 } from "lucide-react";
+import { Music, Search, Trash2, Upload, Volume2 } from "lucide-react";
 import { api, type AudioAsset, type Soundtrack, type SoundtrackHit } from "@/api";
 import { MAX_SOUNDTRACK_HITS } from "@/lib/beat-plan";
 import { bedOutSec, musicBeds } from "@/lib/music-beds";
 import { cn, timecode } from "@/lib/utils";
+import { FreesoundSearch } from "./FreesoundSearch";
 import { MusicBedsEditor } from "./MusicBeds";
 
 export { MAX_SOUNDTRACK_HITS };
@@ -117,6 +118,8 @@ export function MixPanel({
   const [error, setError] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const [uploadKind, setUploadKind] = useState<"music" | "sfx">("sfx");
+  // Freesound search shows once the server says a key is configured.
+  const [freesound, setFreesound] = useState<boolean | null>(null);
 
   function refreshLibrary() {
     void api
@@ -132,6 +135,13 @@ export function MixPanel({
   useEffect(() => {
     refreshLibrary();
   }, [projectId]);
+
+  useEffect(() => {
+    void api
+      .studioSources()
+      .then((sources) => setFreesound(sources.freesound))
+      .catch(() => setFreesound(false));
+  }, []);
 
   const musicTracks = useMemo(
     () => [...library, ...custom].filter((asset) => asset.kind === "music"),
@@ -277,6 +287,31 @@ export function MixPanel({
         ))}
         {sfxTracks.length === 0 && sfxFilter.trim() ? <span className="text-meta text-muted">Nothing matches.</span> : null}
       </div>
+      {freesound !== null ? (
+        <details className="mt-2 rounded-lg border border-border bg-panel-2/40">
+          <summary className="text-ui flex cursor-pointer items-center gap-1.5 px-3 py-2 font-semibold text-muted">
+            <Search className="size-3.5" aria-hidden="true" />
+            Find a sound on Freesound
+          </summary>
+          <div className="border-t border-border px-3 pb-3 pt-2">
+            {freesound ? (
+              <>
+                <p className="text-meta mb-2 text-muted">
+                  Real recordings up to 8 s, CC0 or credit-kept. Take one into the shared library, then drop it at the playhead.
+                </p>
+                <FreesoundSearch
+                  onTaken={() => refreshLibrary()}
+                  onPlace={addHit}
+                  placeDisabled={hits.length >= MAX_SOUNDTRACK_HITS}
+                  placeLabel={hits.length >= MAX_SOUNDTRACK_HITS ? `${MAX_SOUNDTRACK_HITS} hits max` : "Drop at playhead"}
+                />
+              </>
+            ) : (
+              <p className="text-meta text-muted">Freesound needs FREESOUND_API_KEY in the server's .env (a free key from freesound.org/apiv2/apply), then a server restart.</p>
+            )}
+          </div>
+        </details>
+      ) : null}
       {hits.length === 0 ? (
         <p className="text-meta mt-2 text-muted">No hits yet.</p>
       ) : (

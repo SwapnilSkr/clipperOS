@@ -83,7 +83,7 @@ export async function audioPart(path: string, format = "m4a"): Promise<ChatPart>
   return { type: "input_audio", input_audio: { data: bytes.toString("base64"), format } };
 }
 
-export async function chat(input: {
+export interface ChatInput {
   model: string;
   parts: ChatPart[];
   system?: string;
@@ -95,8 +95,10 @@ export async function chat(input: {
   json?: boolean;
   timeoutMs?: number;
   label?: string;
-}): Promise<{ text: string; usage: ChatUsage; provider?: string }> {
-  const body: Record<string, unknown> = {
+}
+
+function chatBody(input: ChatInput): Record<string, unknown> {
+  return {
     model: input.model,
     messages: [
       ...(input.system ? [{ role: "system", content: input.system }] : []),
@@ -107,6 +109,10 @@ export async function chat(input: {
     ...(input.reasoning ? { reasoning: { effort: input.reasoning } } : {}),
     ...(input.json ? { response_format: { type: "json_object" } } : {}),
   };
+}
+
+export async function chat(input: ChatInput): Promise<{ text: string; usage: ChatUsage; provider?: string }> {
+  const body = chatBody(input);
   const response = await fetch(`${BASE}/chat/completions`, {
     method: "POST",
     headers: headers(),
@@ -137,6 +143,98 @@ export async function chat(input: {
       cost: data.usage?.cost,
     },
   };
+}
+
+export interface ChatStreamResult {
+  text: string;
+  /** The model's thinking as it summarised it (Gemini sends summaries, not raw thoughts). */
+  reasoning: string;
+  /** "stop", or "length" when max_tokens cut the answer off. */
+  finishReason?: string;
+  usage: ChatUsage & { reasoningTokens?: number };
+  provider?: string;
+}
+
+/**
+ * `chat`, streamed: reasoning and answer text arrive as deltas while the model
+ * works. OpenRouter sends SSE lines (`data: {...}`), `: OPENROUTER PROCESSING`
+ * comments while it waits, and an `error` object in a chunk when the provider
+ * fails mid-answer.
+ */
+export async function chatStream(
+  input: ChatInput & { onReasoning?: (delta: string) => void; onContent?: (delta: string) => void }
+): Promise<ChatStreamResult> {
+  const response = await fetch(`${BASE}/chat/completions`, {
+    method: "POST",
+    headers: headers(),
+    body: JSON.stringify({ ...chatBody(input), stream: true, usage: { include: true } }),
+    signal: AbortSignal.timeout(input.timeoutMs ?? 240_000),
+  });
+  if (!response.ok) throw await failure(response, input.label ?? "OpenRouter chat");
+  if (!response.body) throw new Error(`${input.label ?? "OpenRouter chat"}: no stream came back`);
+  let text = "";
+  let reasoning = "";
+  let finishReason: string | undefined;
+  let provider: string | undefined;
+  const usage: ChatStreamResult["usage"] = { promptTokens: 0, completionTokens: 0 };
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const take = (line: string) => {
+    if (!line.startsWith("data:")) return;
+    const payload = line.slice(5).trim();
+    if (!payload || payload === "[DONE]") return;
+    let event: {
+      provider?: string;
+      error?: { message?: string };
+      choices?: { delta?: { content?: string | null; reasoning?: string | null }; finish_reason?: string | null }[];
+      usage?: {
+        prompt_tokens?: number;
+        completion_tokens?: number;
+        cost?: number;
+        prompt_tokens_details?: { video_tokens?: number; audio_tokens?: number };
+        completion_tokens_details?: { reasoning_tokens?: number };
+      };
+    };
+    try {
+      event = JSON.parse(payload);
+    } catch {
+      return;
+    }
+    if (event.error) throw new Error(`${input.label ?? "OpenRouter chat"}: ${event.error.message ?? "the provider failed mid-answer"}`);
+    if (event.provider) provider = event.provider;
+    const choice = event.choices?.[0];
+    if (choice?.delta?.reasoning) {
+      reasoning += choice.delta.reasoning;
+      input.onReasoning?.(choice.delta.reasoning);
+    }
+    if (choice?.delta?.content) {
+      text += choice.delta.content;
+      input.onContent?.(choice.delta.content);
+    }
+    if (choice?.finish_reason) finishReason = choice.finish_reason;
+    if (event.usage) {
+      usage.promptTokens = event.usage.prompt_tokens ?? 0;
+      usage.completionTokens = event.usage.completion_tokens ?? 0;
+      usage.videoTokens = event.usage.prompt_tokens_details?.video_tokens;
+      usage.audioTokens = event.usage.prompt_tokens_details?.audio_tokens;
+      usage.reasoningTokens = event.usage.completion_tokens_details?.reasoning_tokens;
+      usage.cost = event.usage.cost;
+    }
+  };
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let newline = buffer.indexOf("\n");
+    while (newline >= 0) {
+      take(buffer.slice(0, newline).trim());
+      buffer = buffer.slice(newline + 1);
+      newline = buffer.indexOf("\n");
+    }
+  }
+  take(buffer.trim());
+  return { text, reasoning, finishReason, usage, provider };
 }
 
 /** The JSON object in a model's answer, fenced or bare. */

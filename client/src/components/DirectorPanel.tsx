@@ -1,17 +1,30 @@
-import { useState } from "react";
-import { Clapperboard, Eye, Loader2, ThumbsDown, ThumbsUp } from "lucide-react";
-import type { ClipSense, DirectInput, DirectorAssetMode, DirectorLane, DirectorNotes, DirectorTurn, RenderReview } from "@/api";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { Check, Clapperboard, Eye, Loader2, ThumbsDown, ThumbsUp, Undo2, X } from "lucide-react";
+import type {
+  ClipSense,
+  DirectInput,
+  DirectorAsk,
+  DirectorAssetMode,
+  DirectorEvent,
+  DirectorLane,
+  DirectorNotes,
+  DirectorStep,
+  DirectorTurn,
+  RenderReview,
+} from "@/api";
 import { cn, timecode } from "@/lib/utils";
 import { Panel } from "./editor-controls";
 
 // ============================================================
-// DIRECTOR PANEL — the one-click plan, and a short conversation to redirect it.
+// DIRECTOR PANEL — a conversation with the Director about this clip.
 //
 // Nothing here changes the plan directly: the editor flushes its draft, asks
-// the server for a pass, then adopts the returned plan. Each pass is kept as
-// a turn (the note, and what the Director said it did), and the server hands
-// the last few back to the model, so a note builds on the ones before it.
-// "Lock" chips are how a pass leaves a lane alone.
+// the server for a pass, then adopts the returned plan. Every note and what
+// the Director did with it is kept as a turn; the server hands the
+// conversation and the edit as it stands back to the model, so a note is a
+// revision of the cut ("shorter", "undo that", "why that bed?"), not a
+// reshuffle. A pass can be taken back from its turn. "Lock" chips are how a
+// pass leaves a lane alone.
 //
 // The harness underneath watches the clip and listens to the library; the
 // options here say where B-roll may come from (the library, stock, made to
@@ -31,6 +44,8 @@ const LANES: { id: DirectorLane; label: string }[] = [
   { id: "sfx", label: "SFX" },
   { id: "music", label: "Music" },
 ];
+
+const LANE_LABELS = Object.fromEntries(LANES.map((lane) => [lane.id, lane.label])) as Record<DirectorLane, string>;
 
 const ASSET_MODES: { id: DirectorAssetMode; label: string; hint: string; needsStock?: boolean }[] = [
   { id: "library", label: "Library", hint: "B-roll only from what is already in the media library" },
@@ -79,24 +94,47 @@ export interface DirectorPanelProps {
   review?: RenderReview;
   /** The clip has a render the harness could watch. */
   rendered: boolean;
-  onDirect: (input: DirectInput) => Promise<{ warnings: string[]; pending: string[]; questions?: string[]; planned?: boolean }>;
+  /** Runs a pass; `at` is the turn it added. */
+  onDirect: (
+    input: DirectInput,
+    onEvent?: (event: DirectorEvent) => void
+  ) => Promise<{ warnings: string[]; pending: string[]; questions?: string[]; planned?: boolean; followed?: string[]; at?: string }>;
   onFeedback: (verdict: "up" | "down", note?: string) => Promise<void>;
+  /** Takes the last pass standing back. */
+  onUndo: () => Promise<void>;
   onReview: () => Promise<void>;
   onSense: () => Promise<void>;
 }
 
-export function DirectorPanel({ director, hasPlan, disabled, stock, sense, review, rendered, onDirect, onFeedback, onReview, onSense }: DirectorPanelProps) {
+/** A pass as the panel watches it: each step, the thinking so far, and how far the answer has got. */
+interface Activity {
+  steps: DirectorStep[];
+  thinking: string;
+  writing: number;
+  startedAt: number;
+  endedAt?: number;
+  failed?: boolean;
+  /** What was sent, shown in the conversation until the pass lands as a turn. */
+  notes?: string;
+  /** The turn the pass added, which it is then shown under. */
+  forAt?: string;
+}
+
+export function DirectorPanel({ director, hasPlan, disabled, stock, sense, review, rendered, onDirect, onFeedback, onUndo, onReview, onSense }: DirectorPanelProps) {
   const [notes, setNotes] = useState("");
   const [keep, setKeep] = useState<DirectorLane[]>([]);
   const [options, setOptions] = useState<Options>(() => readOptions(stock));
   const [busy, setBusy] = useState(false);
+  const [undoing, setUndoing] = useState(false);
   const [watching, setWatching] = useState<"sense" | "review" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [warnings, setWarnings] = useState<string[]>([]);
   const [pending, setPending] = useState<string[]>([]);
+  const [activity, setActivity] = useState<Activity | null>(null);
   const [verdict, setVerdict] = useState<"up" | "down" | null>(null);
   const [feedbackNote, setFeedbackNote] = useState("");
   const [thanked, setThanked] = useState<string | null>(null);
+  const end = useRef<HTMLDivElement>(null);
 
   function setOption<K extends keyof Options>(key: K, value: Options[K]) {
     setOptions((prev) => {
@@ -117,27 +155,138 @@ export function DirectorPanel({ director, hasPlan, disabled, stock, sense, revie
       ? [{ notes: director.notes, summary: director.summary, at: director.generatedAt ?? "" }]
       : [];
   const latest = turns[turns.length - 1];
-  const earlier = turns.slice(0, -1);
-  // A proposal is waiting for an answer: the next run cuts, whatever the mode says.
-  const answering = latest?.kind === "plan";
+  // A proposal is waiting for an answer: the next run cuts unless the note asks
+  // for another plan. A question asked in between is answered below it and
+  // leaves it waiting.
+  let proposalAt = turns.length - 1;
+  while (proposalAt >= 0 && (turns[proposalAt]?.kind === "reply" || turns[proposalAt]?.kind === "undo")) proposalAt--;
+  const proposal = turns[proposalAt]?.kind === "plan" ? turns[proposalAt] : undefined;
+  const answering = Boolean(proposal);
+  // The latest pass still standing can be taken back, once the edit before it was kept.
+  let undoable: DirectorTurn | undefined;
+  for (let index = turns.length - 1; index >= 0; index--) {
+    const turn = turns[index]!;
+    if ((turn.kind && turn.kind !== "pass") || turn.undone) continue;
+    if (turn.changed) undoable = turn;
+    break;
+  }
+  // Picks for the waiting proposal's questions, kept per proposal; unpicked means the recommended option.
+  const [chosen, setChosen] = useState<{ at: string; picks: Record<number, number> }>({ at: "", picks: {} });
+  const picks = proposal && chosen.at === proposal.at ? chosen.picks : {};
+
+  function pick(ask: number, option: number) {
+    if (!proposal) return;
+    setChosen({ at: proposal.at, picks: { ...picks, [ask]: option } });
+  }
+
+  // The clock on a running pass.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!busy) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 500);
+    return () => window.clearInterval(timer);
+  }, [busy]);
+
+  // The newest turn and the note box come into view as the conversation grows:
+  // the column that holds the panel scrolls, never the page.
+  useEffect(() => {
+    const el = end.current;
+    let scroller = el?.parentElement ?? null;
+    while (scroller && !/(auto|scroll)/.test(getComputedStyle(scroller).overflowY)) scroller = scroller.parentElement;
+    if (!el || !scroller) return;
+    const below = el.getBoundingClientRect().bottom - scroller.getBoundingClientRect().bottom;
+    if (below > 0) scroller.scrollTop += below;
+  }, [turns.length, activity?.startedAt, activity?.steps.length, activity?.forAt]);
+
+  function onEvent(event: DirectorEvent) {
+    setActivity((prev) => {
+      if (!prev) return prev;
+      if (event.type === "thinking") return { ...prev, thinking: prev.thinking + event.text };
+      if (event.type === "writing") return { ...prev, writing: event.chars };
+      const { type: _type, ...step } = event;
+      const steps = prev.steps.some((item) => item.id === step.id) ? prev.steps.map((item) => (item.id === step.id ? step : item)) : [...prev.steps, step];
+      // Asked again: the answer starts over.
+      const retry = step.id === "think" && step.state === "run" && step.detail;
+      return { ...prev, steps, ...(retry ? { writing: 0, thinking: prev.thinking ? `${prev.thinking}\n\n` : "" } : {}) };
+    });
+  }
 
   async function run(planFirst: boolean) {
+    const typed = notes.trim();
+    // Every question with options is answered: the pick, or the recommended option.
+    const answers = proposal
+      ? (proposal.asks ?? []).flatMap((ask, index) => {
+          const choice = ask.options?.[picks[index] ?? ask.recommended ?? 0]?.label;
+          return choice ? [{ question: ask.question, choice }] : [];
+        })
+      : [];
     setBusy(true);
     setError(null);
     setWarnings([]);
     setPending([]);
     setThanked(null);
     setVerdict(null);
+    setNow(Date.now());
+    setActivity({
+      steps: [],
+      thinking: "",
+      writing: 0,
+      startedAt: Date.now(),
+      notes: [typed, answers.length ? `Picked: ${answers.map((item) => item.choice).join(" · ")}` : ""].filter(Boolean).join(" — ") || undefined,
+    });
+    // The note moves into the conversation while the Director works on it.
+    setNotes("");
     try {
-      const result = await onDirect({ notes: notes.trim() || undefined, keep, assets: options.assets, music: options.music, see: options.see, plan: planFirst });
+      const result = await onDirect(
+        {
+          notes: typed || undefined,
+          keep,
+          assets: options.assets,
+          music: options.music,
+          see: options.see,
+          plan: planFirst,
+          ...(answers.length ? { answers } : {}),
+        },
+        onEvent
+      );
       setWarnings(result.warnings);
       setPending(result.pending);
-      // The note now lives in the conversation below.
-      setNotes("");
+      setActivity((prev) => {
+        if (!prev) return prev;
+        // A switch decided after the note was read (the Director stopping to ask) joins the note's line.
+        const extra = (result.followed ?? []).filter((line) => !prev.steps.some((step) => step.detail?.includes(line)));
+        const steps = prev.steps.map((step) => ({
+          ...step,
+          state: step.state === "run" ? ("done" as const) : step.state,
+          ...(step.id === "read" && extra.length ? { detail: [step.detail, ...extra].filter(Boolean).join(" · ") } : {}),
+        }));
+        return { ...prev, steps, endedAt: Date.now(), ...(result.at ? { forAt: result.at } : {}) };
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setActivity((prev) =>
+        prev ? { ...prev, failed: true, endedAt: Date.now(), steps: prev.steps.map((step) => (step.state === "run" ? { ...step, state: "fail" as const } : step)) } : prev
+      );
+      // Back in the composer, ready to send again.
+      setNotes((current) => current || typed);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function undo() {
+    setUndoing(true);
+    setError(null);
+    setWarnings([]);
+    setPending([]);
+    setThanked(null);
+    setVerdict(null);
+    try {
+      await onUndo();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setBusy(false);
+      setUndoing(false);
     }
   }
 
@@ -171,27 +320,152 @@ export function DirectorPanel({ director, hasPlan, disabled, stock, sense, revie
   }
 
   const planFirst = options.mode === "plan" && !answering;
+  const locked = busy || undoing || disabled;
+  // Thumbs are for a cut that stands; a proposal, an answer or an undo has nothing to judge.
+  const judgeable = Boolean(latest) && !busy && (!latest!.kind || latest!.kind === "pass") && !latest!.undone;
 
   return (
     <Panel title="AI Director" icon={Clapperboard}>
-      <textarea
-        value={notes}
-        onChange={(event) => setNotes(event.target.value)}
-        rows={2}
-        maxLength={600}
-        placeholder={
-          answering
-            ? "Answer its questions, change anything in the proposal — or just say go."
-            : hasPlan
-              ? "Slow-mo the last line, VHS on the hook, a dragon on “dragon”, a darker bed…"
-              : "Notes (optional) — harder hook, a freeze on the punchline, B-roll of…"
-        }
-        aria-label="Notes for the Director"
-        onKeyDown={(event) => {
-          if (event.key === "Enter" && (event.metaKey || event.ctrlKey) && !busy && !disabled) void run(planFirst);
-        }}
-        className="text-ui w-full resize-y rounded-md border border-control bg-panel-2 px-2 py-2 outline-none focus:border-accent"
-      />
+      {turns.length > 0 || activity ? (
+        <div className="space-y-3 pb-3">
+          {turns.map((turn, index) => {
+            const here = activity?.forAt === turn.at ? activity : null;
+            return (
+              <TurnView
+                key={`${turn.at}-${index}`}
+                turn={turn}
+                model={director?.model}
+                {...(turn === proposal ? { picks, onPick: pick } : {})}
+                {...(turn === undoable ? { onUndo: () => void undo(), undoing, locked } : {})}
+                activity={here ? <DirectorActivity activity={here} busy={false} now={now} /> : undefined}
+              >
+                {here ? <Notices warnings={warnings} pending={pending} /> : null}
+              </TurnView>
+            );
+          })}
+          {activity && !activity.forAt ? (
+            <div className="space-y-1">
+              <YouSaid notes={activity.notes} />
+              <DirectorActivity activity={activity} busy={busy} now={now} />
+            </div>
+          ) : null}
+          {judgeable ? (
+            thanked ? (
+              <p className="text-meta text-accent">{thanked}</p>
+            ) : (
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="text-micro text-muted">This pass:</span>
+                <button
+                  type="button"
+                  aria-pressed={verdict === "up"}
+                  onClick={() => setVerdict(verdict === "up" ? null : "up")}
+                  className={cn("press inline-flex size-8 items-center justify-center rounded-md border border-border text-muted hover:text-fg", verdict === "up" && "border-accent text-accent")}
+                  aria-label="Good pass"
+                >
+                  <ThumbsUp className="size-3.5" aria-hidden="true" />
+                </button>
+                <button
+                  type="button"
+                  aria-pressed={verdict === "down"}
+                  onClick={() => setVerdict(verdict === "down" ? null : "down")}
+                  className={cn("press inline-flex size-8 items-center justify-center rounded-md border border-border text-muted hover:text-fg", verdict === "down" && "border-bad text-bad")}
+                  aria-label="Bad pass"
+                >
+                  <ThumbsDown className="size-3.5" aria-hidden="true" />
+                </button>
+                {verdict ? (
+                  <div className="flex w-full items-center gap-1.5">
+                    <input
+                      value={feedbackNote}
+                      onChange={(event) => setFeedbackNote(event.target.value)}
+                      maxLength={400}
+                      placeholder={verdict === "up" ? "What worked? (optional)" : "What should it do differently? (optional)"}
+                      aria-label="Feedback note"
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") void sendFeedback(verdict);
+                      }}
+                      className="text-ui h-9 min-w-0 flex-1 rounded-md border border-control bg-panel-2 px-2 outline-none focus:border-accent"
+                    />
+                    <button type="button" onClick={() => void sendFeedback(verdict)} className="press text-ui h-9 rounded-md border border-accent px-2 font-semibold text-accent">
+                      Teach it
+                    </button>
+                  </div>
+                ) : null}
+              </div>
+            )
+          ) : null}
+        </div>
+      ) : null}
+
+      {/* The note box stays at the bottom of the column however long the conversation runs. */}
+      <div className={cn("sticky bottom-0 z-10 -mx-3 bg-panel px-3 pb-2", (turns.length > 0 || activity) && "border-t border-border pt-2")}>
+        <textarea
+          value={notes}
+          onChange={(event) => setNotes(event.target.value)}
+          rows={2}
+          maxLength={600}
+          placeholder={
+            answering
+              ? "Answer its questions, change anything in the proposal — or just say go."
+              : hasPlan
+                ? "What should change? “Shorter B-roll”, “a darker bed”, “undo that”, “why that title?”"
+                : "Notes (optional) — harder hook, a freeze on the punchline, B-roll of…"
+          }
+          aria-label="Notes for the Director"
+          onKeyDown={(event) => {
+            if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) return;
+            // Enter sends a note; an empty composer needs ⌘↵, so a stray Enter never starts a whole pass.
+            if (!notes.trim() && !(event.metaKey || event.ctrlKey)) return;
+            event.preventDefault();
+            if (!locked) void run(planFirst);
+          }}
+          className="text-ui w-full resize-y rounded-md border border-control bg-panel-2 px-2 py-2 outline-none focus:border-accent"
+        />
+        <div className="mt-2 flex gap-2">
+          <button
+            type="button"
+            disabled={locked}
+            onClick={() => void run(planFirst)}
+            title="⌘↵"
+            className="press text-ui inline-flex h-10 flex-1 items-center justify-center gap-1.5 rounded-lg bg-accent px-3 font-semibold text-accent-fg hover:opacity-90 disabled:opacity-50"
+          >
+            {busy ? (
+              <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+            ) : (
+              <Clapperboard className="size-4" aria-hidden="true" />
+            )}
+            {busy
+              ? `${(activity && runningStep(activity.steps))?.label ?? "Starting"}…`
+              : answering
+                ? "Go ahead and cut"
+                : planFirst
+                  ? "Propose a cut"
+                  : hasPlan
+                    ? notes.trim()
+                      ? "Send"
+                      : "Redirect"
+                    : "Direct this clip"}
+          </button>
+          {answering && !busy ? (
+            <button
+              type="button"
+              disabled={locked}
+              onClick={() => void run(true)}
+              title="Ask it to rethink the proposal with your notes, without cutting yet"
+              className="press text-ui inline-flex h-10 items-center justify-center rounded-lg border border-border px-3 font-semibold text-muted hover:border-control hover:text-fg disabled:opacity-50"
+            >
+              Rethink
+            </button>
+          ) : null}
+        </div>
+        {error ? <p className="text-meta mt-2 text-bad">{error}</p> : null}
+      </div>
+      <div ref={end} aria-hidden="true" />
+      <p className="text-micro mt-1 text-muted">
+        {hasPlan
+          ? "Keep talking to it: it knows what it did and what you changed since. A note outranks these settings. Enter sends, Shift+Enter for a new line."
+          : "Say it in your own words — a note outranks the B-roll, music and lock settings, and you can ask it anything about the editor."}
+      </p>
 
       <div className="mt-2 flex flex-wrap items-center gap-1.5">
         <span className="text-micro mr-1 text-muted">Mode</span>
@@ -273,128 +547,6 @@ export function DirectorPanel({ director, hasPlan, disabled, stock, sense, revie
               {lane.label}
             </button>
           ))}
-        </div>
-      ) : null}
-      <div className="mt-2 flex gap-2">
-        <button
-          type="button"
-          disabled={busy || disabled}
-          onClick={() => void run(planFirst)}
-          title="⌘↵"
-          className="press text-ui inline-flex h-10 flex-1 items-center justify-center gap-1.5 rounded-lg bg-accent px-3 font-semibold text-accent-fg hover:opacity-90 disabled:opacity-50"
-        >
-          {busy ? (
-            <Loader2 className="size-4 animate-spin" aria-hidden="true" />
-          ) : (
-            <Clapperboard className="size-4" aria-hidden="true" />
-          )}
-          {busy
-            ? planFirst
-              ? "Thinking it through…"
-              : options.see
-                ? "Watching and directing…"
-                : "Directing…"
-            : answering
-              ? "Go ahead and cut"
-              : planFirst
-                ? "Propose a cut"
-                : hasPlan
-                  ? "Redirect"
-                  : "Direct this clip"}
-        </button>
-        {answering && !busy ? (
-          <button
-            type="button"
-            disabled={disabled}
-            onClick={() => void run(true)}
-            title="Ask it to rethink the proposal with your notes, without cutting yet"
-            className="press text-ui inline-flex h-10 items-center justify-center rounded-lg border border-border px-3 font-semibold text-muted hover:border-control hover:text-fg disabled:opacity-50"
-          >
-            Rethink
-          </button>
-        ) : null}
-      </div>
-      {busy && (options.assets === "ai" || options.assets === "both") ? (
-        <p className="text-meta mt-1 text-muted">Made-to-order pictures and beds add 10–40 s each.</p>
-      ) : null}
-      {error ? <p className="text-meta mt-2 text-bad">{error}</p> : null}
-      {warnings.length > 0 ? (
-        <ul className="mt-2 space-y-1">
-          {warnings.map((warning) => (
-            <li key={warning} className="text-meta text-warn">
-              {warning}
-            </li>
-          ))}
-        </ul>
-      ) : null}
-      {pending.length > 0 ? (
-        <ul className="mt-2 space-y-1">
-          {pending.map((item) => (
-            <li key={item} className="text-meta text-muted">
-              ⏳ {item}
-            </li>
-          ))}
-        </ul>
-      ) : null}
-
-      {latest ? (
-        <div className="mt-3 space-y-2 border-t border-border pt-2">
-          {earlier.length > 0 ? (
-            <details>
-              <summary className="text-micro cursor-pointer text-muted hover:text-fg">
-                Earlier passes ({earlier.length})
-              </summary>
-              <div className="mt-1.5 space-y-2">
-                {earlier.map((turn, index) => (
-                  <TurnView key={`${turn.at}-${index}`} turn={turn} compact />
-                ))}
-              </div>
-            </details>
-          ) : null}
-          <TurnView turn={latest} model={director?.model} />
-          {thanked ? (
-            <p className="text-meta text-accent">{thanked}</p>
-          ) : (
-            <div className="flex flex-wrap items-center gap-1.5">
-              <span className="text-micro text-muted">This pass:</span>
-              <button
-                type="button"
-                aria-pressed={verdict === "up"}
-                onClick={() => setVerdict(verdict === "up" ? null : "up")}
-                className={cn("press inline-flex size-8 items-center justify-center rounded-md border border-border text-muted hover:text-fg", verdict === "up" && "border-accent text-accent")}
-                aria-label="Good pass"
-              >
-                <ThumbsUp className="size-3.5" aria-hidden="true" />
-              </button>
-              <button
-                type="button"
-                aria-pressed={verdict === "down"}
-                onClick={() => setVerdict(verdict === "down" ? null : "down")}
-                className={cn("press inline-flex size-8 items-center justify-center rounded-md border border-border text-muted hover:text-fg", verdict === "down" && "border-bad text-bad")}
-                aria-label="Bad pass"
-              >
-                <ThumbsDown className="size-3.5" aria-hidden="true" />
-              </button>
-              {verdict ? (
-                <div className="flex w-full items-center gap-1.5">
-                  <input
-                    value={feedbackNote}
-                    onChange={(event) => setFeedbackNote(event.target.value)}
-                    maxLength={400}
-                    placeholder={verdict === "up" ? "What worked? (optional)" : "What should it do differently? (optional)"}
-                    aria-label="Feedback note"
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") void sendFeedback(verdict);
-                    }}
-                    className="text-ui h-9 min-w-0 flex-1 rounded-md border border-control bg-panel-2 px-2 outline-none focus:border-accent"
-                  />
-                  <button type="button" onClick={() => void sendFeedback(verdict)} className="press text-ui h-9 rounded-md border border-accent px-2 font-semibold text-accent">
-                    Teach it
-                  </button>
-                </div>
-              ) : null}
-            </div>
-          )}
         </div>
       ) : null}
 
@@ -493,29 +645,259 @@ export function DirectorPanel({ director, hasPlan, disabled, stock, sense, revie
   );
 }
 
-function TurnView({ turn, compact, model }: { turn: DirectorTurn; compact?: boolean; model?: string }) {
+/**
+ * The Director at work: each step as it starts and lands, what it is thinking
+ * (open while it runs, folded away once the pass is done), and a clock.
+ */
+function DirectorActivity({ activity, busy, now }: { activity: Activity; busy: boolean; now: number }) {
+  const [open, setOpen] = useState<boolean | null>(null);
+  const box = useRef<HTMLDivElement>(null);
+  // Follows the newest thinking unless the creator has scrolled back to read.
+  const follow = useRef(true);
+  const showThinking = open ?? busy;
+  useEffect(() => {
+    if (showThinking && follow.current && box.current) box.current.scrollTop = box.current.scrollHeight;
+  }, [activity.thinking, showThinking]);
+  // Each new pass starts open again.
+  useEffect(() => {
+    setOpen(null);
+    follow.current = true;
+  }, [activity.startedAt]);
+
+  const seconds = Math.max(0, Math.round(((activity.endedAt ?? now) - activity.startedAt) / 1000));
+  const running = runningStep(activity.steps);
+  return (
+    <div className="rounded-lg border border-border bg-panel-2/40 px-2.5 py-2" aria-live="polite">
+      <div className="flex items-center gap-1.5">
+        {busy ? (
+          <Loader2 className="size-3.5 animate-spin text-accent" aria-hidden="true" />
+        ) : activity.failed ? (
+          <X className="size-3.5 text-bad" aria-hidden="true" />
+        ) : (
+          <Check className="size-3.5 text-accent" aria-hidden="true" />
+        )}
+        <span className="text-meta font-semibold text-fg">{busy ? (running?.label ?? "Starting") : activity.failed ? "Stopped" : `Worked for ${seconds}s`}</span>
+        {busy ? <span className="num text-micro ml-auto text-muted">{seconds}s</span> : null}
+      </div>
+      {activity.steps.length > 0 ? (
+        <ol className="mt-1.5 space-y-1">
+          {activity.steps.map((step) => {
+            const writing = busy && step.id === "think" && step.state === "run" && activity.writing > 0;
+            const detail = writing ? `writing the ${step.label === "Directing" ? "plan" : "proposal"} · ${(activity.writing / 1000).toFixed(1)}k characters` : step.detail;
+            return (
+              <li key={step.id} className="flex items-start gap-1.5">
+                <span className="mt-0.5 flex size-3 shrink-0 items-center justify-center">
+                  {step.state === "run" ? (
+                    <Loader2 className={cn("size-3 text-accent", busy && "animate-spin")} aria-hidden="true" />
+                  ) : step.state === "fail" ? (
+                    <X className="size-3 text-warn" aria-hidden="true" />
+                  ) : (
+                    <Check className="size-3 text-muted" aria-hidden="true" />
+                  )}
+                </span>
+                <p className="text-micro min-w-0 leading-snug">
+                  <span className={step.state === "run" ? "font-semibold text-fg" : "text-fg"}>{step.label}</span>
+                  {detail ? <span className="text-muted"> — {detail}</span> : null}
+                </p>
+              </li>
+            );
+          })}
+        </ol>
+      ) : null}
+      {activity.thinking ? (
+        <div className="mt-1.5">
+          <button type="button" onClick={() => setOpen(!showThinking)} className="press text-micro font-semibold text-muted hover:text-fg">
+            {showThinking ? "Hide its thinking" : "Show its thinking"}
+          </button>
+          {showThinking ? (
+            <div
+              ref={box}
+              onScroll={(event) => {
+                const el = event.currentTarget;
+                follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+              }}
+              className="text-micro mt-1 max-h-48 overflow-y-auto whitespace-pre-line rounded-md border border-border bg-panel px-2 py-1.5 leading-relaxed text-muted"
+            >
+              {thinkingParts(activity.thinking.trim())}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/** The newest step still running (sourcing steps run side by side). */
+function runningStep(steps: DirectorStep[]): DirectorStep | undefined {
+  for (let index = steps.length - 1; index >= 0; index--) if (steps[index]!.state === "run") return steps[index];
+  return undefined;
+}
+
+/** Gemini's thinking arrives as "**Heading**" then a paragraph; headings read as headings. */
+function thinkingParts(text: string) {
+  return text.split(/(\*\*[^*\n]+\*\*)/g).map((part, index) =>
+    /^\*\*[^*\n]+\*\*$/.test(part) ? (
+      <span key={index} className="mt-1.5 block font-semibold text-fg first:mt-0">
+        {part.slice(2, -2)}
+      </span>
+    ) : (
+      <span key={index}>{part.replace(/^\n+/, "")}</span>
+    )
+  );
+}
+
+function YouSaid({ notes }: { notes?: string }) {
+  return (
+    <p className="text-meta text-fg">
+      <span className="text-micro mr-1.5 font-semibold uppercase tracking-wide text-muted">You</span>
+      {notes ? `“${notes}”` : <span className="text-muted">No notes</span>}
+    </p>
+  );
+}
+
+/** What the last pass could not do, and what is still rendering for it. */
+function Notices({ warnings, pending }: { warnings: string[]; pending: string[] }) {
+  if (!warnings.length && !pending.length) return null;
+  return (
+    <ul className="space-y-1">
+      {warnings.map((warning) => (
+        <li key={warning} className="text-meta text-warn">
+          {warning}
+        </li>
+      ))}
+      {pending.map((item) => (
+        <li key={item} className="text-meta text-muted">
+          ⏳ {item}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function TurnView({
+  turn,
+  model,
+  picks,
+  onPick,
+  activity,
+  onUndo,
+  undoing,
+  locked,
+  children,
+}: {
+  turn: DirectorTurn;
+  model?: string;
+  /** The option picked per question; the recommended one until the creator changes it. */
+  picks?: Record<number, number>;
+  onPick?: (ask: number, option: number) => void;
+  /** How the pass that made this turn went, between the note and the answer. */
+  activity?: ReactNode;
+  /** This is the pass that can be taken back. */
+  onUndo?: () => void;
+  undoing?: boolean;
+  locked?: boolean;
+  children?: ReactNode;
+}) {
   const plan = turn.kind === "plan";
+  // An undo from its own button has no note to show.
+  const said = turn.kind === "undo" && !turn.notes ? null : <YouSaid notes={turn.notes} />;
+  // Proposals from before options existed carry plain questions.
+  const asks: DirectorAsk[] = turn.asks?.length ? turn.asks : (turn.questions ?? []).map((question) => ({ question }));
+  if (plan && onPick) {
+    return (
+      <div className="space-y-1">
+        {said}
+        {activity}
+        <p className="text-meta whitespace-pre-line leading-relaxed text-muted" title={model}>
+          <span className="text-micro mr-1.5 font-semibold uppercase tracking-wide text-accent">Director proposes</span>
+          {turn.summary}
+        </p>
+        {asks.length > 0 ? (
+          <div className="space-y-2.5 rounded-md border border-accent/40 bg-accent/5 px-2 py-2">
+            {asks.map((ask, index) => {
+              const options = ask.options ?? [];
+              const recommended = ask.recommended ?? 0;
+              const chosen = picks?.[index] ?? recommended;
+              const detail = options[chosen]?.detail;
+              return (
+                <div key={`${index}-${ask.question}`} className="space-y-1">
+                  <p className="text-meta text-fg">
+                    <span className="num mr-1 text-accent">{index + 1}.</span>
+                    {ask.header ? (
+                      <span className="text-micro mr-1.5 rounded bg-accent/15 px-1 py-0.5 font-semibold uppercase tracking-wide text-accent">{ask.header}</span>
+                    ) : null}
+                    {ask.question}
+                  </p>
+                  {options.length > 0 ? (
+                    <div className="flex flex-wrap gap-1.5" role="radiogroup" aria-label={ask.question}>
+                      {options.map((option, optionIndex) => (
+                        <button
+                          key={option.label}
+                          type="button"
+                          role="radio"
+                          aria-checked={chosen === optionIndex}
+                          title={option.detail}
+                          onClick={() => onPick(index, optionIndex)}
+                          className={cn(
+                            "press text-micro rounded-full border px-2 py-0.5 font-semibold",
+                            chosen === optionIndex ? "border-accent bg-accent/15 text-accent" : "border-border text-muted hover:border-control"
+                          )}
+                        >
+                          {option.label}
+                          {optionIndex === recommended ? <span className="ml-1 font-normal opacity-70">· recommended</span> : null}
+                        </button>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-micro text-muted">Answer in the note below.</p>
+                  )}
+                  {detail ? <p className="text-micro text-muted">{detail}</p> : null}
+                </div>
+              );
+            })}
+          </div>
+        ) : null}
+        <p className="text-micro text-muted">
+          Nothing is cut yet.{asks.some((ask) => ask.options?.length) ? " The recommended answers are picked — change any," : ""} add anything in your own words, and press Go ahead.
+        </p>
+        {children}
+      </div>
+    );
+  }
   return (
     <div className="space-y-1">
-      <p className="text-meta text-fg">
-        <span className="text-micro mr-1.5 font-semibold uppercase tracking-wide text-muted">You</span>
-        {turn.notes ? `“${turn.notes}”` : <span className="text-muted">No notes</span>}
-      </p>
-      <p className={cn("text-meta whitespace-pre-line leading-relaxed text-muted", compact && "line-clamp-2")} title={model}>
-        <span className="text-micro mr-1.5 font-semibold uppercase tracking-wide text-accent">{plan ? "Director proposes" : "Director"}</span>
+      {said}
+      {activity}
+      <p className={cn("text-meta whitespace-pre-line leading-relaxed text-muted", turn.undone && "opacity-60")} title={model}>
+        <span className="text-micro mr-1.5 font-semibold uppercase tracking-wide text-accent">
+          {plan ? "Director proposed" : turn.kind === "reply" ? "Director answers" : "Director"}
+        </span>
+        {turn.undone ? <span className="text-micro mr-1.5 rounded bg-panel-2 px-1 py-0.5 font-semibold uppercase tracking-wide text-muted">Taken back</span> : null}
         {turn.summary}
       </p>
-      {plan && !compact && turn.questions?.length ? (
-        <ul className="text-meta space-y-0.5 rounded-md border border-accent/40 bg-accent/5 px-2 py-1.5 text-fg">
-          {turn.questions.map((question, index) => (
-            <li key={question}>
-              <span className="num mr-1 text-accent">{index + 1}.</span>
-              {question}
-            </li>
+      {turn.changed && !turn.undone ? (
+        <div className="flex flex-wrap items-center gap-1">
+          <span className="text-micro mr-0.5 text-muted">{turn.changed.length ? "Changed" : "Changed nothing"}</span>
+          {turn.changed.map((lane) => (
+            <span key={lane} className="text-micro rounded-full border border-border px-1.5 py-px text-muted">
+              {LANE_LABELS[lane] ?? lane}
+            </span>
           ))}
-        </ul>
+          {onUndo ? (
+            <button
+              type="button"
+              disabled={locked}
+              onClick={onUndo}
+              title="Put these lanes, hits and beds back as they were before this pass"
+              className="press text-micro ml-auto inline-flex h-6 items-center gap-1 rounded-md border border-border px-1.5 font-semibold text-muted hover:border-control hover:text-fg disabled:opacity-50"
+            >
+              {undoing ? <Loader2 className="size-3 animate-spin" aria-hidden="true" /> : <Undo2 className="size-3" aria-hidden="true" />}
+              Undo
+            </button>
+          ) : null}
+        </div>
       ) : null}
-      {plan && !compact ? <p className="text-micro text-muted">Nothing is cut yet. Answer above and press Go ahead — or just Go ahead.</p> : null}
+      {children}
     </div>
   );
 }

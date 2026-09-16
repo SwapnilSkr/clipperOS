@@ -5,6 +5,7 @@ import type {
   ClipSegment,
   ClipSense,
   CreatorPlan,
+  DirectorUndo,
   MusicBed,
   RenderReview,
   SoundtrackHit,
@@ -77,6 +78,8 @@ export interface IClip extends Document {
   review?: RenderReview;
   /** The plan exactly as the Director last wrote it, so the creator's edits can be read as taste. */
   directed?: { plan: CreatorPlan; sfx: SoundtrackHit[]; beds: MusicBed[]; at: string };
+  /** The edit as it stood before each of the Director's recent passes, so a pass can be taken back. */
+  directorUndo?: DirectorUndo[];
   /**
    * Cached person matte (a grayscale mask video in source space) for
    * behind-subject titles. Built on demand, keyed to the analysed span, and
@@ -283,8 +286,27 @@ const creatorPlanSchema = new Schema(
                   notes: { type: String, maxlength: 600 },
                   summary: { type: String, maxlength: 1200 },
                   at: { type: String, maxlength: 40 },
-                  kind: { type: String, enum: ["pass", "plan"] },
+                  kind: { type: String, enum: ["pass", "plan", "reply", "undo"] },
+                  changed: { type: [String], default: undefined },
+                  undone: { type: Boolean },
                   questions: { type: [String], default: undefined },
+                  asks: {
+                    type: [
+                      new Schema(
+                        {
+                          question: { type: String, maxlength: 300 },
+                          header: { type: String, maxlength: 24 },
+                          options: {
+                            type: [new Schema({ label: { type: String, maxlength: 80 }, detail: { type: String, maxlength: 200 } }, { _id: false })],
+                            default: undefined,
+                          },
+                          recommended: { type: Number },
+                        },
+                        { _id: false }
+                      ),
+                    ],
+                    default: undefined,
+                  },
                 },
                 { _id: false }
               ),
@@ -492,6 +514,7 @@ const clipSchema = new Schema<IClip>(
     sense: { type: Schema.Types.Mixed },
     review: { type: Schema.Types.Mixed },
     directed: { type: Schema.Types.Mixed },
+    directorUndo: { type: Schema.Types.Mixed },
     matte: {
       type: new Schema(
         {

@@ -9,7 +9,9 @@ import {
   buildClipMatte,
   streamClipMatte,
   directClipRoute,
+  directClipStreamRoute,
   directorFeedbackRoute,
+  undoDirectorPassRoute,
   reviewClipRoute,
   senseClipRoute,
   mergeClips,
@@ -47,7 +49,9 @@ export const clipRoutes = new Elysia({ prefix: "/api/clips" })
   .post("/:id/matte", buildClipMatte, { params: ClipParams })
   .get("/:id/matte", streamClipMatte, { params: ClipParams })
   .post("/:id/direct", directClipRoute, { params: ClipParams, body: DirectClipBody })
+  .post("/:id/direct/stream", directClipStreamRoute, { params: ClipParams, body: DirectClipBody })
   .post("/:id/director/feedback", directorFeedbackRoute, { params: ClipParams, body: DirectorFeedbackBody })
+  .post("/:id/director/undo", undoDirectorPassRoute, { params: ClipParams })
   .post("/:id/sense", senseClipRoute, { params: ClipParams })
   .post("/:id/review", reviewClipRoute, { params: ClipParams })
   .get("/:id/download", downloadClip, { params: ClipParams })

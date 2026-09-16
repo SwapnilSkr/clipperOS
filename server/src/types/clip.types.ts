@@ -567,16 +567,36 @@ export interface BehindTitle {
 /**
  * One Director turn: what the creator asked, and either what the Director did
  * (a pass) or what it proposes and wants to know first (a plan — nothing
- * applied yet; the next pass carries the answers).
+ * applied yet; the next pass carries the answers) or a reply (the note only
+ * asked a question; nothing changed) or an undo (a pass taken back).
  */
 export interface DirectorTurn {
   notes?: string;
   summary: string;
   at: string;
-  kind?: "pass" | "plan";
+  kind?: "pass" | "plan" | "reply" | "undo";
+  /** Pass turns: the lanes the pass changed. Present once the edit before it is kept, so it can be taken back. */
+  changed?: string[];
+  /** Pass turns: taken back since; none of it is in the edit. */
+  undone?: boolean;
   /** Plan turns: what it needs answered before it cuts. */
   questions?: string[];
+  /** Plan turns: the same questions with their options and the recommended one. */
+  asks?: DirectorAsk[];
 }
+
+/** A question the Director asks before it cuts, answered with a click. */
+export interface DirectorAsk {
+  question: string;
+  /** A 1–2 word chip for the question. */
+  header?: string;
+  /** 2–4 choices; empty for an open question. */
+  options: { label: string; detail?: string }[];
+  /** Index of the option it recommends. */
+  recommended?: number;
+}
+
+export const MAX_DIRECTOR_ASKS = 4;
 
 export interface DirectorNotes {
   /** What the user asked for on the last pass. */
@@ -589,7 +609,20 @@ export interface DirectorNotes {
   turns?: DirectorTurn[];
 }
 
-export const MAX_DIRECTOR_TURNS = 6;
+export const MAX_DIRECTOR_TURNS = 12;
+
+/** The edit as it stood before a Director pass (`clip.directorUndo`), so the pass can be taken back. */
+export interface DirectorUndo {
+  /** The pass turn's `at`. */
+  at: string;
+  creator?: CreatorPlan;
+  sfx: SoundtrackHit[];
+  beds: MusicBed[];
+  /** The clip's caption words at a time before the pass (absent: the look's own count). */
+  chunkWords?: number;
+  /** What the Director had written before the pass, for taste. */
+  directed?: { plan: CreatorPlan; sfx: SoundtrackHit[]; beds: MusicBed[]; at: string };
+}
 
 export interface CreatorPlan {
   enabled: boolean;
